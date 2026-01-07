@@ -25,6 +25,7 @@ import math
 import os
 
 import comfy.utils
+import comfy.disk_tier
 
 from . import clip_vision
 from . import gligen
@@ -287,10 +288,12 @@ class CLIP:
         return self.encode_from_tokens(tokens)
 
     def load_sd(self, sd, full_model=False):
+        if comfy.disk_tier.has_disk_tensors(sd):
+            provider = comfy.disk_tier.provider_from_state_dict(sd)
+            return comfy.disk_tier.attach_disk_state_dict(self.cond_stage_model, sd, provider)
         if full_model:
             return self.cond_stage_model.load_state_dict(sd, strict=False)
-        else:
-            return self.cond_stage_model.load_sd(sd)
+        return self.cond_stage_model.load_sd(sd)
 
     def get_sd(self):
         sd_clip = self.cond_stage_model.state_dict()
@@ -662,7 +665,11 @@ class VAE:
             self.first_stage_model = AutoencoderKL(**(config['params']))
         self.first_stage_model = self.first_stage_model.eval()
 
-        m, u = self.first_stage_model.load_state_dict(sd, strict=False)
+        if comfy.disk_tier.has_disk_tensors(sd):
+            provider = comfy.disk_tier.provider_from_state_dict(sd)
+            m, u = comfy.disk_tier.attach_disk_state_dict(self.first_stage_model, sd, provider)
+        else:
+            m, u = self.first_stage_model.load_state_dict(sd, strict=False)
         if len(m) > 0:
             logging.warning("Missing VAE keys {}".format(m))
 
@@ -1018,7 +1025,11 @@ def load_clip(ckpt_paths, embedding_directory=None, clip_type=CLIPType.STABLE_DI
     for p in ckpt_paths:
         sd, metadata = comfy.utils.load_torch_file(p, safe_load=True, return_metadata=True)
         if model_options.get("custom_operations", None) is None:
-            sd, metadata = comfy.utils.convert_old_quants(sd, model_prefix="", metadata=metadata)
+            if comfy.disk_tier.has_disk_tensors(sd):
+                if comfy.utils.needs_old_quant_conversion(sd, "", metadata=metadata):
+                    raise RuntimeError("Disk-tier loading does not support legacy quantization conversion for text encoders.")
+            else:
+                sd, metadata = comfy.utils.convert_old_quants(sd, model_prefix="", metadata=metadata)
         clip_data.append(sd)
     return load_text_encoder_state_dicts(clip_data, embedding_directory=embedding_directory, clip_type=clip_type, model_options=model_options)
 
@@ -1365,7 +1376,11 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
 
     custom_operations = model_options.get("custom_operations", None)
     if custom_operations is None:
-        sd, metadata = comfy.utils.convert_old_quants(sd, diffusion_model_prefix, metadata=metadata)
+        if comfy.disk_tier.has_disk_tensors(sd):
+            if comfy.utils.needs_old_quant_conversion(sd, diffusion_model_prefix, metadata=metadata):
+                raise RuntimeError("Disk-tier loading does not support legacy quantization conversion.")
+        else:
+            sd, metadata = comfy.utils.convert_old_quants(sd, diffusion_model_prefix, metadata=metadata)
 
     model_config = model_detection.model_config_from_unet(sd, diffusion_model_prefix, metadata=metadata)
     if model_config is None:
@@ -1415,6 +1430,8 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
                     scaled_fp8_list.append(k[:-len("scaled_fp8")])
 
             if len(scaled_fp8_list) > 0:
+                if comfy.disk_tier.has_disk_tensors(sd):
+                    raise RuntimeError("Disk-tier loading does not support legacy quantization conversion for text encoders.")
                 out_sd = {}
                 for k in sd:
                     skip = False
@@ -1483,7 +1500,11 @@ def load_diffusion_model_state_dict(sd, model_options={}, metadata=None):
 
     custom_operations = model_options.get("custom_operations", None)
     if custom_operations is None:
-        sd, metadata = comfy.utils.convert_old_quants(sd, "", metadata=metadata)
+        if comfy.disk_tier.has_disk_tensors(sd):
+            if comfy.utils.needs_old_quant_conversion(sd, "", metadata=metadata):
+                raise RuntimeError("Disk-tier loading does not support legacy quantization conversion.")
+        else:
+            sd, metadata = comfy.utils.convert_old_quants(sd, "", metadata=metadata)
     parameters = comfy.utils.calculate_parameters(sd)
     weight_dtype = comfy.utils.weight_dtype(sd)
 

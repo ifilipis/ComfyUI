@@ -34,6 +34,7 @@ import comfy.lora
 import comfy.model_management
 import comfy.patcher_extension
 import comfy.utils
+import comfy.disk_tier
 from comfy.comfy_types import UnetWrapperFunction
 from comfy.quant_ops import QuantizedTensor
 from comfy.patcher_extension import CallbacksMP, PatcherInjection, WrappersMP
@@ -135,6 +136,13 @@ class LowVramPatch:
 
 LOWVRAM_PATCH_ESTIMATE_MATH_FACTOR = 2
 
+
+class BackupWeight:
+    def __init__(self, weight: torch.Tensor, inplace_update: bool, disk_source=None):
+        self.weight = weight
+        self.inplace_update = inplace_update
+        self.disk_source = disk_source
+
 def low_vram_patch_estimate_vram(model, key):
     weight, set_func, convert_func = get_key_weight(model, key)
     if weight is None:
@@ -235,6 +243,7 @@ class ModelPatcher:
         self.patches_uuid = uuid.uuid4()
         self.parent = None
         self.pinned = set()
+        self._disk_load_logged = set()
 
         self.attachments: dict[str] = {}
         self.additional_models: dict[str, list[ModelPatcher]] = {}
@@ -268,6 +277,8 @@ class ModelPatcher:
 
         if not hasattr(self.model, 'model_offload_buffer_memory'):
             self.model.model_offload_buffer_memory = 0
+        if not hasattr(self.model, 'model_loaded_weight_memory_ram'):
+            self.model.model_loaded_weight_memory_ram = 0
 
     def model_size(self):
         if self.size > 0:
@@ -612,14 +623,35 @@ class ModelPatcher:
             return sd
 
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
-        if key not in self.patches:
-            return
-
         weight, set_func, convert_func = get_key_weight(self.model, key)
+        disk_source = comfy.disk_tier.get_disk_source(self.model, key)
         inplace_update = self.weight_inplace_update or inplace_update
 
+        if key not in self.patches:
+            if disk_source is not None and weight.is_meta:
+                load_device = device_to if device_to is not None else self.offload_device
+                module_name = key.rsplit(".", 1)[0]
+                if module_name not in self._disk_load_logged:
+                    logging.info("Disk tier: loading module %s to %s.", module_name, load_device)
+                    self._disk_load_logged.add(module_name)
+                loaded_weight = disk_source.load(load_device)
+                comfy.utils.set_attr_param(self.model, key, loaded_weight)
+            return
+
         if key not in self.backup:
-            self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
+            if disk_source is not None:
+                meta_weight = torch.empty(disk_source.info.shape, device="meta", dtype=disk_source.info.dtype)
+                self.backup[key] = BackupWeight(meta_weight, inplace_update, disk_source=disk_source)
+            else:
+                self.backup[key] = BackupWeight(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
+
+        if disk_source is not None and weight.is_meta:
+            load_device = device_to if device_to is not None else self.offload_device
+            module_name = key.rsplit(".", 1)[0]
+            if module_name not in self._disk_load_logged:
+                logging.info("Disk tier: loading module %s to %s.", module_name, load_device)
+                self._disk_load_logged.add(module_name)
+            weight = disk_source.load(load_device)
 
         temp_dtype = comfy.model_management.lora_compute_dtype(device_to)
         if device_to is not None:
@@ -805,6 +837,8 @@ class ModelPatcher:
             self.model.model_loaded_weight_memory = mem_counter
             self.model.model_offload_buffer_memory = offload_buffer
             self.model.current_weight_patches_uuid = self.patches_uuid
+            if getattr(self.model, "comfy_disk_tier", False):
+                self.model.model_loaded_weight_memory_ram = comfy.disk_tier.calculate_ram_resident_bytes(self.model)
 
             for callback in self.get_all_callbacks(CallbacksMP.ON_LOAD):
                 callback(self, device_to, lowvram_model_memory, force_patch_weights, full_load)
@@ -845,10 +879,14 @@ class ModelPatcher:
 
             for k in keys:
                 bk = self.backup[k]
-                if bk.inplace_update:
-                    comfy.utils.copy_to_param(self.model, k, bk.weight)
+                if isinstance(bk, BackupWeight) and bk.disk_source is not None:
+                    meta_weight = torch.empty(bk.disk_source.info.shape, device="meta", dtype=bk.disk_source.info.dtype)
+                    comfy.utils.set_attr_param(self.model, k, meta_weight)
                 else:
-                    comfy.utils.set_attr_param(self.model, k, bk.weight)
+                    if bk.inplace_update:
+                        comfy.utils.copy_to_param(self.model, k, bk.weight)
+                    else:
+                        comfy.utils.set_attr_param(self.model, k, bk.weight)
 
             self.model.current_weight_patches_uuid = None
             self.backup.clear()
@@ -858,6 +896,8 @@ class ModelPatcher:
                 self.model.device = device_to
             self.model.model_loaded_weight_memory = 0
             self.model.model_offload_buffer_memory = 0
+            if getattr(self.model, "comfy_disk_tier", False):
+                self.model.model_loaded_weight_memory_ram = 0
 
             for m in self.model.modules():
                 if hasattr(m, "comfy_patched_weights"):
@@ -904,10 +944,14 @@ class ModelPatcher:
                                 self.unpatch_hooks()
                                 hooks_unpatched = True
 
-                            if bk.inplace_update:
-                                comfy.utils.copy_to_param(self.model, key, bk.weight)
+                            if isinstance(bk, BackupWeight) and bk.disk_source is not None:
+                                meta_weight = torch.empty(bk.disk_source.info.shape, device="meta", dtype=bk.disk_source.info.dtype)
+                                comfy.utils.set_attr_param(self.model, key, meta_weight)
                             else:
-                                comfy.utils.set_attr_param(self.model, key, bk.weight)
+                                if bk.inplace_update:
+                                    comfy.utils.copy_to_param(self.model, key, bk.weight)
+                                else:
+                                    comfy.utils.set_attr_param(self.model, key, bk.weight)
                             self.backup.pop(key)
 
                     weight_key = "{}.weight".format(n)
@@ -951,6 +995,8 @@ class ModelPatcher:
             self.model.lowvram_patch_counter += patch_counter
             self.model.model_loaded_weight_memory -= memory_freed
             self.model.model_offload_buffer_memory = offload_buffer
+            if getattr(self.model, "comfy_disk_tier", False):
+                comfy.disk_tier.enforce_ram_budget(self.model, unload_list)
             logging.info("Unloaded partially: {:.2f} MB freed, {:.2f} MB remains loaded, {:.2f} MB buffer reserved, lowvram patches: {}".format(memory_freed / (1024 * 1024), self.model.model_loaded_weight_memory / (1024 * 1024), offload_buffer / (1024 * 1024), self.model.lowvram_patch_counter))
             return memory_freed
 
@@ -1356,4 +1402,3 @@ class ModelPatcher:
     def __del__(self):
         self.unpin_all_weights()
         self.detach(unpatch_all=False)
-

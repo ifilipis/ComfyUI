@@ -149,6 +149,10 @@ parser.add_argument("--disable-async-offload", action="store_true", help="Disabl
 
 parser.add_argument("--force-non-blocking", action="store_true", help="Force ComfyUI to use non-blocking operations for all applicable tensors. This may improve performance on some non-Nvidia systems but can cause issues with some workflows.")
 
+parser.add_argument("--disk-weights", action="store_true", help="Enable disk-tier weight management for safetensors checkpoints.")
+parser.add_argument("--disk-weights-ram-budget", type=float, default=None, help="RAM budget in GB for disk-tier resident weights. Required when --disk-weights is enabled.")
+parser.add_argument("--enable-gpudirect", action="store_true", help="Enable GPUDirect Storage for disk-tier CUDA loads. Fails if GDS is unavailable.")
+
 parser.add_argument("--default-hashing-function", type=str, choices=['md5', 'sha1', 'sha256', 'sha512'], default='sha256', help="Allows you to choose the hash function to use for duplicate filename / contents comparison. Default is sha256.")
 
 parser.add_argument("--disable-smart-memory", action="store_true", help="Force ComfyUI to agressively offload to regular ram instead of keeping models in vram when it can.")

@@ -59,6 +59,14 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
     if device is None:
         device = torch.device("cpu")
     metadata = None
+    if args.disk_weights:
+        if not (ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft")):
+            raise ValueError("Disk-tier loading only supports .safetensors checkpoints.")
+        import comfy.disk_tier
+        sd = comfy.disk_tier.load_disk_state_dict(ckpt)
+        if return_metadata:
+            metadata = sd.metadata
+        return (sd, metadata) if return_metadata else sd
     if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
         try:
             with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
@@ -1207,6 +1215,14 @@ def detect_layer_quantization(state_dict, prefix):
             logging.info("Found quantization metadata version 1")
             return {"mixed_ops": True}
     return None
+
+def needs_old_quant_conversion(state_dict, model_prefix="", metadata=None):
+    if metadata is None:
+        metadata = {}
+    if "_quantization_metadata" in metadata:
+        return False
+    scaled_fp8_key = "{}scaled_fp8".format(model_prefix)
+    return scaled_fp8_key in state_dict
 
 def convert_old_quants(state_dict, model_prefix="", metadata={}):
     if metadata is None:

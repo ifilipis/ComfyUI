@@ -98,11 +98,34 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
     weight_has_function = len(s.weight_function) > 0
     bias_has_function = len(s.bias_function) > 0
 
-    weight = comfy.model_management.cast_to(s.weight, None, device, non_blocking=non_blocking, copy=weight_has_function, stream=offload_stream)
+    disk_sources = getattr(s, "comfy_disk_sources", None)
+    disk_weight_source = disk_sources.get("weight") if disk_sources else None
+    disk_bias_source = disk_sources.get("bias") if disk_sources else None
+    disk_loaded = False
+
+    if s.weight.is_meta and disk_weight_source is None:
+        raise RuntimeError("Disk-tier weight access requested but no disk source is available.")
+
+    if disk_weight_source is not None and s.weight.is_meta:
+        weight = disk_weight_source.load(device, dtype_override=dtype)
+        disk_loaded = True
+    else:
+        weight = comfy.model_management.cast_to(s.weight, None, device, non_blocking=non_blocking, copy=weight_has_function, stream=offload_stream)
 
     bias = None
     if s.bias is not None:
-        bias = comfy.model_management.cast_to(s.bias, bias_dtype, device, non_blocking=non_blocking, copy=bias_has_function, stream=offload_stream)
+        if disk_bias_source is not None and s.bias.is_meta:
+            bias = disk_bias_source.load(device, dtype_override=bias_dtype)
+            disk_loaded = True
+        else:
+            bias = comfy.model_management.cast_to(s.bias, bias_dtype, device, non_blocking=non_blocking, copy=bias_has_function, stream=offload_stream)
+
+    if disk_loaded:
+        offload_stream = None
+        last_device = getattr(s, "_comfy_disk_last_device", None)
+        if last_device != device:
+            logging.info("Disk tier: loaded weights for %s to %s.", s.__class__.__name__, device)
+            s._comfy_disk_last_device = device
 
     comfy.model_management.sync_stream(device, offload_stream)
 

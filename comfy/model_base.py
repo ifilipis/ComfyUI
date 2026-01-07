@@ -54,6 +54,7 @@ import comfy.model_management
 import comfy.patcher_extension
 import comfy.conds
 import comfy.ops
+from comfy.cli_args import args
 from enum import Enum
 from . import utils
 import comfy.latent_formats
@@ -299,6 +300,10 @@ class BaseModel(torch.nn.Module):
         return out
 
     def load_model_weights(self, sd, unet_prefix=""):
+        if args.disk_tier:
+            from comfy import disk_tier
+            if isinstance(sd, disk_tier.DiskStateDict):
+                return self._load_model_weights_disk(sd, unet_prefix, disk_tier)
         to_load = {}
         keys = list(sd.keys())
         for k in keys:
@@ -313,6 +318,64 @@ class BaseModel(torch.nn.Module):
         if len(u) > 0:
             logging.warning("unet unexpected: {}".format(u))
         del to_load
+        return self
+
+    def _load_model_weights_disk(self, sd, unet_prefix, disk_tier):
+        to_load = {}
+        keys = list(sd.keys())
+        for k in keys:
+            if k.startswith(unet_prefix):
+                to_load[k[len(unet_prefix):]] = sd.pop(k)
+
+        to_load = self.model_config.process_unet_state_dict(to_load)
+        param_names = set(dict(self.diffusion_model.named_parameters()).keys())
+        buffer_names = set(dict(self.diffusion_model.named_buffers()).keys())
+        missing = []
+        unexpected = []
+        disk_map = {}
+
+        for key, value in to_load.items():
+            full_key = f"diffusion_model.{key}"
+            if key in param_names:
+                if isinstance(value, disk_tier.DiskTensorProxy):
+                    info = value.info
+                    meta_tensor = torch.empty(info.entry.shape, dtype=info.entry.dtype, device="meta")
+                    utils.set_attr_param(self.diffusion_model, key, meta_tensor)
+                    disk_map[full_key] = info
+                    module_name, param_name = key.rsplit(".", 1) if "." in key else ("", key)
+                    module = self.diffusion_model if module_name == "" else utils.get_attr(self.diffusion_model, module_name)
+                    disk_tier.register_module_disk_info(module, param_name, info)
+                    if hasattr(module, "comfy_cast_weights"):
+                        module.comfy_cast_weights = True
+                else:
+                    utils.set_attr_param(self.diffusion_model, key, value.to(device=self.device, copy=True))
+            elif key in buffer_names:
+                if isinstance(value, disk_tier.DiskTensorProxy):
+                    info = value.info
+                    meta_tensor = torch.empty(info.entry.shape, dtype=info.entry.dtype, device="meta")
+                    utils.set_attr(self.diffusion_model, key, meta_tensor)
+                    disk_map[full_key] = info
+                    module_name, param_name = key.rsplit(".", 1) if "." in key else ("", key)
+                    module = self.diffusion_model if module_name == "" else utils.get_attr(self.diffusion_model, module_name)
+                    disk_tier.register_module_disk_info(module, param_name, info)
+                    if hasattr(module, "comfy_cast_weights"):
+                        module.comfy_cast_weights = True
+                else:
+                    utils.set_attr(self.diffusion_model, key, value.to(device=self.device, copy=True))
+            else:
+                unexpected.append(key)
+
+        for key in param_names.union(buffer_names):
+            if key not in to_load:
+                missing.append(key)
+
+        if len(missing) > 0:
+            logging.warning("unet missing: {}".format(missing))
+        if len(unexpected) > 0:
+            logging.warning("unet unexpected: {}".format(unexpected))
+        if disk_map:
+            disk_tier.attach_disk_map(self, disk_map)
+            disk_tier.update_disk_memory_stats(self)
         return self
 
     def process_latent_in(self, latent):

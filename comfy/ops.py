@@ -98,11 +98,28 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
     weight_has_function = len(s.weight_function) > 0
     bias_has_function = len(s.bias_function) > 0
 
-    weight = comfy.model_management.cast_to(s.weight, None, device, non_blocking=non_blocking, copy=weight_has_function, stream=offload_stream)
+    disk_info = getattr(s, "comfy_disk_tensors", None)
+    disk_weight = None
+    disk_bias = None
+    if disk_info is not None:
+        if hasattr(s, "weight") and getattr(s.weight, "is_meta", False) and "weight" in disk_info:
+            disk_weight = disk_info["weight"].provider.get_tensor(disk_info["weight"].key, device)
+            logging.debug("disk-tier load weight for %s", s.__class__.__name__)
+        if s.bias is not None and getattr(s.bias, "is_meta", False) and "bias" in disk_info:
+            disk_bias = disk_info["bias"].provider.get_tensor(disk_info["bias"].key, device, dtype_override=bias_dtype)
+            logging.debug("disk-tier load bias for %s", s.__class__.__name__)
+
+    if disk_weight is not None:
+        weight = disk_weight
+    else:
+        weight = comfy.model_management.cast_to(s.weight, None, device, non_blocking=non_blocking, copy=weight_has_function, stream=offload_stream)
 
     bias = None
     if s.bias is not None:
-        bias = comfy.model_management.cast_to(s.bias, bias_dtype, device, non_blocking=non_blocking, copy=bias_has_function, stream=offload_stream)
+        if disk_bias is not None:
+            bias = disk_bias
+        else:
+            bias = comfy.model_management.cast_to(s.bias, bias_dtype, device, non_blocking=non_blocking, copy=bias_has_function, stream=offload_stream)
 
     comfy.model_management.sync_stream(device, offload_stream)
 

@@ -59,6 +59,14 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
     if device is None:
         device = torch.device("cpu")
     metadata = None
+    if args.disk_tier:
+        if not (ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft")):
+            raise RuntimeError("disk-tier loading only supports .safetensors files.")
+        from comfy import disk_tier
+        sd = disk_tier.create_disk_state_dict(ckpt)
+        if return_metadata:
+            metadata = sd.metadata
+        return (sd, metadata) if return_metadata else sd
     if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
         try:
             with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:

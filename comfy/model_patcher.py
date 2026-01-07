@@ -34,6 +34,7 @@ import comfy.lora
 import comfy.model_management
 import comfy.patcher_extension
 import comfy.utils
+from comfy.cli_args import args
 from comfy.comfy_types import UnetWrapperFunction
 from comfy.quant_ops import QuantizedTensor
 from comfy.patcher_extension import CallbacksMP, PatcherInjection, WrappersMP
@@ -268,6 +269,12 @@ class ModelPatcher:
 
         if not hasattr(self.model, 'model_offload_buffer_memory'):
             self.model.model_offload_buffer_memory = 0
+
+        if not hasattr(self.model, 'model_loaded_weight_memory_cpu'):
+            self.model.model_loaded_weight_memory_cpu = 0
+
+        if not hasattr(self.model, 'model_disk_weight_memory'):
+            self.model.model_disk_weight_memory = 0
 
     def model_size(self):
         if self.size > 0:
@@ -616,6 +623,14 @@ class ModelPatcher:
             return
 
         weight, set_func, convert_func = get_key_weight(self.model, key)
+        if args.disk_tier:
+            from comfy import disk_tier
+            disk_map = disk_tier.get_disk_map(self.model)
+            if key in disk_map and getattr(weight, "is_meta", False):
+                device_target = device_to if device_to is not None else self.load_device
+                logging.info("disk-tier loading %s to %s", key, device_target)
+                weight = disk_tier.materialize_key(self.model, key, device_target)
+                comfy.utils.set_attr_param(self.model, key, weight)
         inplace_update = self.weight_inplace_update or inplace_update
 
         if key not in self.backup:
@@ -805,6 +820,9 @@ class ModelPatcher:
             self.model.model_loaded_weight_memory = mem_counter
             self.model.model_offload_buffer_memory = offload_buffer
             self.model.current_weight_patches_uuid = self.patches_uuid
+            if args.disk_tier:
+                from comfy import disk_tier
+                disk_tier.update_disk_memory_stats(self.model)
 
             for callback in self.get_all_callbacks(CallbacksMP.ON_LOAD):
                 callback(self, device_to, lowvram_model_memory, force_patch_weights, full_load)
@@ -951,6 +969,9 @@ class ModelPatcher:
             self.model.lowvram_patch_counter += patch_counter
             self.model.model_loaded_weight_memory -= memory_freed
             self.model.model_offload_buffer_memory = offload_buffer
+            if args.disk_tier:
+                from comfy import disk_tier
+                disk_tier.evict_to_disk(self.model, unload_list, disk_tier.disk_tier_ram_budget_bytes())
             logging.info("Unloaded partially: {:.2f} MB freed, {:.2f} MB remains loaded, {:.2f} MB buffer reserved, lowvram patches: {}".format(memory_freed / (1024 * 1024), self.model.model_loaded_weight_memory / (1024 * 1024), offload_buffer / (1024 * 1024), self.model.lowvram_patch_counter))
             return memory_freed
 
@@ -979,6 +1000,9 @@ class ModelPatcher:
             except Exception as e:
                 self.detach()
                 raise e
+            if args.disk_tier:
+                from comfy import disk_tier
+                disk_tier.update_disk_memory_stats(self.model)
 
             return self.model.model_loaded_weight_memory - current_used
 
@@ -1356,4 +1380,3 @@ class ModelPatcher:
     def __del__(self):
         self.unpin_all_weights()
         self.detach(unpatch_all=False)
-

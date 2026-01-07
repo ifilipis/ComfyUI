@@ -6,6 +6,7 @@ import logging
 
 from comfy import model_management
 from comfy.utils import ProgressBar
+from comfy.cli_args import args
 from .ldm.models.autoencoder import AutoencoderKL, AutoencodingEngine
 from .ldm.cascade.stage_a import StageA
 from .ldm.cascade.stage_c_coder import StageC_coder
@@ -1357,6 +1358,11 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
     vae = None
     model = None
     model_patcher = None
+    disk_tier = None
+    if args.disk_tier:
+        from comfy import disk_tier as disk_tier_module
+        if isinstance(sd, disk_tier_module.DiskStateDict):
+            disk_tier = disk_tier_module
 
     diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
     parameters = comfy.utils.calculate_parameters(sd, diffusion_model_prefix)
@@ -1395,7 +1401,12 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
 
     if model_config.clip_vision_prefix is not None:
         if output_clipvision:
-            clipvision = clip_vision.load_clipvision_from_sd(sd, model_config.clip_vision_prefix, True)
+            if disk_tier is not None:
+                clipvision_sd = {k: v for k, v in sd.items() if k.startswith(model_config.clip_vision_prefix)}
+                clipvision_sd = disk_tier.materialize_state_dict(clipvision_sd)
+                clipvision = clip_vision.load_clipvision_from_sd(clipvision_sd, model_config.clip_vision_prefix, True)
+            else:
+                clipvision = clip_vision.load_clipvision_from_sd(sd, model_config.clip_vision_prefix, True)
 
     if output_model:
         inital_load_device = model_management.unet_inital_load_device(parameters, unet_dtype)
@@ -1405,6 +1416,8 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
     if output_vae:
         vae_sd = comfy.utils.state_dict_prefix_replace(sd, {k: "" for k in model_config.vae_key_prefix}, filter_keys=True)
         vae_sd = model_config.process_vae_state_dict(vae_sd)
+        if disk_tier is not None:
+            vae_sd = disk_tier.materialize_state_dict(vae_sd)
         vae = VAE(sd=vae_sd, metadata=metadata)
 
     if output_clip:
@@ -1433,6 +1446,8 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
         if clip_target is not None:
             clip_sd = model_config.process_clip_state_dict(sd)
             if len(clip_sd) > 0:
+                if disk_tier is not None:
+                    clip_sd = disk_tier.materialize_state_dict(clip_sd)
                 parameters = comfy.utils.calculate_parameters(clip_sd)
                 clip = CLIP(clip_target, embedding_directory=embedding_directory, tokenizer_data=clip_sd, parameters=parameters, state_dict=clip_sd, model_options=te_model_options)
             else:

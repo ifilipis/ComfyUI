@@ -142,6 +142,10 @@ vram_group.add_argument("--lowvram", action="store_true", help="Split the unet i
 vram_group.add_argument("--novram", action="store_true", help="When lowvram isn't enough.")
 vram_group.add_argument("--cpu", action="store_true", help="To use the CPU for everything (slow).")
 
+parser.add_argument("--disk-tier", action="store_true", help="Enable disk-tier weight management for safetensors using fastsafetensors.")
+parser.add_argument("--disk-tier-ram-gb", type=float, default=None, help="Maximum RAM (GB) to use for disk-tier resident weights.")
+parser.add_argument("--disk-tier-gpudirect", action="store_true", help="Enable GPUDirect Storage for disk-tier loading. Requires libcufile and GDS support.")
+
 parser.add_argument("--reserve-vram", type=float, default=None, help="Set the amount of vram in GB you want to reserve for use by your OS/other software. By default some amount is reserved depending on your OS.")
 
 parser.add_argument("--async-offload", nargs='?', const=2, type=int, default=None, metavar="NUM_STREAMS", help="Use async weight offloading. An optional argument controls the amount of offload streams. Default is 2. Enabled by default on Nvidia.")

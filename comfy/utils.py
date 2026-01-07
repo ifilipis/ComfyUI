@@ -59,6 +59,22 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
     if device is None:
         device = torch.device("cpu")
     metadata = None
+    if args.disk_offload:
+        if not (ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft")):
+            raise ValueError("Disk-tier loading requires .safetensors checkpoints. Refusing to load: {}".format(ckpt))
+        import importlib.util
+        if importlib.util.find_spec("fastsafetensors") is None:
+            raise ValueError("Disk-tier loading requires fastsafetensors. Install fastsafetensors and retry.")
+        from comfy import disk_tier
+        debug_log = logging.getLogger(__name__).isEnabledFor(logging.DEBUG)
+        sd = disk_tier.build_disk_state_dict(
+            file_path=ckpt,
+            enable_gpudirect=args.enable_gpudirect,
+            device=device,
+            debug_log=debug_log,
+        )
+        metadata = sd.metadata
+        return (sd, metadata) if return_metadata else sd
     if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
         try:
             with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
@@ -107,6 +123,8 @@ def save_torch_file(sd, ckpt, metadata=None):
         safetensors.torch.save_file(sd, ckpt)
 
 def calculate_parameters(sd, prefix=""):
+    if hasattr(sd, "get_parameter_count"):
+        return sd.get_parameter_count(prefix)
     params = 0
     for k in sd.keys():
         if k.startswith(prefix):
@@ -115,6 +133,8 @@ def calculate_parameters(sd, prefix=""):
     return params
 
 def weight_dtype(sd, prefix=""):
+    if hasattr(sd, "get_weight_dtype"):
+        return sd.get_weight_dtype(prefix)
     dtypes = {}
     for k in sd.keys():
         if k.startswith(prefix):
@@ -1217,6 +1237,8 @@ def convert_old_quants(state_dict, model_prefix="", metadata={}):
         scaled_fp8_key = "{}scaled_fp8".format(model_prefix)
 
         if scaled_fp8_key in state_dict:
+            if hasattr(state_dict, "is_disk_tier") and state_dict.is_disk_tier():
+                raise RuntimeError("Disk-tier loading does not support scaled_fp8 conversion. Convert the checkpoint before enabling disk-tier.")
             scaled_fp8_weight = state_dict[scaled_fp8_key]
             scaled_fp8_dtype = scaled_fp8_weight.dtype
             if scaled_fp8_dtype == torch.float32:

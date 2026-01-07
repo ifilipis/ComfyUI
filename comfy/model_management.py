@@ -88,6 +88,13 @@ if args.deterministic:
     logging.info("Using deterministic algorithms for pytorch")
     torch.use_deterministic_algorithms(True, warn_only=True)
 
+DISK_OFFLOAD_ENABLED = args.disk_offload
+DISK_OFFLOAD_RAM_BUDGET = None
+if DISK_OFFLOAD_ENABLED:
+    if args.disk_offload_ram is None or args.disk_offload_ram <= 0:
+        raise ValueError("Disk offload requires --disk-offload-ram to be set (GB).")
+    DISK_OFFLOAD_RAM_BUDGET = int(args.disk_offload_ram * 1024 * 1024 * 1024)
+
 directml_enabled = False
 if args.directml is not None:
     logging.warning("WARNING: torch-directml barely works, is very slow, has not been updated in over 1 year and might be removed soon, please don't use it, there are better options.")
@@ -577,6 +584,15 @@ if args.reserve_vram is not None:
 
 def extra_reserved_memory():
     return EXTRA_RESERVED_VRAM
+
+def disk_offload_enabled():
+    return DISK_OFFLOAD_ENABLED
+
+def disk_offload_ram_budget():
+    return DISK_OFFLOAD_RAM_BUDGET
+
+def disk_offload_gpudirect():
+    return args.enable_gpudirect
 
 def minimum_inference_memory():
     return (1024 * 1024 * 1024) * 0.8 + extra_reserved_memory()

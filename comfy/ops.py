@@ -98,11 +98,29 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
     weight_has_function = len(s.weight_function) > 0
     bias_has_function = len(s.bias_function) > 0
 
-    weight = comfy.model_management.cast_to(s.weight, None, device, non_blocking=non_blocking, copy=weight_has_function, stream=offload_stream)
+    disk_provider = getattr(s, "comfy_disk_offload_provider", None)
+    disk_map = getattr(s, "comfy_disk_offload", None)
+    disk_loaded = False
+
+    if disk_provider is not None and disk_map is not None and hasattr(s.weight, "is_meta") and s.weight.is_meta:
+        entry = disk_map.get("weight")
+        if entry is None:
+            raise RuntimeError("Disk-tier weight entry missing for {}".format(s))
+        weight = disk_provider.get_tensor(entry.disk_key, device=device, dtype_override=None)
+        disk_loaded = True
+    else:
+        weight = comfy.model_management.cast_to(s.weight, None, device, non_blocking=non_blocking, copy=weight_has_function, stream=offload_stream)
 
     bias = None
     if s.bias is not None:
-        bias = comfy.model_management.cast_to(s.bias, bias_dtype, device, non_blocking=non_blocking, copy=bias_has_function, stream=offload_stream)
+        if disk_provider is not None and disk_map is not None and hasattr(s.bias, "is_meta") and s.bias.is_meta:
+            entry = disk_map.get("bias")
+            if entry is None:
+                raise RuntimeError("Disk-tier bias entry missing for {}".format(s))
+            bias = disk_provider.get_tensor(entry.disk_key, device=device, dtype_override=bias_dtype)
+            disk_loaded = True
+        else:
+            bias = comfy.model_management.cast_to(s.bias, bias_dtype, device, non_blocking=non_blocking, copy=bias_has_function, stream=offload_stream)
 
     comfy.model_management.sync_stream(device, offload_stream)
 
@@ -121,6 +139,8 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
             weight = f(weight)
 
     if offloadable:
+        if disk_loaded:
+            return weight, bias, (None, None, None)
         return weight, bias, (offload_stream, weight_a, bias_a)
     else:
         #Legacy function signature

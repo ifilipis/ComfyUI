@@ -299,6 +299,23 @@ class BaseModel(torch.nn.Module):
         return out
 
     def load_model_weights(self, sd, unet_prefix=""):
+        from comfy import disk_tier
+
+        if isinstance(sd, disk_tier.DiskStateDict):
+            to_load = sd.prefixed_view(unet_prefix)
+            to_load = self.model_config.process_unet_state_dict(to_load)
+            if isinstance(to_load, disk_tier.DiskStateDict):
+                disk_tier.apply_disk_offload(self.diffusion_model, to_load, "")
+                model_keys = set(self.diffusion_model.state_dict().keys())
+                disk_keys = set(to_load.keys())
+                missing = sorted(model_keys - disk_keys)
+                unexpected = sorted(disk_keys - model_keys)
+                if missing:
+                    logging.warning("unet missing: {}".format(missing))
+                if unexpected:
+                    logging.warning("unet unexpected: {}".format(unexpected))
+                return self
+
         to_load = {}
         keys = list(sd.keys())
         for k in keys:

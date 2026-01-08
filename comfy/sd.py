@@ -287,10 +287,15 @@ class CLIP:
         return self.encode_from_tokens(tokens)
 
     def load_sd(self, sd, full_model=False):
+        if model_management.disk_cache_enabled() and hasattr(sd, "meta"):
+            model_management.register_disk_state_dict(self.cond_stage_model, sd)
         if full_model:
-            return self.cond_stage_model.load_state_dict(sd, strict=False)
+            out = self.cond_stage_model.load_state_dict(sd, strict=False)
         else:
-            return self.cond_stage_model.load_sd(sd)
+            out = self.cond_stage_model.load_sd(sd)
+        if model_management.disk_cache_enabled() and hasattr(sd, "meta"):
+            model_management.prime_disk_cache(self.cond_stage_model)
+        return out
 
     def get_sd(self):
         sd_clip = self.cond_stage_model.state_dict()
@@ -335,6 +340,7 @@ class VAE:
         self.upscale_index_formula = None
         self.extra_1d_channel = None
         self.crop_input = True
+        sd_shape = lambda key: comfy.utils.state_dict_shape(sd, key)
 
         if config is None:
             if "decoder.mid.block_1.mix_factor" in sd:
@@ -346,7 +352,7 @@ class VAE:
                                                             encoder_config={'target': "comfy.ldm.modules.diffusionmodules.model.Encoder", 'params': encoder_config},
                                                             decoder_config={'target': "comfy.ldm.modules.temporal_ae.VideoDecoder", 'params': decoder_config})
             elif "taesd_decoder.1.weight" in sd:
-                self.latent_channels = sd["taesd_decoder.1.weight"].shape[1]
+                self.latent_channels = sd_shape("taesd_decoder.1.weight")[1]
                 self.first_stage_model = comfy.taesd.taesd.TAESD(latent_channels=self.latent_channels)
             elif "vquantizer.codebook.weight" in sd: #VQGan: stage a of stable cascade
                 self.first_stage_model = StageA()
@@ -377,9 +383,9 @@ class VAE:
                 self.downscale_ratio = 32
                 self.latent_channels = 16
             elif "decoder.conv_in.weight" in sd:
-                if sd['decoder.conv_in.weight'].shape[1] == 64:
+                if sd_shape('decoder.conv_in.weight')[1] == 64:
                     ddconfig = {"block_out_channels": [128, 256, 512, 512, 1024, 1024], "in_channels": 3, "out_channels": 3, "num_res_blocks": 2, "ffactor_spatial": 32, "downsample_match_channel": True, "upsample_match_channel": True}
-                    self.latent_channels = ddconfig['z_channels'] = sd["decoder.conv_in.weight"].shape[1]
+                    self.latent_channels = ddconfig['z_channels'] = sd_shape("decoder.conv_in.weight")[1]
                     self.downscale_ratio = 32
                     self.upscale_ratio = 32
                     self.working_dtypes = [torch.float16, torch.bfloat16, torch.float32]
@@ -389,9 +395,9 @@ class VAE:
 
                     self.memory_used_encode = lambda shape, dtype: (700 * shape[2] * shape[3]) * model_management.dtype_size(dtype)
                     self.memory_used_decode = lambda shape, dtype: (700 * shape[2] * shape[3] * 32 * 32) * model_management.dtype_size(dtype)
-                elif sd['decoder.conv_in.weight'].shape[1] == 32 and sd['decoder.conv_in.weight'].ndim == 5:
+                elif sd_shape('decoder.conv_in.weight')[1] == 32 and len(sd_shape('decoder.conv_in.weight')) == 5:
                     ddconfig = {"block_out_channels": [128, 256, 512, 1024, 1024], "in_channels": 3, "out_channels": 3, "num_res_blocks": 2, "ffactor_spatial": 16, "ffactor_temporal": 4, "downsample_match_channel": True, "upsample_match_channel": True, "refiner_vae": False}
-                    self.latent_channels = ddconfig['z_channels'] = sd["decoder.conv_in.weight"].shape[1]
+                    self.latent_channels = ddconfig['z_channels'] = sd_shape("decoder.conv_in.weight")[1]
                     self.working_dtypes = [torch.float16, torch.bfloat16, torch.float32]
                     self.upscale_ratio = (lambda a: max(0, a * 4 - 3), 16, 16)
                     self.upscale_index_formula = (4, 16, 16)
@@ -414,7 +420,7 @@ class VAE:
                         self.downscale_ratio = 4
                         self.upscale_ratio = 4
 
-                    self.latent_channels = ddconfig['z_channels'] = sd["decoder.conv_in.weight"].shape[1]
+                    self.latent_channels = ddconfig['z_channels'] = sd_shape("decoder.conv_in.weight")[1]
                     if 'decoder.post_quant_conv.weight' in sd:
                         sd = comfy.utils.state_dict_prefix_replace(sd, {"decoder.post_quant_conv.": "post_quant_conv.", "encoder.quant_conv.": "quant_conv."})
 
@@ -427,7 +433,7 @@ class VAE:
                         self.memory_used_decode = lambda shape, dtype: old_memory_used_decode(shape, dtype) *  4.0
 
                     if 'post_quant_conv.weight' in sd:
-                        self.first_stage_model = AutoencoderKL(ddconfig=ddconfig, embed_dim=sd['post_quant_conv.weight'].shape[1])
+                        self.first_stage_model = AutoencoderKL(ddconfig=ddconfig, embed_dim=sd_shape('post_quant_conv.weight')[1])
                     else:
                         self.first_stage_model = AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
                                                                     encoder_config={'target': "comfy.ldm.modules.diffusionmodules.model.Encoder", 'params': ddconfig},
@@ -462,11 +468,11 @@ class VAE:
                 self.downscale_index_formula = (6, 8, 8)
                 self.working_dtypes = [torch.float16, torch.float32]
             elif "decoder.up_blocks.0.res_blocks.0.conv1.conv.weight" in sd: #lightricks ltxv
-                tensor_conv1 = sd["decoder.up_blocks.0.res_blocks.0.conv1.conv.weight"]
+                tensor_conv1_shape = sd_shape("decoder.up_blocks.0.res_blocks.0.conv1.conv.weight")
                 version = 0
-                if tensor_conv1.shape[0] == 512:
+                if tensor_conv1_shape[0] == 512:
                     version = 0
-                elif tensor_conv1.shape[0] == 1024:
+                elif tensor_conv1_shape[0] == 1024:
                     version = 1
                     if "encoder.down_blocks.1.conv.conv.bias" in sd:
                         version = 2
@@ -483,9 +489,9 @@ class VAE:
                 self.downscale_ratio = (lambda a: max(0, math.floor((a + 7) / 8)), 32, 32)
                 self.downscale_index_formula = (8, 32, 32)
                 self.working_dtypes = [torch.bfloat16, torch.float32]
-            elif "decoder.conv_in.conv.weight" in sd and sd['decoder.conv_in.conv.weight'].shape[1] == 32:
+            elif "decoder.conv_in.conv.weight" in sd and sd_shape('decoder.conv_in.conv.weight')[1] == 32:
                 ddconfig = {"block_out_channels": [128, 256, 512, 1024, 1024], "in_channels": 3, "out_channels": 3, "num_res_blocks": 2, "ffactor_spatial": 16, "ffactor_temporal": 4, "downsample_match_channel": True, "upsample_match_channel": True}
-                ddconfig['z_channels'] = sd["decoder.conv_in.conv.weight"].shape[1]
+                ddconfig['z_channels'] = sd_shape("decoder.conv_in.conv.weight")[1]
                 self.latent_channels = 32
                 self.upscale_ratio = (lambda a: max(0, a * 4 - 3), 16, 16)
                 self.upscale_index_formula = (4, 16, 16)
@@ -509,8 +515,8 @@ class VAE:
                 self.downscale_ratio = (lambda a: max(0, math.floor((a + 3) / 4)), 8, 8)
                 self.downscale_index_formula = (4, 8, 8)
                 self.latent_dim = 3
-                self.latent_channels = ddconfig['z_channels'] = sd["decoder.conv_in.conv.weight"].shape[1]
-                self.first_stage_model = AutoencoderKL(ddconfig=ddconfig, embed_dim=sd['post_quant_conv.weight'].shape[1])
+                self.latent_channels = ddconfig['z_channels'] = sd_shape("decoder.conv_in.conv.weight")[1]
+                self.first_stage_model = AutoencoderKL(ddconfig=ddconfig, embed_dim=sd_shape('post_quant_conv.weight')[1])
                 #This is likely to significantly over-estimate with single image or low frame counts as the
                 #implementation is able to completely skip caching. Rework if used as an image only VAE
                 self.memory_used_decode = lambda shape, dtype: (2800 * min(8, ((shape[2] - 1) * 4) + 1) * shape[3] * shape[4] * (8 * 8)) * model_management.dtype_size(dtype)
@@ -543,14 +549,14 @@ class VAE:
                     self.memory_used_encode = lambda shape, dtype: 3300 * shape[3] * shape[4] * model_management.dtype_size(dtype)
                     self.memory_used_decode = lambda shape, dtype: 8000 * shape[3] * shape[4] * (16 * 16) * model_management.dtype_size(dtype)
                 else:  # Wan 2.1 VAE
-                    dim = sd["decoder.head.0.gamma"].shape[0]
+                    dim = sd_shape("decoder.head.0.gamma")[0]
                     self.upscale_ratio = (lambda a: max(0, a * 4 - 3), 8, 8)
                     self.upscale_index_formula = (4, 8, 8)
                     self.downscale_ratio = (lambda a: max(0, math.floor((a + 3) / 4)), 8, 8)
                     self.downscale_index_formula = (4, 8, 8)
                     self.latent_dim = 3
                     self.latent_channels = 16
-                    self.output_channels = sd["encoder.conv1.weight"].shape[1]
+                    self.output_channels = sd_shape("encoder.conv1.weight")[1]
                     self.pad_channel_value = 1.0
                     ddconfig = {"dim": dim, "z_dim": self.latent_channels, "dim_mult": [1, 2, 4, 4], "num_res_blocks": 2, "attn_scales": [], "temperal_downsample": [False, True, True], "image_channels": self.output_channels, "dropout": 0.0}
                     self.first_stage_model = comfy.ldm.wan.vae.WanVAE(**ddconfig)
@@ -626,7 +632,7 @@ class VAE:
                 self.working_dtypes = [torch.float32]
                 self.crop_input = False
             elif "decoder.22.bias" in sd: # taehv, taew and lighttae
-                self.latent_channels = sd["decoder.1.weight"].shape[1]
+                self.latent_channels = sd_shape("decoder.1.weight")[1]
                 self.latent_dim = 3
                 self.upscale_ratio = (lambda a: max(0, a * 4 - 3), 16, 16)
                 self.upscale_index_formula = (4, 16, 16)
@@ -637,12 +643,12 @@ class VAE:
                     self.process_input = lambda image: (_ for _ in ()).throw(NotImplementedError("This light tae doesn't support encoding currently"))
                     self.process_output = lambda image: image
                     self.memory_used_decode = lambda shape, dtype: (1800 * (max(1, (shape[-3] ** 0.7 * 0.1)) * shape[-2] * shape[-1] * 16 * 16) * model_management.dtype_size(dtype))
-                elif self.latent_channels == 32 and sd["decoder.22.bias"].shape[0] == 12: # lighttae_hv15
+                elif self.latent_channels == 32 and sd_shape("decoder.22.bias")[0] == 12: # lighttae_hv15
                     self.first_stage_model = comfy.taesd.taehv.TAEHV(latent_channels=self.latent_channels, latent_format=comfy.latent_formats.HunyuanVideo15)
                     self.process_input = lambda image: (_ for _ in ()).throw(NotImplementedError("This light tae doesn't support encoding currently"))
                     self.memory_used_decode = lambda shape, dtype: (1200 * (max(1, (shape[-3] ** 0.7 * 0.05)) * shape[-2] * shape[-1] * 32 * 32) * model_management.dtype_size(dtype))
                 else:
-                    if sd["decoder.1.weight"].dtype == torch.float16: # taehv currently only available in float16, so assume it's not lighttaew2_1 as otherwise state dicts are identical
+                    if comfy.utils.state_dict_dtype(sd, "decoder.1.weight") == torch.float16: # taehv currently only available in float16, so assume it's not lighttaew2_1 as otherwise state dicts are identical
                         latent_format=comfy.latent_formats.HunyuanVideo
                     else:
                         latent_format=None # lighttaew2_1 doesn't need scaling
@@ -662,12 +668,16 @@ class VAE:
             self.first_stage_model = AutoencoderKL(**(config['params']))
         self.first_stage_model = self.first_stage_model.eval()
 
+        if model_management.disk_cache_enabled() and hasattr(sd, "meta"):
+            model_management.register_disk_state_dict(self.first_stage_model, sd)
         m, u = self.first_stage_model.load_state_dict(sd, strict=False)
         if len(m) > 0:
             logging.warning("Missing VAE keys {}".format(m))
 
         if len(u) > 0:
             logging.debug("Leftover VAE keys {}".format(u))
+        if model_management.disk_cache_enabled() and hasattr(sd, "meta"):
+            model_management.prime_disk_cache(self.first_stage_model)
 
         if device is None:
             device = model_management.vae_device()
@@ -983,6 +993,8 @@ def load_style_model(ckpt_path):
         model = comfy.ldm.flux.redux.ReduxImageEncoder()
     else:
         raise Exception("invalid style model {}".format(ckpt_path))
+    if model_management.disk_cache_enabled() and hasattr(model_data, "meta"):
+        model_management.register_disk_state_dict(model, model_data)
     model.load_state_dict(model_data)
     return StyleModel(model)
 
@@ -1055,16 +1067,16 @@ def detect_te_model(sd):
     if "model.encoder.layers.0.mixer.Wqkv.weight" in sd:
         return TEModel.JINA_CLIP_2
     if "encoder.block.23.layer.1.DenseReluDense.wi_1.weight" in sd:
-        weight = sd["encoder.block.23.layer.1.DenseReluDense.wi_1.weight"]
-        if weight.shape[-1] == 4096:
+        shape = comfy.utils.state_dict_shape(sd, "encoder.block.23.layer.1.DenseReluDense.wi_1.weight")
+        if shape[-1] == 4096:
             return TEModel.T5_XXL
-        elif weight.shape[-1] == 2048:
+        elif shape[-1] == 2048:
             return TEModel.T5_XL
     if 'encoder.block.23.layer.1.DenseReluDense.wi.weight' in sd:
         return TEModel.T5_XXL_OLD
     if "encoder.block.0.layer.0.SelfAttention.k.weight" in sd:
-        weight = sd['encoder.block.0.layer.0.SelfAttention.k.weight']
-        if weight.shape[0] == 384:
+        shape = comfy.utils.state_dict_shape(sd, "encoder.block.0.layer.0.SelfAttention.k.weight")
+        if shape[0] == 384:
             return TEModel.BYT5_SMALL_GLYPH
         return TEModel.T5_BASE
     if 'model.layers.0.post_feedforward_layernorm.weight' in sd:
@@ -1074,19 +1086,19 @@ def detect_te_model(sd):
             return TEModel.GEMMA_3_4B
         return TEModel.GEMMA_2_2B
     if 'model.layers.0.self_attn.k_proj.bias' in sd:
-        weight = sd['model.layers.0.self_attn.k_proj.bias']
-        if weight.shape[0] == 256:
+        shape = comfy.utils.state_dict_shape(sd, "model.layers.0.self_attn.k_proj.bias")
+        if shape[0] == 256:
             return TEModel.QWEN25_3B
-        if weight.shape[0] == 512:
+        if shape[0] == 512:
             return TEModel.QWEN25_7B
     if "model.layers.0.post_attention_layernorm.weight" in sd:
-        weight = sd['model.layers.0.post_attention_layernorm.weight']
+        shape = comfy.utils.state_dict_shape(sd, "model.layers.0.post_attention_layernorm.weight")
         if 'model.layers.0.self_attn.q_norm.weight' in sd:
-            if weight.shape[0] == 2560:
+            if shape[0] == 2560:
                 return TEModel.QWEN3_4B
-            elif weight.shape[0] == 2048:
+            elif shape[0] == 2048:
                 return TEModel.QWEN3_2B
-        if weight.shape[0] == 5120:
+        if shape[0] == 5120:
             if "model.layers.39.post_attention_layernorm.weight" in sd:
                 return TEModel.MISTRAL3_24B
             else:

@@ -113,6 +113,11 @@ See what ComfyUI can do with the [example workflows](https://comfyanonymous.gith
 
 Workflow examples can be found on the [Examples page](https://comfyanonymous.github.io/ComfyUI_examples/)
 
+### Disk-backed safetensors weights
+
+- `--disk-weight-cache-max-gb`: Limit RAM used for disk-backed model weights (0 disables the disk tier cache).
+- `--disk-weight-gds`: Enable GPUDirect Storage for disk→GPU weight loads (fails if GDS/libcufile is unavailable).
+
 ## Release Process
 
 ComfyUI follows a weekly release cycle targeting Monday but this regularly changes because of model releases or large changes to the codebase. There are three interconnected repositories:

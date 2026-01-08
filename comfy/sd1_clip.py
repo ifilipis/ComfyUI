@@ -430,8 +430,7 @@ def load_embed(embedding_name, embedding_directory, embedding_size, embed_key=No
 
     try:
         if embed_path.lower().endswith(".safetensors"):
-            import safetensors.torch
-            embed = safetensors.torch.load_file(embed_path, device="cpu")
+            embed = comfy.utils.load_torch_file(embed_path, safe_load=True)
         else:
             try:
                 embed = torch.load(embed_path, weights_only=True, map_location="cpu")

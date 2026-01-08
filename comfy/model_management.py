@@ -16,6 +16,9 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+import collections
+import dataclasses
+from typing import Optional
 import psutil
 import logging
 from enum import Enum
@@ -27,6 +30,7 @@ import platform
 import weakref
 import gc
 import os
+import comfy.utils
 
 class VRAMState(Enum):
     DISABLED = 0    #No vram present: no need to move models to vram
@@ -451,12 +455,170 @@ except:
 
 current_loaded_models = []
 
+DISK_WEIGHT_CACHE_MAX_BYTES = int(args.disk_weight_cache_max_gb * 1024 * 1024 * 1024)
+DISK_WEIGHT_GDS = args.disk_weight_gds
+
+@dataclasses.dataclass(frozen=True)
+class DiskTensorRef:
+    state_dict: object
+    key: str
+    meta: object
+
+class DiskWeightCache:
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self.total_bytes = 0
+        self.entries: collections.OrderedDict[tuple[int, str], tuple[weakref.ref, str, int]] = collections.OrderedDict()
+
+    def enabled(self) -> bool:
+        return self.max_bytes > 0
+
+    def note_loaded(self, module, param_name: str, param: torch.Tensor) -> None:
+        if not self.enabled():
+            return
+        if not is_device_cpu(param.device):
+            return
+        size = param.nbytes
+        key = (id(module), param_name)
+        existing = self.entries.pop(key, None)
+        if existing is not None:
+            self.total_bytes -= existing[2]
+        self.entries[key] = (weakref.ref(module), param_name, size)
+        self.total_bytes += size
+        self._evict_if_needed()
+
+    def _evict_if_needed(self):
+        while self.total_bytes > self.max_bytes and self.entries:
+            (_, _), (module_ref, param_name, size) = self.entries.popitem(last=False)
+            module = module_ref()
+            if module is None:
+                self.total_bytes -= size
+                continue
+            param = getattr(module, param_name, None)
+            if param is None:
+                self.total_bytes -= size
+                continue
+            disk_ref = getattr(param, "_comfy_disk_ref", None)
+            if disk_ref is None:
+                self.total_bytes -= size
+                continue
+            meta = disk_ref.meta
+            meta_tensor = torch.empty(meta.shape, device="meta", dtype=meta.dtype)
+            new_param = torch.nn.Parameter(meta_tensor, requires_grad=False)
+            new_param._comfy_disk_ref = disk_ref
+            setattr(module, param_name, new_param)
+            self.total_bytes -= size
+
+    def evict_bytes(self, bytes_to_free: int) -> int:
+        freed = 0
+        while freed < bytes_to_free and self.entries:
+            (_, _), (module_ref, param_name, size) = self.entries.popitem(last=False)
+            module = module_ref()
+            if module is None:
+                freed += size
+                self.total_bytes -= size
+                continue
+            param = getattr(module, param_name, None)
+            if param is None:
+                freed += size
+                self.total_bytes -= size
+                continue
+            disk_ref = getattr(param, "_comfy_disk_ref", None)
+            if disk_ref is None:
+                freed += size
+                self.total_bytes -= size
+                continue
+            meta = disk_ref.meta
+            meta_tensor = torch.empty(meta.shape, device="meta", dtype=meta.dtype)
+            new_param = torch.nn.Parameter(meta_tensor, requires_grad=False)
+            new_param._comfy_disk_ref = disk_ref
+            setattr(module, param_name, new_param)
+            freed += size
+            self.total_bytes -= size
+        return freed
+
+DISK_WEIGHT_CACHE = DiskWeightCache(DISK_WEIGHT_CACHE_MAX_BYTES)
+if DISK_WEIGHT_CACHE_MAX_BYTES > 0:
+    logging.info("Disk weight RAM cache limit: {:.2f} GB (GDS {}).".format(DISK_WEIGHT_CACHE_MAX_BYTES / (1024 ** 3), "enabled" if DISK_WEIGHT_GDS else "disabled"))
+
+def disk_cache_enabled() -> bool:
+    return DISK_WEIGHT_CACHE.enabled()
+
+def register_disk_state_dict(model, state_dict) -> None:
+    if not hasattr(state_dict, "meta"):
+        return
+    for key in state_dict.keys():
+        try:
+            param = comfy.utils.get_attr(model, key)
+        except Exception:
+            continue
+        if not isinstance(param, torch.Tensor):
+            continue
+        meta = state_dict.meta(key)
+        param._comfy_disk_ref = DiskTensorRef(state_dict=state_dict, key=key, meta=meta)
+
+def prime_disk_cache(model) -> None:
+    if not disk_cache_enabled():
+        return
+    for module in model.modules():
+        for name, param in module.named_parameters(recurse=False):
+            if getattr(param, "_comfy_disk_ref", None) is None:
+                continue
+            if getattr(param, "is_meta", False):
+                continue
+            DISK_WEIGHT_CACHE.note_loaded(module, name, param)
+
+def materialize_disk_tensor(tensor: torch.Tensor, device: torch.device, dtype: Optional[torch.dtype] = None, allow_gds: bool = False):
+    if not getattr(tensor, "is_meta", False):
+        return tensor
+    disk_ref = getattr(tensor, "_comfy_disk_ref", None)
+    if disk_ref is None:
+        return tensor
+    load_dtype = dtype or disk_ref.meta.dtype
+    loaded = disk_ref.state_dict.get_tensor(
+        disk_ref.key,
+        device=device,
+        dtype=load_dtype,
+        allow_gds=allow_gds,
+        cache_mode="cache",
+    )
+    loaded = loaded.to(device=device)
+    loaded_tensor = torch.nn.Parameter(loaded, requires_grad=False)
+    loaded_tensor._comfy_disk_ref = disk_ref
+    return loaded_tensor
+
+def materialize_module_weights(module, device: torch.device, allow_gds: bool = False):
+    for name, param in module.named_parameters(recurse=False):
+        if getattr(param, "is_meta", False):
+            loaded_param = materialize_disk_tensor(param, device, dtype=param.dtype, allow_gds=allow_gds)
+            if loaded_param is not param:
+                setattr(module, name, loaded_param)
+                DISK_WEIGHT_CACHE.note_loaded(module, name, loaded_param)
+
+def register_disk_weight_hooks(model):
+    if not disk_cache_enabled():
+        return
+    for module in model.modules():
+        if getattr(module, "_comfy_disk_hook", None) is not None:
+            continue
+        def _hook(mod, _args, _kwargs):
+            device = getattr(mod, "_comfy_disk_device", None)
+            if device is None:
+                for p in mod.parameters(recurse=False):
+                    if not getattr(p, "is_meta", False):
+                        device = p.device
+                        break
+            if device is None:
+                device = torch.device("cpu")
+            materialize_module_weights(mod, device, allow_gds=DISK_WEIGHT_GDS)
+        module._comfy_disk_hook = module.register_forward_pre_hook(_hook, with_kwargs=True)
+
 def module_size(module):
     module_mem = 0
     sd = module.state_dict()
     for k in sd:
         t = sd[k]
-        module_mem += t.nbytes
+        module_mem += t.numel() * t.element_size()
     return module_mem
 
 class LoadedModel:
@@ -628,6 +790,11 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
         minimum_memory_required = extra_mem
     else:
         minimum_memory_required = max(inference_memory, minimum_memory_required + extra_reserved_memory())
+
+    if disk_cache_enabled():
+        cpu_free = get_free_memory(torch.device("cpu"))
+        if cpu_free < inference_memory:
+            DISK_WEIGHT_CACHE.evict_bytes(int(inference_memory - cpu_free))
 
     models_temp = set()
     for m in models:
@@ -1110,6 +1277,10 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
 
 def cast_to_device(tensor, device, dtype, copy=False):
     non_blocking = device_supports_non_blocking(device)
+    if getattr(tensor, "is_meta", False):
+        loaded = materialize_disk_tensor(tensor, device, dtype=dtype, allow_gds=DISK_WEIGHT_GDS)
+        if loaded is not tensor:
+            tensor = loaded
     return cast_to(tensor, dtype=dtype, device=device, non_blocking=non_blocking, copy=copy)
 
 

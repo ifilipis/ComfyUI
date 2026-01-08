@@ -299,20 +299,30 @@ class BaseModel(torch.nn.Module):
         return out
 
     def load_model_weights(self, sd, unet_prefix=""):
-        to_load = {}
-        keys = list(sd.keys())
-        for k in keys:
-            if k.startswith(unet_prefix):
-                to_load[k[len(unet_prefix):]] = sd.pop(k)
+        if unet_prefix:
+            to_load = comfy.utils.state_dict_prefix_replace(sd, {unet_prefix: ""}, filter_keys=True)
+        else:
+            to_load = sd
 
         to_load = self.model_config.process_unet_state_dict(to_load)
+        if comfy.model_management.disk_cache_enabled() and hasattr(to_load, "meta"):
+            comfy.model_management.register_disk_state_dict(self.diffusion_model, to_load)
+
         m, u = self.diffusion_model.load_state_dict(to_load, strict=False)
         if len(m) > 0:
             logging.warning("unet missing: {}".format(m))
 
         if len(u) > 0:
             logging.warning("unet unexpected: {}".format(u))
-        del to_load
+        if comfy.model_management.disk_cache_enabled() and hasattr(to_load, "meta"):
+            comfy.model_management.prime_disk_cache(self.diffusion_model)
+        if unet_prefix:
+            if hasattr(sd, "discard_prefix"):
+                sd.discard_prefix(unet_prefix)
+            else:
+                for k in list(sd.keys()):
+                    if k.startswith(unet_prefix):
+                        sd.pop(k)
         return self
 
     def process_latent_in(self, latent):

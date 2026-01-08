@@ -269,6 +269,11 @@ class ModelPatcher:
         if not hasattr(self.model, 'model_offload_buffer_memory'):
             self.model.model_offload_buffer_memory = 0
 
+        if comfy.model_management.disk_cache_enabled():
+            for module in self.model.modules():
+                module._comfy_disk_device = self.load_device
+            comfy.model_management.register_disk_weight_hooks(self.model)
+
     def model_size(self):
         if self.size > 0:
             return self.size
@@ -783,6 +788,8 @@ class ModelPatcher:
 
             for x in load_completely:
                 x[2].to(device_to)
+                if comfy.model_management.disk_cache_enabled():
+                    x[2]._comfy_disk_device = device_to
 
             for x in offloaded:
                 n = x[1]
@@ -798,6 +805,9 @@ class ModelPatcher:
                 self.model.model_lowvram = False
                 if full_load:
                     self.model.to(device_to)
+                    if comfy.model_management.disk_cache_enabled():
+                        for module in self.model.modules():
+                            module._comfy_disk_device = device_to
                     mem_counter = self.model_size()
 
             self.model.lowvram_patch_counter += patch_counter
@@ -856,6 +866,9 @@ class ModelPatcher:
             if device_to is not None:
                 self.model.to(device_to)
                 self.model.device = device_to
+                if comfy.model_management.disk_cache_enabled():
+                    for module in self.model.modules():
+                        module._comfy_disk_device = device_to
             self.model.model_loaded_weight_memory = 0
             self.model.model_offload_buffer_memory = 0
 
@@ -915,6 +928,8 @@ class ModelPatcher:
                     if move_weight:
                         cast_weight = self.force_cast_weights
                         m.to(device_to)
+                        if comfy.model_management.disk_cache_enabled():
+                            m._comfy_disk_device = device_to
                         module_mem += move_weight_functions(m, device_to)
                         if lowvram_possible:
                             if weight_key in self.patches:
@@ -1356,4 +1371,3 @@ class ModelPatcher:
     def __del__(self):
         self.unpin_all_weights()
         self.detach(unpatch_all=False)
-

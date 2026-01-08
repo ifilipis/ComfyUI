@@ -166,6 +166,8 @@ parser.add_argument("--disable-pinned-memory", action="store_true", help="Disabl
 
 parser.add_argument("--mmap-torch-files", action="store_true", help="Use mmap when loading ckpt/pt files.")
 parser.add_argument("--disable-mmap", action="store_true", help="Don't use mmap when loading safetensors.")
+parser.add_argument("--disk-weight-cache-max-gb", type=float, default=0.0, help="Maximum RAM (in GB) to use for disk-backed model weights loaded from safetensors. 0 disables disk tier caching.")
+parser.add_argument("--disk-weight-gds", action="store_true", help="Enable GPUDirect Storage (GDS) for disk->GPU safetensors weight loads. Fails if GDS is unavailable.")
 
 parser.add_argument("--dont-print-server", action="store_true", help="Don't print server output.")
 parser.add_argument("--quick-test-for-ci", action="store_true", help="Quick test for CI.")

@@ -60,16 +60,11 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
         device = torch.device("cpu")
     metadata = None
     if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
+        from .safetensors_stream import StreamStateDict
         try:
-            with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
-                sd = {}
-                for k in f.keys():
-                    tensor = f.get_tensor(k)
-                    if DISABLE_MMAP:  # TODO: Not sure if this is the best way to bypass the mmap issues
-                        tensor = tensor.to(device=device, copy=True)
-                    sd[k] = tensor
-                if return_metadata:
-                    metadata = f.metadata()
+            sd = StreamStateDict(ckpt, device=device, allow_gds=args.disk_weight_gds, disable_mmap=DISABLE_MMAP)
+            if return_metadata:
+                metadata = sd.metadata()
         except Exception as e:
             if len(e.args) > 0:
                 message = e.args[0]
@@ -106,20 +101,39 @@ def save_torch_file(sd, ckpt, metadata=None):
     else:
         safetensors.torch.save_file(sd, ckpt)
 
+def state_dict_meta(sd, key):
+    if hasattr(sd, "meta"):
+        return sd.meta(key)
+    w = sd[key]
+    from .safetensors_stream import TensorMeta
+    return TensorMeta(
+        dtype=w.dtype,
+        shape=tuple(w.shape),
+        numel=w.numel(),
+        nbytes=w.nbytes,
+        data_offsets=None,
+        filename="",
+    )
+
+def state_dict_shape(sd, key):
+    return state_dict_meta(sd, key).shape
+
+def state_dict_dtype(sd, key):
+    return state_dict_meta(sd, key).dtype
+
 def calculate_parameters(sd, prefix=""):
     params = 0
     for k in sd.keys():
         if k.startswith(prefix):
-            w = sd[k]
-            params += w.nelement()
+            params += state_dict_meta(sd, k).numel
     return params
 
 def weight_dtype(sd, prefix=""):
     dtypes = {}
     for k in sd.keys():
         if k.startswith(prefix):
-            w = sd[k]
-            dtypes[w.dtype] = dtypes.get(w.dtype, 0) + w.numel()
+            meta = state_dict_meta(sd, k)
+            dtypes[meta.dtype] = dtypes.get(meta.dtype, 0) + meta.numel
 
     if len(dtypes) == 0:
         return None
@@ -127,12 +141,18 @@ def weight_dtype(sd, prefix=""):
     return max(dtypes, key=dtypes.get)
 
 def state_dict_key_replace(state_dict, keys_to_replace):
+    if hasattr(state_dict, "meta"):
+        from .safetensors_stream import rename_keys_view
+        return rename_keys_view(state_dict, keys_to_replace)
     for x in keys_to_replace:
         if x in state_dict:
             state_dict[keys_to_replace[x]] = state_dict.pop(x)
     return state_dict
 
 def state_dict_prefix_replace(state_dict, replace_prefix, filter_keys=False):
+    if hasattr(state_dict, "meta"):
+        from .safetensors_stream import prefix_view
+        return prefix_view(state_dict, replace_prefix, filter_keys)
     if filter_keys:
         out = {}
     else:
@@ -146,6 +166,9 @@ def state_dict_prefix_replace(state_dict, replace_prefix, filter_keys=False):
 
 
 def transformers_convert(sd, prefix_from, prefix_to, number):
+    if hasattr(sd, "meta"):
+        from .safetensors_stream import transformers_convert_view
+        return transformers_convert_view(sd, prefix_from, prefix_to, number)
     keys_to_replace = {
         "{}positional_embedding": "{}embeddings.position_embedding.weight",
         "{}token_embedding.weight": "{}embeddings.token_embedding.weight",
@@ -187,6 +210,9 @@ def transformers_convert(sd, prefix_from, prefix_to, number):
     return sd
 
 def clip_text_transformers_convert(sd, prefix_from, prefix_to):
+    if hasattr(sd, "meta"):
+        from .safetensors_stream import clip_text_transformers_convert_view
+        return clip_text_transformers_convert_view(sd, prefix_from, prefix_to)
     sd = transformers_convert(sd, prefix_from, "{}text_model.".format(prefix_to), 32)
 
     tp = "{}text_projection.weight".format(prefix_from)
@@ -1211,6 +1237,65 @@ def detect_layer_quantization(state_dict, prefix):
 def convert_old_quants(state_dict, model_prefix="", metadata={}):
     if metadata is None:
         metadata = {}
+
+    if hasattr(state_dict, "meta"):
+        from .safetensors_stream import MappedStateDict, _SourceConstant, _SourceKey
+
+        quant_metadata = None
+        if "_quantization_metadata" not in metadata:
+            scaled_fp8_key = "{}scaled_fp8".format(model_prefix)
+            if scaled_fp8_key in state_dict:
+                scaled_fp8_weight = state_dict[scaled_fp8_key]
+                scaled_fp8_dtype = scaled_fp8_weight.dtype
+                if scaled_fp8_dtype == torch.float32:
+                    scaled_fp8_dtype = torch.float8_e4m3fn
+
+                if scaled_fp8_weight.nelement() == 2:
+                    full_precision_matrix_mult = True
+                else:
+                    full_precision_matrix_mult = False
+
+                layers = {}
+                mapping = {}
+                for k in state_dict.keys():
+                    if k == scaled_fp8_key:
+                        continue
+                    if not k.startswith(model_prefix):
+                        mapping[k] = _SourceKey(k)
+                        continue
+                    k_out = k
+                    layer = None
+                    if k_out.endswith(".scale_weight"):
+                        layer = k_out[:-len(".scale_weight")]
+                        k_out = "{}.weight_scale".format(layer)
+                    if layer is not None:
+                        layer_conf = {"format": "float8_e4m3fn"}
+                        if full_precision_matrix_mult:
+                            layer_conf["full_precision_matrix_mult"] = full_precision_matrix_mult
+                        layers[layer] = layer_conf
+
+                    if k_out.endswith(".scale_input"):
+                        layer = k_out[:-len(".scale_input")]
+                        k_out = "{}.input_scale".format(layer)
+                        w = state_dict[k]
+                        if w.item() == 1.0:
+                            continue
+                    mapping[k_out] = _SourceKey(k)
+
+                quant_metadata = {"layers": layers}
+                state_dict = MappedStateDict(state_dict, mapping)
+        else:
+            quant_metadata = json.loads(metadata["_quantization_metadata"])
+
+        if quant_metadata is not None:
+            layers = quant_metadata["layers"]
+            mapping = {k: _SourceKey(k) for k in state_dict.keys()}
+            for k, v in layers.items():
+                q_tensor = torch.tensor(list(json.dumps(v).encode("utf-8")), dtype=torch.uint8)
+                mapping["{}.comfy_quant".format(k)] = _SourceConstant(q_tensor)
+            state_dict = MappedStateDict(state_dict, mapping)
+
+        return state_dict, metadata
 
     quant_metadata = None
     if "_quantization_metadata" not in metadata:

@@ -1,6 +1,7 @@
 import torch
 from . import model_base
 from . import utils
+import comfy.safetensors_stream
 
 from . import sd1_clip
 from . import sdxl_clip
@@ -439,6 +440,26 @@ class Stable_Cascade_C(supported_models_base.BASE):
     clip_vision_prefix = "clip_l_vision."
 
     def process_unet_state_dict(self, state_dict):
+        if hasattr(state_dict, "meta"):
+            from .safetensors_stream import MappedStateDict, _SourceKey, _SourceSlice
+            mapping = {}
+            handled = set()
+            for k_from in state_dict.keys():
+                if k_from in handled:
+                    continue
+                if k_from.endswith(".in_proj_weight") or k_from.endswith(".in_proj_bias"):
+                    suffix = k_from.rsplit(".", 1)[-1]
+                    prefix = k_from[:-(len(suffix) + 1)]
+                    base_meta = state_dict.meta(k_from)
+                    split = base_meta.shape[0] // 3
+                    for idx, p in enumerate(["to_q", "to_k", "to_v"]):
+                        k_to = "{}.{}.{}".format(prefix, p, suffix.split("_")[-1])
+                        mapping[k_to] = _SourceSlice(k_from, 0, split * idx, split * (idx + 1))
+                    handled.add(k_from)
+                    continue
+                mapping[k_from] = _SourceKey(k_from)
+            return MappedStateDict(state_dict, mapping)
+
         key_list = list(state_dict.keys())
         for y in ["weight", "bias"]:
             suffix = "in_proj_{}".format(y)
@@ -584,6 +605,11 @@ class StableAudio(supported_models_base.BASE):
         return model_base.StableAudio1(self, seconds_start_embedder_weights=seconds_start_sd, seconds_total_embedder_weights=seconds_total_sd, device=device)
 
     def process_unet_state_dict(self, state_dict):
+        if hasattr(state_dict, "meta"):
+            return comfy.safetensors_stream.remove_keys_view(
+                state_dict,
+                (".cross_attend_norm.beta", ".ff_norm.beta", ".pre_norm.beta"),
+            )
         for k in list(state_dict.keys()):
             if k.endswith(".cross_attend_norm.beta") or k.endswith(".ff_norm.beta") or k.endswith(".pre_norm.beta"): #These weights are all zero
                 state_dict.pop(k)

@@ -144,3 +144,15 @@ def test_stream_load_without_disk_cache_keeps_cpu_weights(tmp_path):
         assert model.weight.device.type != "meta"
     finally:
         comfy.disk_weights.configure(prev_cache, allow_gds=prev_gds, pin_if_cpu=prev_pin, enabled=prev_enabled)
+
+
+def test_load_torch_file_metadata_only_for_non_stream(tmp_path):
+    if torch is None:
+        pytest.skip("torch not installed")
+    import comfy.utils
+    path = os.path.join(tmp_path, "test.ckpt")
+    torch.save({"weight": torch.zeros((2, 3), dtype=torch.float32)}, path)
+    sd = comfy.utils.load_torch_file(path, safe_load=True, metadata_only=True)
+    assert sd["weight"].device.type == "meta"
+    meta = comfy.utils.state_dict_meta(sd, "weight")
+    assert meta.shape == (2, 3)

@@ -842,7 +842,11 @@ class ModelPatcher:
 
     def _move_module_to(self, module, device_to):
         if self._module_has_meta(module):
-            module.to_empty(device=device_to)
+            def _convert(tensor):
+                if tensor is None or tensor.device.type == "meta":
+                    return tensor
+                return tensor.to(device=device_to)
+            module._apply(_convert)
         else:
             module.to(device_to)
 

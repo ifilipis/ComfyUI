@@ -58,9 +58,9 @@ if hasattr(torch.serialization, "add_safe_globals"):  # TODO: this was added in 
 else:
     logging.warning("Warning, you are using an old pytorch version and some ckpt/pt files might be loaded unsafely. Upgrading to 2.4 or above is recommended as older versions of pytorch are no longer supported.")
 
-def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
+def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False, metadata_only=False):
     if device is None:
-        device = torch.device("cpu")
+        device = torch.device("meta" if metadata_only else "cpu")
     metadata = None
     if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
         try:

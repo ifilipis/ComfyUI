@@ -249,9 +249,11 @@ def ensure_module_materialized(module: torch.nn.Module, target_device: torch.dev
             CACHE.record(module, name, tensor, is_buffer=is_buffer)
 
 
-def disk_weight_pre_hook(module: torch.nn.Module, args, kwargs):
+def disk_weight_pre_hook(module: torch.nn.Module, args, kwargs=None):
     if not REGISTRY.has(module):
         return
+    if kwargs is None:
+        kwargs = {}
     if getattr(module, "comfy_cast_weights", False):
         target_device = torch.device("cpu")
     else:

@@ -170,7 +170,10 @@ def load_state_dict(model, state_dict, strict=False, assign=False):
     if is_stream_state_dict(state_dict):
         comfy.disk_weights.register_module_weights(model, state_dict)
         comfy.disk_weights.attach_disk_weight_hooks(model)
-        missing, unexpected = stream_load_state_dict(model, state_dict, strict=strict, assign=assign)
+        if comfy.disk_weights.disk_weights_enabled():
+            missing, unexpected = stream_load_state_dict_meta(model, state_dict, strict=strict)
+        else:
+            missing, unexpected = stream_load_state_dict(model, state_dict, strict=strict, assign=assign)
         return missing, unexpected
     return model.load_state_dict(state_dict, strict=strict)
 
@@ -210,6 +213,60 @@ def stream_load_state_dict(model, state_dict, strict=False, assign=False):
                 raise RuntimeError("load_state_dict post hook returned a value, which is unsupported.")
 
     load(model, state_dict)
+    if strict:
+        if len(unexpected_keys) > 0:
+            error_msgs.insert(0, 'Unexpected key(s) in state_dict: {}. '.format(', '.join(f'"{k}"' for k in unexpected_keys)))
+        if len(missing_keys) > 0:
+            error_msgs.insert(0, 'Missing key(s) in state_dict: {}. '.format(', '.join(f'"{k}"' for k in missing_keys)))
+    if len(error_msgs) > 0:
+        raise RuntimeError('Error(s) in loading state_dict for {}:\n\t{}'.format(model.__class__.__name__, "\n\t".join(error_msgs)))
+    return missing_keys, unexpected_keys
+
+
+def stream_load_state_dict_meta(model, state_dict, strict=False):
+    if is_stream_state_dict(state_dict) and hasattr(state_dict, "copy"):
+        state_dict = state_dict.copy()
+    missing_keys = []
+    unexpected_keys = []
+    error_msgs = []
+    state_dict_keys = set(state_dict.keys())
+    expected_keys = set()
+
+    def load(module, prefix=""):
+        for name, param in module._parameters.items():
+            if param is None:
+                continue
+            key = f"{prefix}{name}"
+            expected_keys.add(key)
+            if key in state_dict_keys:
+                meta = state_dict.meta(key)
+                module._parameters[name] = torch.nn.Parameter(
+                    torch.empty(meta.shape, dtype=meta.dtype, device="meta"),
+                    requires_grad=param.requires_grad,
+                )
+            else:
+                missing_keys.append(key)
+        for name, buf in module._buffers.items():
+            if buf is None:
+                continue
+            key = f"{prefix}{name}"
+            expected_keys.add(key)
+            if key in state_dict_keys:
+                meta = state_dict.meta(key)
+                module._buffers[name] = torch.empty(meta.shape, dtype=meta.dtype, device="meta")
+            else:
+                missing_keys.append(key)
+        for name, child in module._modules.items():
+            if child is not None:
+                load(child, f"{prefix}{name}.")
+        incompatible = torch.nn.modules.module._IncompatibleKeys(missing_keys, unexpected_keys)
+        for hook in module._load_state_dict_post_hooks.values():
+            out = hook(module, incompatible)
+            if out is not None:
+                raise RuntimeError("load_state_dict post hook returned a value, which is unsupported.")
+
+    load(model)
+    unexpected_keys.extend(k for k in state_dict_keys if k not in expected_keys)
     if strict:
         if len(unexpected_keys) > 0:
             error_msgs.insert(0, 'Unexpected key(s) in state_dict: {}. '.format(', '.join(f'"{k}"' for k in unexpected_keys)))

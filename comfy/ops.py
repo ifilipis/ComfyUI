@@ -19,6 +19,7 @@
 import torch
 import logging
 import comfy.model_management
+import comfy.disk_tier
 from comfy.cli_args import args, PerformanceFeature
 import comfy.float
 import comfy.rmsnorm
@@ -98,11 +99,30 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
     weight_has_function = len(s.weight_function) > 0
     bias_has_function = len(s.bias_function) > 0
 
-    weight = comfy.model_management.cast_to(s.weight, None, device, non_blocking=non_blocking, copy=weight_has_function, stream=offload_stream)
+    weight = s.weight
+    bias = s.bias
+    if (
+        comfy.disk_tier.disk_tier_enabled()
+        and hasattr(s, "comfy_disk_offload")
+        and hasattr(s, "comfy_disk_tensor_provider")
+    ):
+        if weight is not None and weight.is_meta and "weight" in s.comfy_disk_offload:
+            weight = s.comfy_disk_tensor_provider.get_tensor(
+                s.comfy_disk_offload["weight"].key,
+                device,
+                dtype_override=dtype,
+            )
+        if bias is not None and bias.is_meta and "bias" in s.comfy_disk_offload:
+            bias = s.comfy_disk_tensor_provider.get_tensor(
+                s.comfy_disk_offload["bias"].key,
+                device,
+                dtype_override=bias_dtype,
+            )
 
-    bias = None
-    if s.bias is not None:
-        bias = comfy.model_management.cast_to(s.bias, bias_dtype, device, non_blocking=non_blocking, copy=bias_has_function, stream=offload_stream)
+    weight = comfy.model_management.cast_to(weight, None, device, non_blocking=non_blocking, copy=weight_has_function, stream=offload_stream)
+
+    if bias is not None:
+        bias = comfy.model_management.cast_to(bias, bias_dtype, device, non_blocking=non_blocking, copy=bias_has_function, stream=offload_stream)
 
     comfy.model_management.sync_stream(device, offload_stream)
 

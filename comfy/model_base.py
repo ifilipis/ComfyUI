@@ -59,6 +59,8 @@ from . import utils
 import comfy.latent_formats
 import comfy.model_sampling
 import math
+import comfy.disk_tier
+import comfy.supported_models_base
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from comfy.model_patcher import ModelPatcher
@@ -299,6 +301,71 @@ class BaseModel(torch.nn.Module):
         return out
 
     def load_model_weights(self, sd, unet_prefix=""):
+        if comfy.disk_tier.disk_tier_enabled() and hasattr(sd, "is_disk_state_dict"):
+            if (
+                self.model_config.process_unet_state_dict.__func__
+                is not comfy.supported_models_base.BASE.process_unet_state_dict
+            ):
+                raise RuntimeError(
+                    "Disk-tier loading does not support unet state dict transformations. "
+                    "Disable disk tier or use a checkpoint that matches the model keys."
+                )
+            sd_keys = {k for k in sd.keys() if k.startswith(unet_prefix)}
+            missing = []
+            unexpected = []
+            expected_keys = set()
+            param_keys = {k for k, _ in self.diffusion_model.named_parameters()}
+            buffer_keys = {k for k, _ in self.diffusion_model.named_buffers()}
+            for model_key in self.diffusion_model.state_dict().keys():
+                expected_keys.add(model_key)
+                full_key = f"{unet_prefix}{model_key}"
+                if full_key not in sd_keys:
+                    missing.append(model_key)
+                    continue
+                info = sd.get_tensor_info(full_key)
+                if model_key in buffer_keys:
+                    buffer_tensor = sd.disk_tensor_provider.get_tensor(
+                        full_key, torch.device("cpu")
+                    )
+                    comfy.disk_tier.set_module_tensor(
+                        self.diffusion_model, model_key, buffer_tensor
+                    )
+                    continue
+                if model_key in param_keys:
+                    module_name, param_name = model_key.rsplit(".", 1)
+                    module = comfy.utils.get_attr(self.diffusion_model, module_name)
+                    comfy.disk_tier.mark_disk_tensor(
+                        module, param_name, info, sd.disk_tensor_provider
+                    )
+                    meta_tensor = torch.empty(
+                        info.shape,
+                        device="meta",
+                        dtype=comfy.disk_tier.torch_dtype_from_disk(info.dtype),
+                    )
+                    comfy.disk_tier.set_module_tensor(
+                        self.diffusion_model, model_key, meta_tensor
+                    )
+
+            for key in sd_keys:
+                model_key = key[len(unet_prefix):]
+                if model_key not in expected_keys:
+                    unexpected.append(model_key)
+
+            self.model_loaded_weight_memory = 0
+            self.model_ram_loaded_weight_memory = 0
+            self.model_disk_offloaded_weight_memory = sum(
+                info.nbytes
+                for info in (
+                    sd.get_tensor_info(f"{unet_prefix}{k}") for k in param_keys if f"{unet_prefix}{k}" in sd_keys
+                )
+            )
+
+            if len(missing) > 0:
+                logging.warning("unet missing: {}".format(missing))
+            if len(unexpected) > 0:
+                logging.warning("unet unexpected: {}".format(unexpected))
+            return self
+
         to_load = {}
         keys = list(sd.keys())
         for k in keys:

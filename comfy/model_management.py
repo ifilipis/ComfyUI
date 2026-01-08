@@ -456,7 +456,10 @@ def module_size(module):
     sd = module.state_dict()
     for k in sd:
         t = sd[k]
-        module_mem += t.nbytes
+        if t.is_meta and hasattr(module, "comfy_disk_offload") and k in module.comfy_disk_offload:
+            module_mem += module.comfy_disk_offload[k].nbytes
+        else:
+            module_mem += t.nbytes
     return module_mem
 
 class LoadedModel:

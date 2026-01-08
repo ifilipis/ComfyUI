@@ -30,6 +30,7 @@ from torch.nn.functional import interpolate
 from einops import rearrange
 from comfy.cli_args import args
 import json
+import comfy.disk_tier
 
 MMAP_TORCH_FILES = args.mmap_torch_files
 DISABLE_MMAP = args.disable_mmap
@@ -55,21 +56,31 @@ if hasattr(torch.serialization, "add_safe_globals"):  # TODO: this was added in 
 else:
     logging.warning("Warning, you are using an old pytorch version and some ckpt/pt files might be loaded unsafely. Upgrading to 2.4 or above is recommended as older versions of pytorch are no longer supported.")
 
-def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
+def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False, disk_tier=None):
     if device is None:
         device = torch.device("cpu")
     metadata = None
+    if disk_tier is None:
+        disk_tier = comfy.disk_tier.disk_tier_enabled()
     if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
         try:
-            with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
-                sd = {}
-                for k in f.keys():
-                    tensor = f.get_tensor(k)
-                    if DISABLE_MMAP:  # TODO: Not sure if this is the best way to bypass the mmap issues
-                        tensor = tensor.to(device=device, copy=True)
-                    sd[k] = tensor
+            if disk_tier:
+                provider = comfy.disk_tier.DiskTensorProvider(
+                    ckpt, enable_gpudirect=comfy.disk_tier.gpudirect_enabled()
+                )
+                sd = comfy.disk_tier.DiskStateDict(provider, device)
                 if return_metadata:
-                    metadata = f.metadata()
+                    metadata = provider.metadata.metadata
+            else:
+                with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
+                    sd = {}
+                    for k in f.keys():
+                        tensor = f.get_tensor(k)
+                        if DISABLE_MMAP:  # TODO: Not sure if this is the best way to bypass the mmap issues
+                            tensor = tensor.to(device=device, copy=True)
+                        sd[k] = tensor
+                    if return_metadata:
+                        metadata = f.metadata()
         except Exception as e:
             if len(e.args) > 0:
                 message = e.args[0]
@@ -79,6 +90,10 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
                     raise ValueError("{}\n\nFile path: {}\n\nThe safetensors file is corrupt/incomplete. Check the file size and make sure you have copied/downloaded it correctly.".format(message, ckpt))
             raise e
     else:
+        if disk_tier:
+            raise RuntimeError(
+                f"Disk-tier loading only supports .safetensors files (got: {ckpt})"
+            )
         torch_args = {}
         if MMAP_TORCH_FILES:
             torch_args["mmap"] = True
@@ -108,6 +123,12 @@ def save_torch_file(sd, ckpt, metadata=None):
 
 def calculate_parameters(sd, prefix=""):
     params = 0
+    if hasattr(sd, "get_tensor_info"):
+        for k in sd.keys():
+            if k.startswith(prefix):
+                info = sd.get_tensor_info(k)
+                params += math.prod(info.shape)
+        return params
     for k in sd.keys():
         if k.startswith(prefix):
             w = sd[k]
@@ -116,6 +137,15 @@ def calculate_parameters(sd, prefix=""):
 
 def weight_dtype(sd, prefix=""):
     dtypes = {}
+    if hasattr(sd, "get_tensor_info"):
+        for k in sd.keys():
+            if k.startswith(prefix):
+                info = sd.get_tensor_info(k)
+                torch_dtype = comfy.disk_tier.torch_dtype_from_disk(info.dtype)
+                dtypes[torch_dtype] = dtypes.get(torch_dtype, 0) + math.prod(info.shape)
+        if len(dtypes) == 0:
+            return None
+        return max(dtypes, key=dtypes.get)
     for k in sd.keys():
         if k.startswith(prefix):
             w = sd[k]
@@ -1217,6 +1247,11 @@ def convert_old_quants(state_dict, model_prefix="", metadata={}):
         scaled_fp8_key = "{}scaled_fp8".format(model_prefix)
 
         if scaled_fp8_key in state_dict:
+            if hasattr(state_dict, "is_disk_state_dict"):
+                raise RuntimeError(
+                    "Disk-tier loading does not support legacy scaled-fp8 checkpoints. "
+                    "Convert the checkpoint before enabling disk tier."
+                )
             scaled_fp8_weight = state_dict[scaled_fp8_key]
             scaled_fp8_dtype = scaled_fp8_weight.dtype
             if scaled_fp8_dtype == torch.float32:

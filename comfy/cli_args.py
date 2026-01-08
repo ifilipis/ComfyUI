@@ -166,6 +166,9 @@ parser.add_argument("--disable-pinned-memory", action="store_true", help="Disabl
 
 parser.add_argument("--mmap-torch-files", action="store_true", help="Use mmap when loading ckpt/pt files.")
 parser.add_argument("--disable-mmap", action="store_true", help="Don't use mmap when loading safetensors.")
+parser.add_argument("--disk-tier", action="store_true", help="Enable disk-tier weight loading for safetensors checkpoints.")
+parser.add_argument("--disk-tier-ram", type=float, default=0.0, help="RAM budget in GB for disk-tier CPU-resident weights.")
+parser.add_argument("--enable-gpudirect", action="store_true", help="Enable GPUDirect Storage for disk-tier GPU reads.")
 
 parser.add_argument("--dont-print-server", action="store_true", help="Don't print server output.")
 parser.add_argument("--quick-test-for-ci", action="store_true", help="Quick test for CI.")

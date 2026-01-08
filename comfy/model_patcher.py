@@ -34,6 +34,7 @@ import comfy.lora
 import comfy.model_management
 import comfy.patcher_extension
 import comfy.utils
+import comfy.disk_tier
 from comfy.comfy_types import UnetWrapperFunction
 from comfy.quant_ops import QuantizedTensor
 from comfy.patcher_extension import CallbacksMP, PatcherInjection, WrappersMP
@@ -268,6 +269,9 @@ class ModelPatcher:
 
         if not hasattr(self.model, 'model_offload_buffer_memory'):
             self.model.model_offload_buffer_memory = 0
+        self.disk_tier_manager = getattr(self.model, "disk_tier_manager", None)
+        if self.disk_tier_manager is not None and not hasattr(self.model, "model_loaded_ram_memory"):
+            self.model.model_loaded_ram_memory = 0
 
     def model_size(self):
         if self.size > 0:
@@ -774,6 +778,10 @@ class ModelPatcher:
                 for param in params:
                     key = "{}.{}".format(n, param)
                     self.unpin_weight(key)
+                    if self.disk_tier_manager is not None:
+                        added = comfy.disk_tier.materialize_module_param(m, param, device_to or self.offload_device)
+                        if added > 0:
+                            self.model.model_loaded_ram_memory = self.disk_tier_manager.loaded_ram_bytes
                     self.patch_weight_to_device(key, device_to=device_to)
                 if comfy.model_management.is_device_cuda(device_to):
                     torch.cuda.synchronize()
@@ -782,6 +790,11 @@ class ModelPatcher:
                 m.comfy_patched_weights = True
 
             for x in load_completely:
+                if self.disk_tier_manager is not None and comfy.model_management.is_device_cuda(device_to):
+                    ram_bytes = comfy.disk_tier.module_loaded_bytes(x[2], x[3])
+                    if ram_bytes > 0:
+                        self.disk_tier_manager.release_ram(ram_bytes)
+                        self.model.model_loaded_ram_memory = self.disk_tier_manager.loaded_ram_bytes
                 x[2].to(device_to)
 
             for x in offloaded:
@@ -915,6 +928,17 @@ class ModelPatcher:
                     if move_weight:
                         cast_weight = self.force_cast_weights
                         m.to(device_to)
+                        if self.disk_tier_manager is not None and device_to.type == "cpu":
+                            ram_bytes = comfy.disk_tier.module_loaded_bytes(m, params)
+                            if ram_bytes > 0:
+                                self.disk_tier_manager.reserve_ram(ram_bytes)
+                                self.model.model_loaded_ram_memory = self.disk_tier_manager.loaded_ram_bytes
+                            if self.disk_tier_manager.over_budget():
+                                freed = comfy.disk_tier.evict_module_to_disk(m, params)
+                                if freed > 0:
+                                    self.disk_tier_manager.release_ram(freed)
+                                    self.model.model_loaded_ram_memory = self.disk_tier_manager.loaded_ram_bytes
+                                    logging.info("Disk tier: evicted {:.2f} MB from RAM".format(freed / (1024 * 1024)))
                         module_mem += move_weight_functions(m, device_to)
                         if lowvram_possible:
                             if weight_key in self.patches:
@@ -1356,4 +1380,3 @@ class ModelPatcher:
     def __del__(self):
         self.unpin_all_weights()
         self.detach(unpatch_all=False)
-

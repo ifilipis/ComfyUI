@@ -456,7 +456,10 @@ def module_size(module):
     sd = module.state_dict()
     for k in sd:
         t = sd[k]
-        module_mem += t.nbytes
+        if hasattr(t, "is_meta") and t.is_meta:
+            module_mem += t.numel() * t.element_size()
+        else:
+            module_mem += t.nbytes
     return module_mem
 
 class LoadedModel:

@@ -147,6 +147,10 @@ parser.add_argument("--reserve-vram", type=float, default=None, help="Set the am
 parser.add_argument("--async-offload", nargs='?', const=2, type=int, default=None, metavar="NUM_STREAMS", help="Use async weight offloading. An optional argument controls the amount of offload streams. Default is 2. Enabled by default on Nvidia.")
 parser.add_argument("--disable-async-offload", action="store_true", help="Disable async weight offloading.")
 
+parser.add_argument("--disk-tier", action="store_true", help="Enable disk-tier weight loading with fastsafetensors.")
+parser.add_argument("--disk-tier-ram-budget", type=float, default=None, help="Disk-tier RAM budget (GB) for CPU-resident weights.")
+parser.add_argument("--enable-gpudirect", action="store_true", help="Enable GPUDirect Storage for disk-tier loading.")
+
 parser.add_argument("--force-non-blocking", action="store_true", help="Force ComfyUI to use non-blocking operations for all applicable tensors. This may improve performance on some non-Nvidia systems but can cause issues with some workflows.")
 
 parser.add_argument("--default-hashing-function", type=str, choices=['md5', 'sha1', 'sha256', 'sha512'], default='sha256', help="Allows you to choose the hash function to use for duplicate filename / contents comparison. Default is sha256.")

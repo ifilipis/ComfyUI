@@ -299,20 +299,28 @@ class BaseModel(torch.nn.Module):
         return out
 
     def load_model_weights(self, sd, unet_prefix=""):
-        to_load = {}
-        keys = list(sd.keys())
-        for k in keys:
-            if k.startswith(unet_prefix):
-                to_load[k[len(unet_prefix):]] = sd.pop(k)
+        if hasattr(sd, "extract_prefix"):
+            from comfy import disk_tier
+            unet_sd = sd.extract_prefix(unet_prefix)
+            unet_sd = self.model_config.process_unet_state_dict(unet_sd)
+            m, u = disk_tier.load_disk_state_dict_into_model(self.diffusion_model, unet_sd)
+            self.disk_tier_manager = unet_sd.manager
+        else:
+            to_load = {}
+            keys = list(sd.keys())
+            for k in keys:
+                if k.startswith(unet_prefix):
+                    to_load[k[len(unet_prefix):]] = sd.pop(k)
 
-        to_load = self.model_config.process_unet_state_dict(to_load)
-        m, u = self.diffusion_model.load_state_dict(to_load, strict=False)
+            to_load = self.model_config.process_unet_state_dict(to_load)
+            m, u = self.diffusion_model.load_state_dict(to_load, strict=False)
         if len(m) > 0:
             logging.warning("unet missing: {}".format(m))
 
         if len(u) > 0:
             logging.warning("unet unexpected: {}".format(u))
-        del to_load
+        if not hasattr(sd, "extract_prefix"):
+            del to_load
         return self
 
     def process_latent_in(self, latent):

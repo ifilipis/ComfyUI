@@ -19,6 +19,7 @@
 import torch
 import logging
 import comfy.model_management
+import comfy.disk_tier
 from comfy.cli_args import args, PerformanceFeature
 import comfy.float
 import comfy.rmsnorm
@@ -98,11 +99,35 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
     weight_has_function = len(s.weight_function) > 0
     bias_has_function = len(s.bias_function) > 0
 
-    weight = comfy.model_management.cast_to(s.weight, None, device, non_blocking=non_blocking, copy=weight_has_function, stream=offload_stream)
+    weight = s.weight
+    disk_manager = getattr(s, "comfy_disk_tier_manager", None)
+    if disk_manager is not None:
+        weight_ref = comfy.disk_tier.get_disk_tensor(s, "weight")
+        if weight_ref is not None and comfy.disk_tier.is_meta_tensor(weight):
+            if device.type == "cuda" and weight_ref.provider.enable_gpudirect:
+                weight = weight_ref.provider.get_tensor(weight_ref.name, device)
+            else:
+                loaded_cpu = weight_ref.provider.get_tensor(weight_ref.name, torch.device("cpu"))
+                s.weight = torch.nn.Parameter(loaded_cpu, requires_grad=False)
+                disk_manager.reserve_ram(weight_ref.entry.nbytes)
+                weight = s.weight
+    weight = comfy.model_management.cast_to(weight, None, device, non_blocking=non_blocking, copy=weight_has_function, stream=offload_stream)
 
     bias = None
     if s.bias is not None:
-        bias = comfy.model_management.cast_to(s.bias, bias_dtype, device, non_blocking=non_blocking, copy=bias_has_function, stream=offload_stream)
+        if disk_manager is not None:
+            bias_ref = comfy.disk_tier.get_disk_tensor(s, "bias")
+            if bias_ref is not None and comfy.disk_tier.is_meta_tensor(s.bias):
+                if device.type == "cuda" and bias_ref.provider.enable_gpudirect:
+                    bias = bias_ref.provider.get_tensor(bias_ref.name, device)
+                else:
+                    loaded_cpu = bias_ref.provider.get_tensor(bias_ref.name, torch.device("cpu"))
+                    s.bias = torch.nn.Parameter(loaded_cpu, requires_grad=False)
+                    disk_manager.reserve_ram(bias_ref.entry.nbytes)
+                    bias = s.bias
+        if bias is None:
+            bias = s.bias
+        bias = comfy.model_management.cast_to(bias, bias_dtype, device, non_blocking=non_blocking, copy=bias_has_function, stream=offload_stream)
 
     comfy.model_management.sync_stream(device, offload_stream)
 

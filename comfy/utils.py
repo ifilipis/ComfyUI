@@ -60,6 +60,12 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
         device = torch.device("cpu")
     metadata = None
     if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
+        if args.disk_tier:
+            from comfy import disk_tier
+            sd = disk_tier.open_disk_state_dict(ckpt, device=device)
+            if return_metadata:
+                metadata = sd.provider.index.metadata.metadata
+            return (sd, metadata) if return_metadata else sd
         try:
             with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
                 sd = {}
@@ -79,6 +85,8 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
                     raise ValueError("{}\n\nFile path: {}\n\nThe safetensors file is corrupt/incomplete. Check the file size and make sure you have copied/downloaded it correctly.".format(message, ckpt))
             raise e
     else:
+        if args.disk_tier:
+            raise RuntimeError("Disk-tier loading only supports .safetensors checkpoints.")
         torch_args = {}
         if MMAP_TORCH_FILES:
             torch_args["mmap"] = True
@@ -110,16 +118,30 @@ def calculate_parameters(sd, prefix=""):
     params = 0
     for k in sd.keys():
         if k.startswith(prefix):
-            w = sd[k]
-            params += w.nelement()
+            if hasattr(sd, "get_tensor_info"):
+                info = sd.get_tensor_info(k)
+                if info is None:
+                    continue
+                shape, _ = info
+                params += math.prod(shape)
+            else:
+                w = sd[k]
+                params += w.nelement()
     return params
 
 def weight_dtype(sd, prefix=""):
     dtypes = {}
     for k in sd.keys():
         if k.startswith(prefix):
-            w = sd[k]
-            dtypes[w.dtype] = dtypes.get(w.dtype, 0) + w.numel()
+            if hasattr(sd, "get_tensor_info"):
+                info = sd.get_tensor_info(k)
+                if info is None:
+                    continue
+                shape, dtype = info
+                dtypes[dtype] = dtypes.get(dtype, 0) + math.prod(shape)
+            else:
+                w = sd[k]
+                dtypes[w.dtype] = dtypes.get(w.dtype, 0) + w.numel()
 
     if len(dtypes) == 0:
         return None

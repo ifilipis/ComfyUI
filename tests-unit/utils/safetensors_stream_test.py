@@ -180,3 +180,33 @@ def test_lazy_disk_weights_loads_on_demand(tmp_path, monkeypatch):
         assert len(calls) == 2
     finally:
         comfy.disk_weights.configure(prev_cache, allow_gds=prev_gds, pin_if_cpu=prev_pin, enabled=prev_enabled)
+
+
+def test_lazy_disk_weights_respect_dtype_override(tmp_path):
+    if importlib.util.find_spec("fastsafetensors") is None:
+        pytest.skip("fastsafetensors not installed")
+    import comfy.utils
+    import comfy.disk_weights
+
+    prev_cache = comfy.disk_weights.CACHE.max_bytes
+    prev_gds = comfy.disk_weights.ALLOW_GDS
+    prev_pin = comfy.disk_weights.PIN_IF_CPU
+    prev_enabled = comfy.disk_weights.DISK_WEIGHTS_ENABLED
+    comfy.disk_weights.configure(0, allow_gds=False, pin_if_cpu=False, enabled=True)
+
+    try:
+        path = _write_safetensors(
+            tmp_path,
+            {
+                "weight": torch.zeros((4, 4), dtype=torch.bfloat16),
+                "bias": torch.zeros((4,), dtype=torch.bfloat16),
+            },
+        )
+        sd = comfy.utils.load_torch_file(path, safe_load=True)
+        model = torch.nn.Linear(4, 4, bias=True)
+        comfy.utils.load_state_dict(model, sd, strict=True)
+        x = torch.zeros((1, 4), dtype=torch.float32)
+        _ = model(x)
+        assert model.weight.dtype == torch.float32
+    finally:
+        comfy.disk_weights.configure(prev_cache, allow_gds=prev_gds, pin_if_cpu=prev_pin, enabled=prev_enabled)

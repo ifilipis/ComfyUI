@@ -27,7 +27,13 @@
 - `comfy/model_management.py` handles VRAM/RAM offload via `free_memory` and keeps tracking of loaded/offloaded memory (needs integration for RAM disk tier).【F:comfy/model_management.py†L584-L612】
 - `comfy/model_patcher.py` implements module-by-module offload/low-vram weight casting (`comfy_cast_weights`) and partial unload/load (needs to integrate disk tier for RAM eviction).【F:comfy/model_patcher.py†L663-L955】
 
-## Strategy summary (no coding performed yet)
+## Strategy summary (progress update)
+
+### Implemented so far
+- `load_torch_file` returns `StreamStateDict` for safetensors and exposes metadata without eager tensor loads.
+- Streamed state dicts register disk-backed weights and attach forward pre-hooks for on-demand materialization.
+- Meta-only load path replaces parameters/buffers with meta tensors when disk weights are enabled to avoid RAM spikes on UNet load.
+- Forward pre-hook tolerates missing kwargs for compatibility with PyTorch hook signatures.
 
 ### Streaming safetensors mapping (no full dict materialization)
 - Introduce a new module `comfy/safetensors_stream.py` with:
@@ -55,3 +61,9 @@
 ### Tests and docs
 - Add unit tests for metadata correctness, single-tensor loading, and lazy views (no full materialization), plus integration tests for load behavior and GDS failure path.
 - Document new flags for RAM cache size and GPUDirect enablement and how to disable GDS when unsupported.
+
+### Not yet implemented
+- Metadata-only load path for non-stream state dicts and any remaining eager tensor accesses that still materialize weights in memory.
+- Full pipeline refactors listed above (e.g., avoiding eager dict creation in `BaseModel.load_model_weights`, model detection paths, and direct safetensors loaders).
+- Disk-tier integration into all model loaders (CLIP, VAE, clip vision) and global memory/offload policies beyond current hook-based materialization.
+- Tests and documentation updates described above.

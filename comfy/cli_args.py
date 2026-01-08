@@ -114,6 +114,8 @@ cache_group.add_argument("--cache-lru", type=int, default=0, help="Use LRU cachi
 cache_group.add_argument("--cache-none", action="store_true", help="Reduced RAM/VRAM usage at the expense of executing every node for each run.")
 cache_group.add_argument("--cache-ram", nargs='?', const=4.0, type=float, default=0, help="Use RAM pressure caching with the specified headroom threshold. If available RAM drops below the threhold the cache remove large items to free RAM. Default 4GB")
 
+parser.add_argument("--weight-ram-cache-gb", type=float, default=0.0, help="Max RAM cache size in GB for streamed safetensors model weights. Set to 0 to disable.")
+
 attn_group = parser.add_mutually_exclusive_group()
 attn_group.add_argument("--use-split-cross-attention", action="store_true", help="Use the split cross attention optimization. Ignored when xformers is used.")
 attn_group.add_argument("--use-quad-cross-attention", action="store_true", help="Use the sub-quadratic cross attention optimization . Ignored when xformers is used.")
@@ -141,6 +143,8 @@ vram_group.add_argument("--normalvram", action="store_true", help="Used to force
 vram_group.add_argument("--lowvram", action="store_true", help="Split the unet in parts to use less vram.")
 vram_group.add_argument("--novram", action="store_true", help="When lowvram isn't enough.")
 vram_group.add_argument("--cpu", action="store_true", help="To use the CPU for everything (slow).")
+
+parser.add_argument("--safetensors-gds", action="store_true", help="Enable GPUDirect Storage (GDS) for safetensors disk→GPU loads. Requires libcufile and GDS support.")
 
 parser.add_argument("--reserve-vram", type=float, default=None, help="Set the amount of vram in GB you want to reserve for use by your OS/other software. By default some amount is reserved depending on your OS.")
 

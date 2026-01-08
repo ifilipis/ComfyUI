@@ -27,6 +27,10 @@ import platform
 import weakref
 import gc
 import os
+from collections import OrderedDict
+
+import comfy.utils
+import comfy.safetensors_stream
 
 class VRAMState(Enum):
     DISABLED = 0    #No vram present: no need to move models to vram
@@ -451,6 +455,147 @@ except:
 
 current_loaded_models = []
 
+class DiskWeightCacheEntry:
+    def __init__(self, module_ref, param_name, disk_ref, nbytes):
+        self.module_ref = module_ref
+        self.param_name = param_name
+        self.disk_ref = disk_ref
+        self.nbytes = nbytes
+
+class DiskWeightCache:
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self.current_bytes = 0
+        self.entries = OrderedDict()
+
+    def enabled(self) -> bool:
+        return self.max_bytes > 0
+
+    def _make_key(self, module, param_name):
+        return (id(module), param_name)
+
+    def track(self, module, param_name, disk_ref):
+        if not self.enabled():
+            return
+        param = getattr(module, param_name, None)
+        if param is None or param.device.type != "cpu":
+            return
+        key = self._make_key(module, param_name)
+        nbytes = param.numel() * param.element_size()
+        module_ref = weakref.ref(module)
+        if key in self.entries:
+            self.current_bytes -= self.entries[key].nbytes
+            self.entries.pop(key)
+        self.entries[key] = DiskWeightCacheEntry(module_ref, param_name, disk_ref, nbytes)
+        self.current_bytes += nbytes
+        self.entries.move_to_end(key)
+        self.evict_to_limit()
+
+    def touch(self, module, param_name):
+        key = self._make_key(module, param_name)
+        if key in self.entries:
+            self.entries.move_to_end(key)
+
+    def evict_to_limit(self):
+        if not self.enabled():
+            return
+        while self.current_bytes > self.max_bytes and self.entries:
+            _, entry = self.entries.popitem(last=False)
+            self._evict_entry(entry)
+
+    def evict_for_ram_pressure(self, target_free_bytes: int):
+        if not self.enabled():
+            return
+        cpu_dev = torch.device("cpu")
+        while self.entries and get_free_memory(cpu_dev) < target_free_bytes:
+            _, entry = self.entries.popitem(last=False)
+            self._evict_entry(entry)
+
+    def _evict_entry(self, entry: DiskWeightCacheEntry):
+        module = entry.module_ref()
+        self.current_bytes -= entry.nbytes
+        if module is None:
+            return
+        param = getattr(module, entry.param_name, None)
+        if param is None or param.device.type != "cpu":
+            return
+        meta = entry.disk_ref.meta
+        meta_tensor = torch.empty(meta.shape, device="meta", dtype=param.dtype)
+        setattr(module, entry.param_name, torch.nn.Parameter(meta_tensor, requires_grad=param.requires_grad))
+
+DISK_WEIGHT_CACHE = DiskWeightCache(int(args.weight_ram_cache_gb * 1024 * 1024 * 1024))
+
+def register_disk_refs(model, state_dict):
+    if not comfy.safetensors_stream.is_stream_state_dict(state_dict):
+        return
+    if not hasattr(state_dict, "meta"):
+        return
+    for key in state_dict.keys():
+        if not isinstance(key, str):
+            continue
+        if "." in key:
+            module_path, param_name = key.rsplit(".", 1)
+            try:
+                module = comfy.utils.get_attr(model, module_path)
+            except Exception:
+                continue
+        else:
+            module = model
+            param_name = key
+        param = getattr(module, param_name, None)
+        if not isinstance(param, torch.nn.Parameter):
+            continue
+        disk_ref = comfy.safetensors_stream.DiskRef(state_dict, key, state_dict.meta(key))
+        if not hasattr(module, "_comfy_disk_refs"):
+            module._comfy_disk_refs = {}
+        module._comfy_disk_refs[param_name] = disk_ref
+        _ensure_disk_hook(module)
+        DISK_WEIGHT_CACHE.track(module, param_name, disk_ref)
+
+def _ensure_disk_hook(module):
+    if getattr(module, "_comfy_disk_hook", None) is not None:
+        return
+    module._comfy_disk_hook = module.register_forward_pre_hook(_disk_weight_pre_hook, with_kwargs=True)
+
+def _infer_device_from_args(module, args, kwargs):
+    for obj in list(args) + list(kwargs.values()):
+        if torch.is_tensor(obj):
+            return obj.device
+    for buf in module.buffers(recurse=False):
+        if buf.device.type != "meta":
+            return buf.device
+    for param in module.parameters(recurse=False):
+        if param.device.type != "meta":
+            return param.device
+    return torch.device("cpu")
+
+def _disk_weight_pre_hook(module, fwd_args, fwd_kwargs):
+    if not hasattr(module, "_comfy_disk_refs"):
+        return
+    device = _infer_device_from_args(module, fwd_args, fwd_kwargs)
+    allow_gds = bool(args.safetensors_gds)
+    pin_if_cpu = device.type == "cuda" and device_supports_non_blocking(device)
+    cache_mode = "ram_cache" if device.type == "cpu" else "none"
+    for param_name, disk_ref in module._comfy_disk_refs.items():
+        param = getattr(module, param_name, None)
+        if not isinstance(param, torch.nn.Parameter):
+            continue
+        if param.device.type != "meta":
+            DISK_WEIGHT_CACHE.touch(module, param_name)
+            continue
+        tensor = disk_ref.load(
+            device=device,
+            dtype=param.dtype,
+            allow_gds=allow_gds,
+            cache_mode=cache_mode,
+            pin_if_cpu=pin_if_cpu,
+            stream=get_offload_stream(device) if device.type == "cuda" else None,
+            gds_disable_flag="--safetensors-gds",
+        )
+        new_param = torch.nn.Parameter(tensor, requires_grad=param.requires_grad)
+        setattr(module, param_name, new_param)
+        DISK_WEIGHT_CACHE.track(module, param_name, disk_ref)
+
 def module_size(module):
     module_mem = 0
     sd = module.state_dict()
@@ -628,6 +773,8 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
         minimum_memory_required = extra_mem
     else:
         minimum_memory_required = max(inference_memory, minimum_memory_required + extra_reserved_memory())
+
+    DISK_WEIGHT_CACHE.evict_for_ram_pressure(minimum_memory_required)
 
     models_temp = set()
     for m in models:

@@ -30,6 +30,7 @@ from torch.nn.functional import interpolate
 from einops import rearrange
 from comfy.cli_args import args
 import json
+import comfy.safetensors_stream
 
 MMAP_TORCH_FILES = args.mmap_torch_files
 DISABLE_MMAP = args.disable_mmap
@@ -61,15 +62,9 @@ def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
     metadata = None
     if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
         try:
-            with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
-                sd = {}
-                for k in f.keys():
-                    tensor = f.get_tensor(k)
-                    if DISABLE_MMAP:  # TODO: Not sure if this is the best way to bypass the mmap issues
-                        tensor = tensor.to(device=device, copy=True)
-                    sd[k] = tensor
-                if return_metadata:
-                    metadata = f.metadata()
+            sd = comfy.safetensors_stream.StreamStateDict(ckpt, device=device)
+            if return_metadata:
+                metadata = sd.metadata()
         except Exception as e:
             if len(e.args) > 0:
                 message = e.args[0]
@@ -110,29 +105,61 @@ def calculate_parameters(sd, prefix=""):
     params = 0
     for k in sd.keys():
         if k.startswith(prefix):
-            w = sd[k]
-            params += w.nelement()
+            if hasattr(sd, "meta"):
+                w_meta = sd.meta(k)
+                params += w_meta.numel
+            else:
+                w = sd[k]
+                params += w.nelement()
     return params
 
 def weight_dtype(sd, prefix=""):
     dtypes = {}
     for k in sd.keys():
         if k.startswith(prefix):
-            w = sd[k]
-            dtypes[w.dtype] = dtypes.get(w.dtype, 0) + w.numel()
+            if hasattr(sd, "meta"):
+                w_meta = sd.meta(k)
+                dtypes[w_meta.dtype] = dtypes.get(w_meta.dtype, 0) + w_meta.numel
+            else:
+                w = sd[k]
+                dtypes[w.dtype] = dtypes.get(w.dtype, 0) + w.numel()
 
     if len(dtypes) == 0:
         return None
 
     return max(dtypes, key=dtypes.get)
 
+def state_dict_meta(sd, key):
+    if hasattr(sd, "meta"):
+        return sd.meta(key)
+    return None
+
+def state_dict_tensor_shape(sd, key):
+    meta = state_dict_meta(sd, key)
+    if meta is not None:
+        return meta.shape
+    return sd[key].shape
+
+def state_dict_tensor_dtype(sd, key):
+    meta = state_dict_meta(sd, key)
+    if meta is not None:
+        return meta.dtype
+    return sd[key].dtype
+
 def state_dict_key_replace(state_dict, keys_to_replace):
+    if comfy.safetensors_stream.is_stream_state_dict(state_dict):
+        mapping = {}
+        for key in state_dict.keys():
+            mapping[keys_to_replace.get(key, key)] = key
+        return comfy.safetensors_stream.RenameViewStateDict(state_dict, mapping)
     for x in keys_to_replace:
         if x in state_dict:
             state_dict[keys_to_replace[x]] = state_dict.pop(x)
     return state_dict
 
 def state_dict_prefix_replace(state_dict, replace_prefix, filter_keys=False):
+    if comfy.safetensors_stream.is_stream_state_dict(state_dict):
+        return comfy.safetensors_stream.build_prefix_replace_view(state_dict, replace_prefix, filter_keys)
     if filter_keys:
         out = {}
     else:
@@ -1212,6 +1239,9 @@ def convert_old_quants(state_dict, model_prefix="", metadata={}):
     if metadata is None:
         metadata = {}
 
+    if comfy.safetensors_stream.is_stream_state_dict(state_dict):
+        return _convert_old_quants_streaming(state_dict, model_prefix, metadata)
+
     quant_metadata = None
     if "_quantization_metadata" not in metadata:
         scaled_fp8_key = "{}scaled_fp8".format(model_prefix)
@@ -1265,5 +1295,71 @@ def convert_old_quants(state_dict, model_prefix="", metadata={}):
         layers = quant_metadata["layers"]
         for k, v in layers.items():
             state_dict["{}.comfy_quant".format(k)] = torch.tensor(list(json.dumps(v).encode('utf-8')), dtype=torch.uint8)
+
+    return state_dict, metadata
+
+def _convert_old_quants_streaming(state_dict, model_prefix, metadata):
+    quant_metadata = None
+    if "_quantization_metadata" not in metadata:
+        scaled_fp8_key = "{}scaled_fp8".format(model_prefix)
+        if scaled_fp8_key in state_dict:
+            scaled_fp8_weight = state_dict[scaled_fp8_key]
+            scaled_fp8_dtype = scaled_fp8_weight.dtype
+            if scaled_fp8_dtype == torch.float32:
+                scaled_fp8_dtype = torch.float8_e4m3fn
+
+            full_precision_matrix_mult = scaled_fp8_weight.nelement() == 2
+            layers = {}
+            mapping = {}
+            drop_keys = {scaled_fp8_key}
+
+            for k in list(state_dict.keys()):
+                if k == scaled_fp8_key:
+                    continue
+                if not k.startswith(model_prefix):
+                    mapping[k] = k
+                    continue
+                k_out = k
+                if k_out.endswith(".scale_weight"):
+                    layer = k_out[:-len(".scale_weight")]
+                    k_out = "{}.weight_scale".format(layer)
+                    layer_conf = {"format": "float8_e4m3fn"}
+                    if full_precision_matrix_mult:
+                        layer_conf["full_precision_matrix_mult"] = full_precision_matrix_mult
+                    layers[layer] = layer_conf
+                if k_out.endswith(".scale_input"):
+                    layer = k_out[:-len(".scale_input")]
+                    k_out = "{}.input_scale".format(layer)
+                    if state_dict[k].item() == 1.0:
+                        drop_keys.add(k)
+                        continue
+                mapping[k_out] = k
+
+            state_dict = comfy.safetensors_stream.RenameViewStateDict(state_dict, mapping)
+            state_dict = comfy.safetensors_stream.CompositeStateDict(state_dict, drop_keys=drop_keys)
+            quant_metadata = {"layers": layers}
+    else:
+        quant_metadata = json.loads(metadata["_quantization_metadata"])
+
+    if quant_metadata is not None:
+        layers = quant_metadata["layers"]
+        extra = {}
+        for k, v in layers.items():
+            key = "{}.comfy_quant".format(k)
+            payload = torch.tensor(list(json.dumps(v).encode('utf-8')), dtype=torch.uint8)
+            meta = comfy.safetensors_stream.TensorMeta(
+                dtype=payload.dtype,
+                shape=tuple(payload.shape),
+                numel=payload.numel(),
+                nbytes=payload.numel() * payload.element_size(),
+                data_offsets=None,
+                filename=\"<metadata>\",
+            )
+
+            def _loader(p=payload):
+                return p
+
+            extra[key] = comfy.safetensors_stream.DerivedEntry(_loader, meta)
+        state_dict = comfy.safetensors_stream.CompositeStateDict(state_dict, extra=extra)
 
     return state_dict, metadata

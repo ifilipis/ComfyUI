@@ -1,6 +1,7 @@
 import torch
 from . import model_base
 from . import utils
+import comfy.safetensors_stream
 
 from . import sd1_clip
 from . import sdxl_clip
@@ -439,6 +440,8 @@ class Stable_Cascade_C(supported_models_base.BASE):
     clip_vision_prefix = "clip_l_vision."
 
     def process_unet_state_dict(self, state_dict):
+        if comfy.safetensors_stream.is_stream_state_dict(state_dict):
+            return comfy.safetensors_stream.split_in_proj_qkv(state_dict)
         key_list = list(state_dict.keys())
         for y in ["weight", "bias"]:
             suffix = "in_proj_{}".format(y)
@@ -455,6 +458,12 @@ class Stable_Cascade_C(supported_models_base.BASE):
 
     def process_clip_state_dict(self, state_dict):
         state_dict = utils.state_dict_prefix_replace(state_dict, {k: "" for k in self.text_encoder_key_prefix}, filter_keys=True)
+        if comfy.safetensors_stream.is_stream_state_dict(state_dict) and "clip_g.text_projection" in state_dict:
+            return comfy.safetensors_stream.add_transposed_entry(
+                state_dict,
+                "clip_g.text_projection",
+                "clip_g.transformer.text_projection.weight",
+            )
         if "clip_g.text_projection" in state_dict:
             state_dict["clip_g.transformer.text_projection.weight"] = state_dict.pop("clip_g.text_projection").transpose(0, 1)
         return state_dict
@@ -584,6 +593,11 @@ class StableAudio(supported_models_base.BASE):
         return model_base.StableAudio1(self, seconds_start_embedder_weights=seconds_start_sd, seconds_total_embedder_weights=seconds_total_sd, device=device)
 
     def process_unet_state_dict(self, state_dict):
+        if comfy.safetensors_stream.is_stream_state_dict(state_dict):
+            return comfy.safetensors_stream.filter_keys(
+                state_dict,
+                lambda k: not (k.endswith(".cross_attend_norm.beta") or k.endswith(".ff_norm.beta") or k.endswith(".pre_norm.beta")),
+            )
         for k in list(state_dict.keys()):
             if k.endswith(".cross_attend_norm.beta") or k.endswith(".ff_norm.beta") or k.endswith(".pre_norm.beta"): #These weights are all zero
                 state_dict.pop(k)
@@ -875,6 +889,19 @@ class HunyuanVideo(supported_models_base.BASE):
         return out
 
     def process_unet_state_dict(self, state_dict):
+        if comfy.safetensors_stream.is_stream_state_dict(state_dict):
+            def _transform(key_out: str) -> str:
+                key_out = key_out.replace("txt_in.t_embedder.mlp.0.", "txt_in.t_embedder.in_layer.").replace("txt_in.t_embedder.mlp.2.", "txt_in.t_embedder.out_layer.")
+                key_out = key_out.replace("txt_in.c_embedder.linear_1.", "txt_in.c_embedder.in_layer.").replace("txt_in.c_embedder.linear_2.", "txt_in.c_embedder.out_layer.")
+                key_out = key_out.replace("_mod.linear.", "_mod.lin.").replace("_attn_qkv.", "_attn.qkv.")
+                key_out = key_out.replace("mlp.fc1.", "mlp.0.").replace("mlp.fc2.", "mlp.2.")
+                key_out = key_out.replace("_attn_q_norm.weight", "_attn.norm.query_norm.scale").replace("_attn_k_norm.weight", "_attn.norm.key_norm.scale")
+                key_out = key_out.replace(".q_norm.weight", ".norm.query_norm.scale").replace(".k_norm.weight", ".norm.key_norm.scale")
+                key_out = key_out.replace("_attn_proj.", "_attn.proj.")
+                key_out = key_out.replace(".modulation.linear.", ".modulation.lin.")
+                key_out = key_out.replace("_in.mlp.2.", "_in.out_layer.").replace("_in.mlp.0.", "_in.in_layer.")
+                return key_out
+            return comfy.safetensors_stream.rename_keys_with_transform(state_dict, _transform)
         out_sd = {}
         for k in list(state_dict.keys()):
             key_out = k

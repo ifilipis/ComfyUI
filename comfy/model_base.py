@@ -299,14 +299,16 @@ class BaseModel(torch.nn.Module):
         return out
 
     def load_model_weights(self, sd, unet_prefix=""):
-        to_load = {}
-        keys = list(sd.keys())
-        for k in keys:
-            if k.startswith(unet_prefix):
-                to_load[k[len(unet_prefix):]] = sd.pop(k)
+        if unet_prefix != "":
+            to_load = utils.state_dict_prefix_replace(sd, {unet_prefix: ""}, filter_keys=True)
+            if hasattr(sd, "discard_prefix"):
+                sd.discard_prefix(unet_prefix)
+        else:
+            to_load = sd
 
         to_load = self.model_config.process_unet_state_dict(to_load)
         m, u = self.diffusion_model.load_state_dict(to_load, strict=False)
+        comfy.model_management.register_disk_refs(self.diffusion_model, to_load)
         if len(m) > 0:
             logging.warning("unet missing: {}".format(m))
 

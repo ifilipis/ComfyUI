@@ -48,7 +48,9 @@ class ClipVisionModel():
         self.patcher = comfy.model_patcher.ModelPatcher(self.model, load_device=self.load_device, offload_device=offload_device)
 
     def load_sd(self, sd):
-        return self.model.load_state_dict(sd, strict=False)
+        out = self.model.load_state_dict(sd, strict=False)
+        comfy.model_management.register_disk_refs(self.model, sd)
+        return out
 
     def get_sd(self):
         return self.model.state_dict()

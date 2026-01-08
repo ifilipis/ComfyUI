@@ -349,6 +349,8 @@ For models compatible with Iluvatar Extension for PyTorch. Here's a step-by-step
 | `--enable-manager` | Enable ComfyUI-Manager |
 | `--enable-manager-legacy-ui` | Use the legacy manager UI instead of the new UI (requires `--enable-manager`) |
 | `--disable-manager-ui` | Disable the manager UI and endpoints while keeping background features like security checks and scheduled installation completion (requires `--enable-manager`) |
+| `--weight-ram-cache-gb` | Max RAM cache size in GB for streamed safetensors model weights. Set to 0 to disable. |
+| `--safetensors-gds` | Enable GPUDirect Storage for safetensors disk→GPU reads. Requires libcufile and GDS support; if unavailable, ComfyUI will raise an error. Omit the flag to use disk→RAM→GPU instead. |
 
 
 # Running

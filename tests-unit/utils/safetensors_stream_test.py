@@ -182,7 +182,7 @@ def test_lazy_disk_weights_loads_on_demand(tmp_path, monkeypatch):
         comfy.disk_weights.configure(prev_cache, allow_gds=prev_gds, pin_if_cpu=prev_pin, enabled=prev_enabled)
 
 
-def test_lazy_disk_weights_respects_dtype_override(tmp_path):
+def test_lazy_disk_weights_future_dtype_materializes(tmp_path):
     if importlib.util.find_spec("fastsafetensors") is None:
         pytest.skip("fastsafetensors not installed")
     import comfy.utils
@@ -195,13 +195,13 @@ def test_lazy_disk_weights_respects_dtype_override(tmp_path):
     comfy.disk_weights.configure(0, allow_gds=False, pin_if_cpu=False, enabled=True)
 
     try:
-        path = _write_safetensors(tmp_path, {"weight": torch.zeros((4, 4), dtype=torch.bfloat16), "bias": torch.zeros((4,), dtype=torch.bfloat16)})
+        path = _write_safetensors(tmp_path, {"weight": torch.zeros((4, 4), dtype=torch.float32), "bias": torch.zeros((4,), dtype=torch.float32)})
         sd = comfy.utils.load_torch_file(path, safe_load=True)
         model = torch.nn.Linear(4, 4, bias=True)
         comfy.utils.load_state_dict(model, sd, strict=True)
         assert model.weight.device.type == "meta"
 
-        comfy.disk_weights.ensure_module_materialized(model, torch.device("cpu"))
+        comfy.disk_weights.ensure_module_materialized(model, torch.device("cpu"), dtype_override=torch.bfloat16)
         assert model.weight.dtype == torch.bfloat16
 
         comfy.disk_weights.ensure_module_materialized(model, torch.device("cpu"), dtype_override=torch.float16)

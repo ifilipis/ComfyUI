@@ -46,6 +46,7 @@ class DiskTensorRef:
     meta: object
     requires_grad: bool
     is_buffer: bool
+    future_dtype: Optional[torch.dtype] = None
 
     def load(
         self,
@@ -54,7 +55,7 @@ class DiskTensorRef:
         pin_if_cpu: bool,
         dtype_override: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
-        dtype = dtype_override or getattr(self.meta, "dtype", None)
+        dtype = dtype_override or self.future_dtype or getattr(self.meta, "dtype", None)
         if hasattr(self.state_dict, "get_tensor"):
             return self.state_dict.get_tensor(
                 self.key,
@@ -251,6 +252,47 @@ def _meta_tensor(meta, dtype_override: Optional[torch.dtype] = None) -> torch.Te
     if dtype is None or shape is None:
         raise KeyError("Missing metadata for meta tensor")
     return torch.empty(shape, dtype=dtype, device="meta")
+
+
+def _ref_dtype(disk_ref: DiskTensorRef, dtype_override: Optional[torch.dtype] = None) -> Optional[torch.dtype]:
+    if dtype_override is not None:
+        return dtype_override
+    if disk_ref.future_dtype is not None:
+        return disk_ref.future_dtype
+    return getattr(disk_ref.meta, "dtype", None)
+
+
+def _meta_tensor_from_ref(disk_ref: DiskTensorRef, dtype_override: Optional[torch.dtype] = None) -> torch.Tensor:
+    dtype = _ref_dtype(disk_ref, dtype_override)
+    shape = getattr(disk_ref.meta, "shape", None)
+    if dtype is None or shape is None:
+        raise KeyError("Missing metadata for meta tensor")
+    return torch.empty(shape, dtype=dtype, device="meta")
+
+
+def _set_module_future_dtype(module: torch.nn.Module, dtype_override: Optional[torch.dtype]):
+    if dtype_override is None:
+        return
+    refs = REGISTRY.get(module)
+    if not refs:
+        return
+    for name, disk_ref in refs.items():
+        if disk_ref.future_dtype == dtype_override:
+            continue
+        disk_ref.future_dtype = dtype_override
+        if disk_ref.is_buffer:
+            current = module._buffers.get(name)
+        else:
+            current = module._parameters.get(name)
+        if current is None or current.device.type != "meta":
+            continue
+        if current.dtype == dtype_override:
+            continue
+        meta_tensor = _meta_tensor_from_ref(disk_ref, dtype_override=dtype_override)
+        if disk_ref.is_buffer:
+            module._buffers[name] = meta_tensor
+        else:
+            module._parameters[name] = torch.nn.Parameter(meta_tensor, requires_grad=disk_ref.requires_grad)
 
 
 def _state_dict_meta(state_dict: MutableMapping, key: str):
@@ -549,7 +591,7 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
             state = _get_materialization_state(module)
             for ref_name, disk_ref in refs.items():
                 shape = getattr(disk_ref.meta, "shape", None)
-                dtype = getattr(disk_ref.meta, "dtype", None)
+                dtype = _ref_dtype(disk_ref)
                 if shape is None or dtype is None:
                     continue
                 meta_tensor = torch.empty(shape, dtype=dtype, device="meta")
@@ -572,7 +614,7 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
         return
     disk_ref = ref[name]
     shape = getattr(disk_ref.meta, "shape", None)
-    dtype = getattr(disk_ref.meta, "dtype", None)
+    dtype = _ref_dtype(disk_ref)
     if shape is None or dtype is None:
         return
     meta_tensor = torch.empty(shape, dtype=dtype, device="meta")
@@ -641,6 +683,7 @@ def ensure_module_materialized(
     fallback_device: Optional[torch.device] = None,
     dtype_override: Optional[torch.dtype] = None,
 ):
+    _set_module_future_dtype(module, dtype_override)
     lazy_state = LAZY_MODULE_STATE.get(module)
     if lazy_state is not None:
         _materialize_module_from_state_dict(module, lazy_state, target_device)
@@ -664,9 +707,10 @@ def ensure_module_materialized(
             continue
         if current is None:
             continue
+        target_dtype = _ref_dtype(disk_ref, dtype_override)
         if current.device.type != "meta" and current.device == target_device:
-            if dtype_override is not None and current.dtype != dtype_override:
-                tensor = current.to(device=target_device, dtype=dtype_override)
+            if target_dtype is not None and current.dtype != target_dtype:
+                tensor = current.to(device=target_device, dtype=target_dtype)
                 if is_buffer:
                     module._buffers[name] = tensor
                 else:
@@ -696,10 +740,10 @@ def ensure_module_materialized(
         else:
             target_for_load = target_device
         if current.device.type == "meta":
-            tensor = disk_ref.load(target_for_load, ALLOW_GDS, PIN_IF_CPU, dtype_override=dtype_override)
+            tensor = disk_ref.load(target_for_load, ALLOW_GDS, PIN_IF_CPU, dtype_override=target_dtype)
         else:
-            if dtype_override is not None and current.dtype != dtype_override:
-                tensor = current.to(device=target_for_load, dtype=dtype_override)
+            if target_dtype is not None and current.dtype != target_dtype:
+                tensor = current.to(device=target_for_load, dtype=target_dtype)
             else:
                 tensor = current.to(device=target_for_load)
         if is_buffer:
@@ -713,7 +757,7 @@ def ensure_module_materialized(
     _log_materialization(module, target_device, free_mem_start, refs, state, "Disk weight materialized")
 
 
-def disk_weight_pre_hook(module: torch.nn.Module, args, kwargs={}):
+def disk_weight_pre_hook(module: torch.nn.Module, args, kwargs):
     if not REGISTRY.has(module) and module not in LAZY_MODULE_STATE:
         return
     input_dtype = _find_tensor_dtype(args, kwargs)
@@ -815,6 +859,9 @@ def load_module_tensor(
     refs = REGISTRY.get(module)
     if not refs or name not in refs:
         return None
+    disk_ref = refs[name]
+    if dtype_override is not None:
+        disk_ref.future_dtype = dtype_override
     if name in module._parameters:
         current = module._parameters[name]
         is_buffer = False
@@ -826,18 +873,18 @@ def load_module_tensor(
     if current is None:
         return None
     if current.device.type != "meta":
-        if current.device != device or (dtype_override is not None and current.dtype != dtype_override):
-            tensor = current.to(device=device, dtype=dtype_override)
+        target_dtype = _ref_dtype(disk_ref, dtype_override)
+        if current.device != device or (target_dtype is not None and current.dtype != target_dtype):
+            tensor = current.to(device=device, dtype=target_dtype)
             if not temporary:
                 if is_buffer:
                     module._buffers[name] = tensor
                 else:
-                    module._parameters[name] = torch.nn.Parameter(tensor, requires_grad=refs[name].requires_grad)
+                    module._parameters[name] = torch.nn.Parameter(tensor, requires_grad=disk_ref.requires_grad)
                 _rebuild_materialization_state(module, refs, _get_materialization_state(module))
             return tensor
         return current
 
-    disk_ref = refs[name]
     required_bytes = _meta_nbytes(disk_ref.meta)
     if required_bytes is None:
         return current
@@ -875,7 +922,8 @@ def load_module_tensor(
         _log_materialization(module, device, free_mem_start, refs, state, "Disk weight deferred")
         return current
 
-    tensor = disk_ref.load(load_device, ALLOW_GDS, PIN_IF_CPU, dtype_override=dtype_override)
+    target_dtype = _ref_dtype(disk_ref, dtype_override)
+    tensor = disk_ref.load(load_device, ALLOW_GDS, PIN_IF_CPU, dtype_override=target_dtype)
     if temporary:
         return tensor
     if is_buffer:
@@ -1001,21 +1049,18 @@ def lazy_load_state_dict(model: torch.nn.Module, state_dict, strict: bool = Fals
         if error_msgs:
             raise RuntimeError("Error(s) in loading state_dict:\n\t{}".format("\n\t".join(error_msgs)))
 
-    dtype_override = getattr(model, "manual_cast_dtype", None)
     for name, param in model.named_parameters(recurse=True):
         if name not in state_keys:
             continue
         meta = state_dict.meta(name)
-        meta_dtype = dtype_override or meta.dtype
-        meta_tensor = torch.empty(meta.shape, dtype=meta_dtype, device="meta")
+        meta_tensor = torch.empty(meta.shape, dtype=meta.dtype, device="meta")
         _replace_tensor(model, name, meta_tensor, is_buffer=False, requires_grad=param.requires_grad)
 
     for name, buf in model.named_buffers(recurse=True):
         if buf is None or name not in state_keys:
             continue
         meta = state_dict.meta(name)
-        meta_dtype = dtype_override or meta.dtype
-        meta_tensor = torch.empty(meta.shape, dtype=meta_dtype, device="meta")
+        meta_tensor = torch.empty(meta.shape, dtype=meta.dtype, device="meta")
         _replace_tensor(model, name, meta_tensor, is_buffer=True, requires_grad=False)
 
     register_module_weights(model, state_dict)

@@ -1345,7 +1345,10 @@ def load_checkpoint(config_path=None, ckpt_path=None, output_vae=True, output_cl
     return (model, clip, vae)
 
 def load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, output_clipvision=False, embedding_directory=None, output_model=True, model_options={}, te_model_options={}):
-    sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
+    disk_tier_enabled = model_management.disk_tier_enabled()
+    if disk_tier_enabled:
+        model_management.disk_tier_ram_budget_bytes()
+    sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True, disk_tier=disk_tier_enabled)
     out = load_state_dict_guess_config(sd, output_vae, output_clip, output_clipvision, embedding_directory, output_model, model_options, te_model_options=te_model_options, metadata=metadata)
     if out is None:
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(ckpt_path, model_detection_error_hint(ckpt_path, sd)))

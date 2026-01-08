@@ -55,10 +55,24 @@ if hasattr(torch.serialization, "add_safe_globals"):  # TODO: this was added in 
 else:
     logging.warning("Warning, you are using an old pytorch version and some ckpt/pt files might be loaded unsafely. Upgrading to 2.4 or above is recommended as older versions of pytorch are no longer supported.")
 
-def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
+def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False, disk_tier=False):
     if device is None:
         device = torch.device("cpu")
     metadata = None
+    if disk_tier:
+        if not ckpt.lower().endswith(".safetensors"):
+            raise RuntimeError("disk-tier loading only supports .safetensors checkpoints.")
+        import comfy.disk_tier
+        import comfy.model_management
+        provider = comfy.disk_tier.DiskTensorProvider(
+            ckpt,
+            enable_gpudirect=comfy.model_management.disk_tier_use_gpudirect(),
+            allow_cpu_staging=comfy.model_management.disk_tier_allow_cpu_staging(),
+        )
+        sd = comfy.disk_tier.DiskBackedStateDict(provider, device)
+        if return_metadata:
+            metadata = provider.metadata
+        return (sd, metadata) if return_metadata else sd
     if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
         try:
             with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:

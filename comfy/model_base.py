@@ -54,6 +54,7 @@ import comfy.model_management
 import comfy.patcher_extension
 import comfy.conds
 import comfy.ops
+import comfy.disk_tier
 from enum import Enum
 from . import utils
 import comfy.latent_formats
@@ -299,6 +300,19 @@ class BaseModel(torch.nn.Module):
         return out
 
     def load_model_weights(self, sd, unet_prefix=""):
+        if isinstance(sd, comfy.disk_tier.DiskBackedStateDict):
+            disk_sd = sd.strip_prefix(unet_prefix)
+            disk_sd = self.model_config.process_unet_state_dict(disk_sd)
+            missing, unexpected = comfy.disk_tier.apply_disk_state_dict(self.diffusion_model, disk_sd)
+            if len(missing) > 0:
+                logging.warning("unet missing: {}".format(missing))
+            if len(unexpected) > 0:
+                logging.warning("unet unexpected: {}".format(unexpected))
+            sd.mark_removed_prefix(unet_prefix)
+            self.model_disk_tier = True
+            logging.info("disk-tier: mapped unet weights without full CPU materialization")
+            return self
+
         to_load = {}
         keys = list(sd.keys())
         for k in keys:

@@ -144,6 +144,11 @@ vram_group.add_argument("--cpu", action="store_true", help="To use the CPU for e
 
 parser.add_argument("--reserve-vram", type=float, default=None, help="Set the amount of vram in GB you want to reserve for use by your OS/other software. By default some amount is reserved depending on your OS.")
 
+parser.add_argument("--disk-tier", action="store_true", help="Enable disk-tier weight management for safetensors checkpoints.")
+parser.add_argument("--disk-tier-ram-gb", type=float, default=None, help="RAM budget in GB for disk-tier resident weights.")
+parser.add_argument("--disk-tier-cpu-staging", action="store_true", help="Allow disk->RAM->GPU staging when GPUDirect is disabled.")
+parser.add_argument("--enable-gpudirect", action="store_true", help="Enable GPUDirect Storage for disk-tier loads.")
+
 parser.add_argument("--async-offload", nargs='?', const=2, type=int, default=None, metavar="NUM_STREAMS", help="Use async weight offloading. An optional argument controls the amount of offload streams. Default is 2. Enabled by default on Nvidia.")
 parser.add_argument("--disable-async-offload", action="store_true", help="Disable async weight offloading.")
 

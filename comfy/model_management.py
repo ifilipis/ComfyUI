@@ -142,6 +142,22 @@ except:
 if args.cpu:
     cpu_state = CPUState.CPU
 
+def disk_tier_enabled():
+    return bool(args.disk_tier)
+
+def disk_tier_ram_budget_bytes():
+    if not args.disk_tier:
+        return 0
+    if args.disk_tier_ram_gb is None:
+        raise RuntimeError("disk-tier is enabled but --disk-tier-ram-gb was not provided.")
+    return int(args.disk_tier_ram_gb * (1024 ** 3))
+
+def disk_tier_allow_cpu_staging():
+    return bool(args.disk_tier_cpu_staging)
+
+def disk_tier_use_gpudirect():
+    return bool(args.enable_gpudirect)
+
 def is_intel_xpu():
     global cpu_state
     global xpu_available
@@ -456,7 +472,10 @@ def module_size(module):
     sd = module.state_dict()
     for k in sd:
         t = sd[k]
-        module_mem += t.nbytes
+        if getattr(t, "is_meta", False) and hasattr(t, "_disk_tier_nbytes"):
+            module_mem += t._disk_tier_nbytes
+        else:
+            module_mem += t.nbytes
     return module_mem
 
 class LoadedModel:

@@ -34,6 +34,7 @@ import comfy.lora
 import comfy.model_management
 import comfy.patcher_extension
 import comfy.utils
+import comfy.disk_tier
 from comfy.comfy_types import UnetWrapperFunction
 from comfy.quant_ops import QuantizedTensor
 from comfy.patcher_extension import CallbacksMP, PatcherInjection, WrappersMP
@@ -268,6 +269,9 @@ class ModelPatcher:
 
         if not hasattr(self.model, 'model_offload_buffer_memory'):
             self.model.model_offload_buffer_memory = 0
+
+        if not hasattr(self.model, 'model_ram_loaded_weight_memory'):
+            self.model.model_ram_loaded_weight_memory = 0
 
     def model_size(self):
         if self.size > 0:
@@ -611,6 +615,105 @@ class ModelPatcher:
                         sd.pop(k)
             return sd
 
+    def _disk_tier_enabled(self):
+        return comfy.model_management.disk_tier_enabled()
+
+    def _disk_tier_load_params(self, module_name, params, device_to):
+        if not self._disk_tier_enabled():
+            return 0
+        if device_to is None:
+            return 0
+        loaded_bytes = 0
+        for param in params:
+            key = "{}.{}".format(module_name, param)
+            weight, set_func, _ = get_key_weight(self.model, key)
+            if weight is None:
+                continue
+            provider = getattr(weight, "_disk_tier_provider", None)
+            if provider is None or not getattr(weight, "is_meta", False):
+                continue
+            nbytes = getattr(weight, "_disk_tier_nbytes", weight.nbytes)
+            tensor = comfy.disk_tier.load_disk_tensor_from_param(weight, device_to, weight.dtype)
+            if set_func is None:
+                new_param = torch.nn.Parameter(tensor, requires_grad=False)
+                comfy.disk_tier.attach_disk_marker(new_param, key, provider, nbytes)
+                comfy.utils.set_attr(self.model, key, new_param)
+            else:
+                set_func(tensor, inplace_update=False, seed=string_to_seed(key))
+                updated_weight, _, _ = get_key_weight(self.model, key)
+                if updated_weight is not None:
+                    comfy.disk_tier.attach_disk_marker(updated_weight, key, provider, nbytes)
+            loaded_bytes += nbytes
+        if loaded_bytes > 0:
+            if device_to.type == "cpu":
+                self.model.model_ram_loaded_weight_memory += loaded_bytes
+                logging.info("disk-tier: loaded %.2f MB to RAM for %s", loaded_bytes / (1024 * 1024), module_name)
+            elif comfy.model_management.is_device_cuda(device_to):
+                logging.info("disk-tier: loaded %.2f MB to VRAM for %s", loaded_bytes / (1024 * 1024), module_name)
+        return loaded_bytes
+
+    def _disk_tier_evict_params(self, module_name, params):
+        if not self._disk_tier_enabled():
+            return 0
+        freed_bytes = 0
+        for param in params:
+            key = "{}.{}".format(module_name, param)
+            weight, _, _ = get_key_weight(self.model, key)
+            if weight is None:
+                continue
+            provider = getattr(weight, "_disk_tier_provider", None)
+            if provider is None:
+                continue
+            if getattr(weight, "is_meta", False):
+                continue
+            if weight.device.type != "cpu":
+                continue
+            nbytes = getattr(weight, "_disk_tier_nbytes", weight.nbytes)
+            meta_param = comfy.disk_tier.set_param_disk_backed(weight, key, provider, weight.shape, weight.dtype, nbytes)
+            comfy.utils.set_attr(self.model, key, meta_param)
+            freed_bytes += nbytes
+        if freed_bytes > 0:
+            self.model.model_ram_loaded_weight_memory = max(0, self.model.model_ram_loaded_weight_memory - freed_bytes)
+            logging.info("disk-tier: evicted %.2f MB from RAM for %s", freed_bytes / (1024 * 1024), module_name)
+        return freed_bytes
+
+    def _disk_tier_enforce_ram_budget(self):
+        if not self._disk_tier_enabled():
+            return
+        ram_budget = comfy.model_management.disk_tier_ram_budget_bytes()
+        if ram_budget <= 0:
+            return
+        if self.model.model_ram_loaded_weight_memory <= ram_budget:
+            return
+        unload_list = self._load_list()
+        unload_list.sort(reverse=True)
+        for module_offload_mem, module_mem, n, m, params in unload_list:
+            if self.model.model_ram_loaded_weight_memory <= ram_budget:
+                break
+            self._disk_tier_evict_params(n, params)
+        if self.model.model_ram_loaded_weight_memory > ram_budget:
+            raise RuntimeError("disk-tier RAM budget could not be satisfied; insufficient evictable weights.")
+
+    def _disk_tier_release_ram_for_module(self, module_name, params):
+        if not self._disk_tier_enabled():
+            return 0
+        freed_bytes = 0
+        for param in params:
+            key = "{}.{}".format(module_name, param)
+            weight, _, _ = get_key_weight(self.model, key)
+            if weight is None:
+                continue
+            if weight.device.type != "cpu":
+                continue
+            if not hasattr(weight, "_disk_tier_provider"):
+                continue
+            nbytes = getattr(weight, "_disk_tier_nbytes", weight.nbytes)
+            freed_bytes += nbytes
+        if freed_bytes > 0:
+            self.model.model_ram_loaded_weight_memory = max(0, self.model.model_ram_loaded_weight_memory - freed_bytes)
+            logging.info("disk-tier: released %.2f MB from RAM for %s", freed_bytes / (1024 * 1024), module_name)
+        return freed_bytes
+
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
         if key not in self.patches:
             return
@@ -771,6 +874,7 @@ class ModelPatcher:
                     if m.comfy_patched_weights == True:
                         continue
 
+                self._disk_tier_load_params(n, params, device_to)
                 for param in params:
                     key = "{}.{}".format(n, param)
                     self.unpin_weight(key)
@@ -782,6 +886,10 @@ class ModelPatcher:
                 m.comfy_patched_weights = True
 
             for x in load_completely:
+                n = x[1]
+                params = x[3]
+                if comfy.model_management.is_device_cuda(device_to):
+                    self._disk_tier_release_ram_for_module(n, params)
                 x[2].to(device_to)
 
             for x in offloaded:
@@ -805,6 +913,7 @@ class ModelPatcher:
             self.model.model_loaded_weight_memory = mem_counter
             self.model.model_offload_buffer_memory = offload_buffer
             self.model.current_weight_patches_uuid = self.patches_uuid
+            self._disk_tier_enforce_ram_budget()
 
             for callback in self.get_all_callbacks(CallbacksMP.ON_LOAD):
                 callback(self, device_to, lowvram_model_memory, force_patch_weights, full_load)
@@ -916,6 +1025,8 @@ class ModelPatcher:
                         cast_weight = self.force_cast_weights
                         m.to(device_to)
                         module_mem += move_weight_functions(m, device_to)
+                        if self._disk_tier_enabled() and device_to.type == "cpu":
+                            self.model.model_ram_loaded_weight_memory += module_mem
                         if lowvram_possible:
                             if weight_key in self.patches:
                                 if force_patch_weights:
@@ -951,6 +1062,7 @@ class ModelPatcher:
             self.model.lowvram_patch_counter += patch_counter
             self.model.model_loaded_weight_memory -= memory_freed
             self.model.model_offload_buffer_memory = offload_buffer
+            self._disk_tier_enforce_ram_budget()
             logging.info("Unloaded partially: {:.2f} MB freed, {:.2f} MB remains loaded, {:.2f} MB buffer reserved, lowvram patches: {}".format(memory_freed / (1024 * 1024), self.model.model_loaded_weight_memory / (1024 * 1024), offload_buffer / (1024 * 1024), self.model.lowvram_patch_counter))
             return memory_freed
 
@@ -1356,4 +1468,3 @@ class ModelPatcher:
     def __del__(self):
         self.unpin_all_weights()
         self.detach(unpatch_all=False)
-

@@ -219,10 +219,12 @@ class _SafeTensorFile:
             fst, framework, meta, torch.device("cpu"), dtype
         )
         if device_is_cuda:
+            cpu_tensor = cpu_tensor.contiguous()
             if pin_if_cpu:
                 cpu_tensor = cpu_tensor.pin_memory()
-            gpu_tensor = torch.empty_like(cpu_tensor, device=device)
-            gpu_tensor.copy_(cpu_tensor, non_blocking=pin_if_cpu)
+            non_blocking = cpu_tensor.is_pinned()
+            gpu_tensor = torch.empty(cpu_tensor.shape, dtype=cpu_tensor.dtype, device=device)
+            gpu_tensor.copy_(cpu_tensor, non_blocking=non_blocking)
             return gpu_tensor
         return cpu_tensor
 

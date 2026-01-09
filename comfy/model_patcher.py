@@ -709,7 +709,7 @@ class ModelPatcher:
             def ensure_cpu_budget(module_name, module, module_mem):
                 free_mem = comfy.model_management.get_free_memory(cpu_device)
                 if free_mem < module_mem:
-                    comfy.model_management.free_memory(module_mem - free_mem, cpu_device)
+                    comfy.model_management.free_memory(module_mem, cpu_device)
                     free_mem = comfy.model_management.get_free_memory(cpu_device)
                 if free_mem < module_mem:
                     logging.info(

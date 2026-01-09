@@ -603,6 +603,21 @@ def free_memory(memory_required, device, keep_loaded=[]):
     unloaded_models = []
     disk_weights_enabled = comfy.disk_weights.disk_weights_enabled()
     free_mem = None
+    gpu_before_total = None
+    gpu_before_torch = None
+    log_gpu_pressure = False
+    if device.type not in ("cpu", "meta"):
+        gpu_before_total, gpu_before_torch = get_free_memory(device, torch_free_too=True)
+        if gpu_before_total < memory_required:
+            log_gpu_pressure = True
+            logging.info(
+                "GPU memory pressure: device=%s required=%.2f MB free_before=%.2f MB minimum_inference=%.2f MB extra_reserved=%.2f MB",
+                device,
+                memory_required / (1024 * 1024),
+                gpu_before_total / (1024 * 1024),
+                minimum_inference_memory() / (1024 * 1024),
+                EXTRA_RESERVED_VRAM / (1024 * 1024),
+            )
     if is_device_cpu(device) and disk_weights_enabled:
         free_mem = get_free_memory(device)
         logging.info("RAM pressure: requested %.2f MB, free %.2f MB", memory_required / (1024 * 1024), free_mem / (1024 * 1024))
@@ -652,6 +667,17 @@ def free_memory(memory_required, device, keep_loaded=[]):
             mem_free_total, mem_free_torch = get_free_memory(device, torch_free_too=True)
             if mem_free_torch > mem_free_total * 0.25:
                 soft_empty_cache()
+    if log_gpu_pressure:
+        gpu_after_total, gpu_after_torch = get_free_memory(device, torch_free_too=True)
+        logging.info(
+            "GPU memory freed: device=%s free_total_before=%.2f MB free_total_after=%.2f MB delta=%.2f MB; torch_free_before=%.2f MB torch_free_after=%.2f MB",
+            device,
+            gpu_before_total / (1024 * 1024),
+            gpu_after_total / (1024 * 1024),
+            (gpu_after_total - gpu_before_total) / (1024 * 1024),
+            gpu_before_torch / (1024 * 1024),
+            gpu_after_torch / (1024 * 1024),
+        )
     return unloaded_models
 
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
@@ -1119,6 +1145,8 @@ def sync_stream(device, stream):
     current_stream(device).wait_stream(stream)
 
 def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, stream=None):
+    if device is not None and not isinstance(device, torch.device):
+        device = torch.device(device)
     if device is None or weight.device == device:
         if not copy:
             if dtype is None or weight.dtype == dtype:
@@ -1131,6 +1159,21 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
                 return weight.to(dtype=dtype, copy=copy)
         return weight.to(dtype=dtype, copy=copy)
 
+
+    if device.type not in ("cpu", "meta"):
+        dtype_to_allocate = dtype if dtype is not None else weight.dtype
+        bytes_needed = weight.numel() * torch.empty((), dtype=dtype_to_allocate).element_size()
+        required_free_before = bytes_needed + minimum_inference_memory()
+        free_memory(required_free_before, device)
+        free_after = get_free_memory(device)
+        if free_after < required_free_before:
+            logging.error(
+                "Insufficient free VRAM for cast_to: device=%s required=%.2f MB free_after=%.2f MB",
+                device,
+                required_free_before / (1024 * 1024),
+                free_after / (1024 * 1024),
+            )
+            raise RuntimeError("Insufficient free VRAM for cast_to allocation.")
 
     if stream is not None:
         wf_context = stream
@@ -1607,7 +1650,30 @@ def soft_empty_cache(force=False):
         torch.cuda.ipc_collect()
 
 def unload_all_models():
-    free_memory(1e30, get_torch_device())
+    device = get_torch_device()
+    if device.type not in ("cpu", "meta"):
+        before_total, before_torch = get_free_memory(device, torch_free_too=True)
+        logging.info(
+            "GPU memory pressure: device=%s required=%.2f MB free_before=%.2f MB minimum_inference=%.2f MB extra_reserved=%.2f MB",
+            device,
+            1e30 / (1024 * 1024),
+            before_total / (1024 * 1024),
+            minimum_inference_memory() / (1024 * 1024),
+            EXTRA_RESERVED_VRAM / (1024 * 1024),
+        )
+        free_memory(1e30, device)
+        after_total, after_torch = get_free_memory(device, torch_free_too=True)
+        logging.info(
+            "GPU memory freed: device=%s free_total_before=%.2f MB free_total_after=%.2f MB delta=%.2f MB; torch_free_before=%.2f MB torch_free_after=%.2f MB",
+            device,
+            before_total / (1024 * 1024),
+            after_total / (1024 * 1024),
+            (after_total - before_total) / (1024 * 1024),
+            before_torch / (1024 * 1024),
+            after_torch / (1024 * 1024),
+        )
+        return
+    free_memory(1e30, device)
 
 def debug_memory_summary():
     if is_amd() or is_nvidia():

@@ -772,6 +772,21 @@ def ensure_module_materialized(
                 continue
         else:
             target_for_load = target_device
+        if target_for_load.type not in ("cpu", "meta"):
+            from . import model_management
+            required_free_before = required_bytes + model_management.minimum_inference_memory()
+            model_management.free_memory(required_free_before, target_for_load)
+            free_after = _device_free_memory(target_for_load)
+            if free_after < required_free_before:
+                logging.error(
+                    "Insufficient free VRAM for materialization: device=%s required=%.2f MB free_after=%.2f MB",
+                    target_for_load,
+                    required_free_before / (1024 * 1024),
+                    free_after / (1024 * 1024),
+                )
+                raise RuntimeError("Insufficient free VRAM for materialization.")
+            if target_for_load == target_device:
+                remaining_budget = free_after
         if current.device.type == "meta":
             tensor = disk_ref.load(
                 target_for_load,
@@ -906,6 +921,16 @@ def offload_module_weights(module: torch.nn.Module) -> int:
     return offloaded_bytes
 
 
+def offload_module_tree_weights(module: torch.nn.Module) -> int:
+    if not disk_weights_enabled():
+        return 0
+    offloaded_bytes = 0
+    for submodule in module.modules():
+        CACHE.remove_module(submodule)
+        offloaded_bytes += offload_module_weights(submodule)
+    return offloaded_bytes
+
+
 def module_to(module: torch.nn.Module, *args, **kwargs):
     allow_materialize = kwargs.pop("allow_materialize", True)
     if disk_weights_enabled():
@@ -913,7 +938,7 @@ def module_to(module: torch.nn.Module, *args, **kwargs):
         if target_device is None:
             target_device = _find_existing_device(module) or torch.device("cpu")
         if target_device.type == "meta":
-            offload_module_weights(module)
+            offload_module_tree_weights(module)
             return module
         if allow_materialize:
             materialize_module_tree(module, target_device)

@@ -123,6 +123,24 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
             if loaded_bias is not None:
                 bias_source = loaded_bias
 
+    if device is not None and not comfy.model_management.is_device_cpu(device) and not comfy.model_management.is_device_type(device, "meta"):
+        def _cast_bytes(tensor, target_dtype, target_device, requires_copy):
+            if tensor is None:
+                return 0
+            if target_device == tensor.device and not requires_copy:
+                if target_dtype is None or tensor.dtype == target_dtype:
+                    return 0
+            dtype_to_use = target_dtype if target_dtype is not None else tensor.dtype
+            return tensor.numel() * comfy.model_management.dtype_size(dtype_to_use)
+
+        cast_bytes = _cast_bytes(weight_source, dtype, device, weight_has_function)
+        cast_bytes += _cast_bytes(bias_source, bias_dtype, device, bias_has_function)
+        if cast_bytes > 0:
+            free_mem = comfy.model_management.get_free_memory(device)
+            reserved = comfy.model_management.extra_reserved_memory()
+            if free_mem - reserved < cast_bytes:
+                comfy.model_management.free_memory(cast_bytes + reserved, device)
+
     weight = comfy.model_management.cast_to(weight_source, None, device, non_blocking=non_blocking, copy=weight_has_function, stream=offload_stream)
 
     bias = None

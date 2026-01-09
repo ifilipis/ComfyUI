@@ -1608,6 +1608,8 @@ def soft_empty_cache(force=False):
 
 def unload_all_models():
     free_memory(1e30, get_torch_device())
+    gc.collect()
+    soft_empty_cache()
 
 def debug_memory_summary():
     if is_amd() or is_nvidia():

@@ -2,7 +2,6 @@ import logging
 from typing import Optional
 
 import torch
-import comfy.utils
 import torch.nn as nn
 
 from .vae_modules import (AttnBlock1D, Downsample1D, ResnetBlock1D,
@@ -153,7 +152,7 @@ class VAE(nn.Module):
         return dec, posterior
 
     def load_weights(self, src_dict) -> None:
-        comfy.utils.load_state_dict(self, src_dict, strict=True)
+        self.load_state_dict(src_dict, strict=True)
 
     @property
     def device(self) -> torch.device:
@@ -356,3 +355,4 @@ def get_my_vae(name: str, **kwargs) -> VAE:
     if name == '44k':
         return VAE_44k(**kwargs)
     raise ValueError(f'Unknown model: {name}')
+

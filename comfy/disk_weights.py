@@ -34,6 +34,9 @@ ALLOW_GDS = False
 PIN_IF_CPU = False
 DISK_WEIGHTS_ENABLED = False
 BASE_LOAD_FROM_STATE_DICT = torch.nn.Module._load_from_state_dict
+ORIGINAL_MODULE_LOAD_STATE_DICT = torch.nn.Module.load_state_dict
+ORIGINAL_MODULE_TO = torch.nn.Module.to
+PATCHED_TORCH_MODULE_METHODS = False
 LAZY_MODULE_STATE = weakref.WeakKeyDictionary()
 DISK_MATERIALIZATION_STATE = weakref.WeakKeyDictionary()
 _MISSING = object()
@@ -169,19 +172,59 @@ CACHE = DiskWeightCache(0)
 LOGGER = logging.getLogger(__name__)
 
 
-def configure(cache_bytes: int, allow_gds: bool, pin_if_cpu: bool, enabled: bool = True):
+def configure(max_ram_cache_bytes: int, allow_gds: bool, pin_if_cpu: bool, enabled: bool = True):
     global ALLOW_GDS, PIN_IF_CPU, DISK_WEIGHTS_ENABLED
     ALLOW_GDS = allow_gds
     PIN_IF_CPU = pin_if_cpu
     DISK_WEIGHTS_ENABLED = enabled
-    CACHE.set_limit(cache_bytes if enabled else 0)
+    CACHE.set_limit(max_ram_cache_bytes if enabled else 0)
     if not enabled:
         CACHE._entries.clear()
         CACHE.current_bytes = 0
+    if enabled:
+        patch_torch_module_methods_once()
 
 
 def disk_weights_enabled() -> bool:
     return DISK_WEIGHTS_ENABLED
+
+
+def _call_load_state_dict_with_assign(func, model, state_dict, strict: bool, assign: bool):
+    try:
+        return func(model, state_dict, strict=strict, assign=assign)
+    except TypeError:
+        return func(model, state_dict, strict=strict)
+
+
+def _module_has_meta_tensors(module: torch.nn.Module) -> bool:
+    for param in module.parameters(recurse=True):
+        if param is not None and param.device.type == "meta":
+            return True
+    for buf in module.buffers(recurse=True):
+        if buf is not None and buf.device.type == "meta":
+            return True
+    return False
+
+
+def patch_torch_module_methods_once():
+    global PATCHED_TORCH_MODULE_METHODS
+    if PATCHED_TORCH_MODULE_METHODS:
+        return
+    PATCHED_TORCH_MODULE_METHODS = True
+
+    def patched_load_state_dict(self, state_dict, strict=True, assign=False):
+        if getattr(state_dict, "is_stream_state_dict", False):
+            from . import utils
+            return _call_load_state_dict_with_assign(utils.load_state_dict, self, state_dict, strict, assign)
+        return _call_load_state_dict_with_assign(ORIGINAL_MODULE_LOAD_STATE_DICT, self, state_dict, strict, assign)
+
+    def patched_to(self, *args, **kwargs):
+        if disk_weights_enabled() and _module_has_meta_tensors(self):
+            return module_to(self, *args, **kwargs)
+        return ORIGINAL_MODULE_TO(self, *args, **kwargs)
+
+    torch.nn.Module.load_state_dict = patched_load_state_dict
+    torch.nn.Module.to = patched_to
 
 
 def register_module_weights(module: torch.nn.Module, state_dict, prefix: str = ""):
@@ -372,11 +415,9 @@ def _device_free_memory(device: torch.device) -> int:
 def _evict_ram_for_budget(required_bytes: int) -> int:
     if required_bytes <= 0:
         return 0
-    freed = evict_ram_cache(required_bytes)
-    if freed < required_bytes:
-        from . import model_management
-        freed += model_management.evict_ram_to_disk(required_bytes - freed)
-    return freed
+    from . import model_management
+    model_management.free_memory(required_bytes, torch.device("cpu"))
+    return int(model_management.get_free_memory(torch.device("cpu")))
 
 
 def _maybe_free_ram_budget(device: torch.device, required_bytes: int) -> int:
@@ -527,8 +568,9 @@ class _BudgetedStateDict(MutableMapping):
             if default is _MISSING:
                 raise KeyError(key)
             return default
+        tensor = self.get_tensor(key)
         self._deleted.add(key)
-        return self.get_tensor(key)
+        return tensor
 
     def meta(self, key: str):
         return self._get_meta(key)
@@ -875,10 +917,10 @@ def module_to(module: torch.nn.Module, *args, **kwargs):
             return module
         if allow_materialize:
             materialize_module_tree(module, target_device)
-            return module.to(*args, **kwargs)
+            return ORIGINAL_MODULE_TO(module, *args, **kwargs)
         dtype_override = _extract_to_dtype(args, kwargs)
         return move_module_tensors(module, target_device, dtype_override=dtype_override)
-    return module.to(*args, **kwargs)
+    return ORIGINAL_MODULE_TO(module, *args, **kwargs)
 
 
 def load_module_tensor(

@@ -694,12 +694,34 @@ class ModelPatcher:
             patch_counter = 0
             lowvram_counter = 0
             lowvram_mem_counter = 0
+            disk_offload_counter = 0
             loading = self._load_list()
 
             load_completely = []
             offloaded = []
             offload_buffer = 0
             loading.sort(reverse=True)
+            disk_weights_enabled = comfy.disk_weights.disk_weights_enabled()
+            cpu_device = torch.device("cpu")
+            cpu_offload_device = disk_weights_enabled and comfy.model_management.is_device_cpu(self.offload_device)
+            cpu_load_device = disk_weights_enabled and device_to is not None and comfy.model_management.is_device_cpu(device_to)
+
+            def ensure_cpu_budget(module_name, module, module_mem):
+                free_mem = comfy.model_management.get_free_memory(cpu_device)
+                if free_mem < module_mem:
+                    comfy.model_management.free_memory(module_mem - free_mem, cpu_device)
+                    free_mem = comfy.model_management.get_free_memory(cpu_device)
+                if free_mem < module_mem:
+                    logging.info(
+                        "Insufficient CPU RAM for %s (need %.2f MB, free %.2f MB); offloading to disk.",
+                        module_name,
+                        module_mem / (1024 * 1024),
+                        free_mem / (1024 * 1024),
+                    )
+                    comfy.disk_weights.offload_module_weights(module)
+                    return False
+                return True
+
             for i, x in enumerate(loading):
                 module_offload_mem, module_mem, n, m, params = x
 
@@ -742,14 +764,17 @@ class ModelPatcher:
                             patch_counter += 1
 
                     cast_weight = True
-                    offloaded.append((module_mem, n, m, params))
                 else:
                     if hasattr(m, "comfy_cast_weights"):
                         wipe_lowvram_weight(m)
 
                     if full_load or lowvram_fits:
-                        mem_counter += module_mem
-                        load_completely.append((module_mem, n, m, params))
+                        if cpu_load_device and not ensure_cpu_budget(n, m, module_mem):
+                            offloaded.append((module_mem, n, m, params, False))
+                            disk_offload_counter += 1
+                        else:
+                            mem_counter += module_mem
+                            load_completely.append((module_mem, n, m, params))
                     else:
                         offload_buffer = potential_offload
 
@@ -763,6 +788,14 @@ class ModelPatcher:
                 if bias_key in self.weight_wrapper_patches:
                     m.bias_function.extend(self.weight_wrapper_patches[bias_key])
 
+                if lowvram_weight:
+                    if cpu_offload_device:
+                        should_pin = ensure_cpu_budget(n, m, module_mem)
+                        if not should_pin:
+                            disk_offload_counter += 1
+                        offloaded.append((module_mem, n, m, params, should_pin))
+                    else:
+                        offloaded.append((module_mem, n, m, params, True))
                 mem_counter += move_weight_functions(m, device_to)
 
             load_completely.sort(reverse=True)
@@ -790,10 +823,13 @@ class ModelPatcher:
             for x in offloaded:
                 n = x[1]
                 params = x[3]
-                for param in params:
-                    self.pin_weight_to_device("{}.{}".format(n, param))
+                should_pin = x[4]
+                if should_pin:
+                    for param in params:
+                        self.pin_weight_to_device("{}.{}".format(n, param))
 
-            if lowvram_counter > 0:
+            partial_load = lowvram_counter > 0 or disk_offload_counter > 0
+            if partial_load:
                 logging.info("loaded partially; {:.2f} MB usable, {:.2f} MB loaded, {:.2f} MB offloaded, {:.2f} MB buffer reserved, lowvram patches: {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), lowvram_mem_counter / (1024 * 1024), offload_buffer / (1024 * 1024), patch_counter))
                 self.model.model_lowvram = True
             else:

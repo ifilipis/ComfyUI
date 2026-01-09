@@ -1,6 +1,7 @@
 import bisect
 import gc
 import itertools
+import logging
 import psutil
 import time
 import torch
@@ -9,6 +10,7 @@ from comfy_execution.graph import DynamicPrompt
 from abc import ABC, abstractmethod
 
 import nodes
+import comfy.model_management
 
 from comfy_execution.graph_utils import is_link
 
@@ -385,8 +387,18 @@ class RAMPressureCache(LRUCache):
         def _ram_gb():
             return psutil.virtual_memory().available / (1024**3)
 
-        if _ram_gb() > ram_headroom:
+        available_gb = _ram_gb()
+        if available_gb > ram_headroom:
             return
+        logging.debug(
+            "RAM pressure cache triggered: available %.2f GB, headroom %.2f GB",
+            available_gb,
+            ram_headroom,
+        )
+        if ram_headroom > 0:
+            required_bytes = int(max(0.0, ram_headroom - available_gb) * (1024**3))
+            if required_bytes > 0:
+                comfy.model_management.free_memory(required_bytes, torch.device("cpu"))
         gc.collect()
         if _ram_gb() > ram_headroom:
             return

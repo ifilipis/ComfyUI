@@ -37,6 +37,17 @@ _FST_LOADED = False
 _GDS_INITIALIZED = False
 _MISSING = object()
 _NOGDS_CHUNK_BYTES_DEFAULT = 64 * 1024 * 1024
+_FLOAT8_DTYPES = {
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+        getattr(torch, "float8_e8m0fnu", None),
+    )
+    if dtype is not None
+}
 
 
 def _require_fastsafetensors():
@@ -348,6 +359,8 @@ def _dlpack_tensor_from_buffer(
 
 
 def _validate_dtype_conversion(src: torch.dtype, dst: torch.dtype):
+    if src in _FLOAT8_DTYPES:
+        return
     if torch.tensor([], dtype=dst).element_size() > torch.tensor([], dtype=src).element_size():
         raise ValueError(f"Online type conversion to larger sizes is not supported ({src} -> {dst})")
 
@@ -523,8 +536,9 @@ class StreamStateDict(collections.abc.MutableMapping):
                 raise KeyError(key)
             return default
         if self._index.has(key):
+            tensor = self.get_tensor(key)
             self._deleted.add(key)
-            return self.get_tensor(key)
+            return tensor
         if default is _MISSING:
             raise KeyError(key)
         return default
@@ -636,8 +650,9 @@ class _BaseViewStateDict(MutableMapping):
                 if default is _MISSING:
                     raise
                 return default
+        tensor = self.get_tensor(key)
         self._deleted.add(key)
-        return self.get_tensor(key)
+        return tensor
 
     def meta(self, key: str):
         if key in self._overrides:
@@ -768,8 +783,9 @@ class DeviceViewStateDict(_BaseViewStateDict):
                 if default is _MISSING:
                     raise
                 return default
+        tensor = self.get_tensor(key)
         self._deleted.add(key)
-        return self.get_tensor(key)
+        return tensor
 
 
 class FilterViewStateDict(_BaseViewStateDict):

@@ -57,6 +57,34 @@ class DiskTensorRef:
         pin_if_cpu: bool,
         dtype_override: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
+        if device is not None and device.type == "cuda":
+            from . import model_management
+            meta_nbytes = _meta_nbytes(self.meta)
+            if meta_nbytes is not None:
+                required_bytes = meta_nbytes
+                meta_dtype = getattr(self.meta, "dtype", None)
+                if dtype_override is not None and meta_dtype is not None:
+                    required_bytes = int(
+                        required_bytes
+                        * torch.empty((), dtype=dtype_override).element_size()
+                        / torch.empty((), dtype=meta_dtype).element_size()
+                    )
+                effective_before = model_management.get_effective_free_memory(device)
+                effective_after = effective_before
+                while effective_after < required_bytes:
+                    model_management.free_memory(required_bytes, device)
+                    effective_after = model_management.get_effective_free_memory(device)
+                    if effective_after <= effective_before:
+                        break
+                logging.debug(
+                    "Disk tensor load VRAM gate: required=%.2f MB effective_free_before=%.2f MB effective_free_after=%.2f MB reserved_vram=%.2f MB",
+                    required_bytes / (1024 * 1024),
+                    effective_before / (1024 * 1024),
+                    effective_after / (1024 * 1024),
+                    model_management.extra_reserved_memory() / (1024 * 1024),
+                )
+                if effective_after < required_bytes:
+                    raise RuntimeError("Insufficient effective VRAM for disk tensor load.")
         dtype = dtype_override or getattr(self.meta, "dtype", None)
         if hasattr(self.state_dict, "get_tensor"):
             return self.state_dict.get_tensor(
@@ -149,6 +177,13 @@ class DiskWeightCache:
             entry = self._entries.pop(key)
             self.current_bytes -= entry.size_bytes
 
+    def remove_entry(self, module: torch.nn.Module, name: str) -> None:
+        key = self._entry_key(module, name)
+        entry = self._entries.pop(key, None)
+        if entry is None:
+            return
+        self.current_bytes = max(0, self.current_bytes - entry.size_bytes)
+
     def _drop_module_entries(self, module_ref: weakref.ReferenceType):
         to_remove = []
         for key, entry in self._entries.items():
@@ -187,6 +222,86 @@ def configure(max_ram_cache_bytes: int, allow_gds: bool, pin_if_cpu: bool, enabl
 
 def disk_weights_enabled() -> bool:
     return DISK_WEIGHTS_ENABLED
+
+
+def resolve_model_key(model: torch.nn.Module, key: str) -> tuple[torch.nn.Module, str]:
+    parts = key.split(".")
+    module = model
+    for part in parts[:-1]:
+        if not hasattr(module, part):
+            raise KeyError(key)
+        module = getattr(module, part)
+    attr = parts[-1]
+    if not hasattr(module, attr):
+        raise KeyError(key)
+    return module, attr
+
+
+def materialize_model_key_tensor(
+    model: torch.nn.Module,
+    key: str,
+    device: torch.device,
+    *,
+    dtype_override: Optional[torch.dtype] = None,
+    strict: bool = True,
+) -> Optional[torch.Tensor]:
+    module, attr = resolve_model_key(model, key)
+    if attr in module._parameters:
+        current = module._parameters[attr]
+    elif attr in module._buffers:
+        current = module._buffers[attr]
+    else:
+        raise KeyError(key)
+    if current is None:
+        return None
+    if current.device.type != "meta":
+        if dtype_override is not None and current.dtype != dtype_override:
+            return current.to(dtype=dtype_override)
+        return current
+    refs = REGISTRY.get(module)
+    if not refs or attr not in refs:
+        if strict:
+            raise RuntimeError(
+                f"Meta tensor without disk reference for key {key} on module {module.__class__.__name__}."
+            )
+        return current
+    # Meta device tensors have no storage; Tensor.to() cannot materialize them.
+    # See https://pytorch.org/docs/stable/meta.html
+    disk_ref = refs[attr]
+    meta_nbytes = _meta_nbytes(disk_ref.meta)
+    if meta_nbytes is not None:
+        required_bytes = meta_nbytes
+        meta_dtype = getattr(disk_ref.meta, "dtype", None)
+        if dtype_override is not None and meta_dtype is not None:
+            required_bytes = int(
+                required_bytes
+                * torch.empty((), dtype=dtype_override).element_size()
+                / torch.empty((), dtype=meta_dtype).element_size()
+            )
+        from . import model_management
+        effective_free = model_management.get_effective_free_memory(device)
+        while effective_free < required_bytes:
+            model_management.free_memory(required_bytes, device)
+            new_effective = model_management.get_effective_free_memory(device)
+            if new_effective <= effective_free:
+                break
+            effective_free = new_effective
+        if effective_free < required_bytes and strict:
+            raise RuntimeError(
+                f"Insufficient effective memory to materialize key {key} on device {device}."
+            )
+    tensor = load_module_tensor(
+        module,
+        attr,
+        device,
+        allow_alternate=False,
+        temporary=False,
+        dtype_override=dtype_override,
+    )
+    if tensor is None or tensor.device.type == "meta":
+        if strict:
+            raise RuntimeError(f"Strict materialization failed for key {key}.")
+    return tensor
 
 
 def _call_load_state_dict_with_assign(func, model, state_dict, strict: bool, assign: bool):
@@ -607,35 +722,35 @@ def register_lazy_modules(model: torch.nn.Module, state_dict):
 
 def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
     lazy_state = LAZY_MODULE_STATE.get(module)
+    refs = REGISTRY.get(module)
+    if not refs or name not in refs:
+        raise RuntimeError(
+            f"Attempted to offload meta tensor without registry ref: {module.__class__.__name__}.{name}."
+        )
     if lazy_state is not None:
         CACHE.remove_module(module)
-        refs = REGISTRY.get(module)
-        if refs:
-            state = _get_materialization_state(module)
-            for ref_name, disk_ref in refs.items():
-                shape = getattr(disk_ref.meta, "shape", None)
-                dtype = _get_future_dtype(module, ref_name) or getattr(disk_ref.meta, "dtype", None)
-                if shape is None or dtype is None:
-                    continue
-                meta_tensor = torch.empty(shape, dtype=dtype, device="meta")
-                if disk_ref.is_buffer:
-                    module._buffers[ref_name] = meta_tensor
-                else:
-                    module._parameters[ref_name] = torch.nn.Parameter(meta_tensor, requires_grad=disk_ref.requires_grad)
-                nbytes = _meta_nbytes(disk_ref.meta)
-                if nbytes is not None:
-                    state.loaded_keys.discard(ref_name)
-                    if ref_name not in state.deferred_keys:
-                        state.deferred_keys.add(ref_name)
-                        state.deferred_bytes += nbytes
-                    state.loaded_bytes = max(0, state.loaded_bytes - nbytes)
-            _update_disk_state_attrs(module, state)
+        state = _get_materialization_state(module)
+        for ref_name, disk_ref in refs.items():
+            shape = getattr(disk_ref.meta, "shape", None)
+            dtype = _get_future_dtype(module, ref_name) or getattr(disk_ref.meta, "dtype", None)
+            if shape is None or dtype is None:
+                continue
+            meta_tensor = torch.empty(shape, dtype=dtype, device="meta")
+            if disk_ref.is_buffer:
+                module._buffers[ref_name] = meta_tensor
+            else:
+                module._parameters[ref_name] = torch.nn.Parameter(meta_tensor, requires_grad=disk_ref.requires_grad)
+            nbytes = _meta_nbytes(disk_ref.meta)
+            if nbytes is not None:
+                state.loaded_keys.discard(ref_name)
+                if ref_name not in state.deferred_keys:
+                    state.deferred_keys.add(ref_name)
+                    state.deferred_bytes += nbytes
+                state.loaded_bytes = max(0, state.loaded_bytes - nbytes)
+        _update_disk_state_attrs(module, state)
         lazy_state.loaded = False
         return
-    ref = REGISTRY.get(module)
-    if not ref or name not in ref:
-        return
-    disk_ref = ref[name]
+    disk_ref = refs[name]
     shape = getattr(disk_ref.meta, "shape", None)
     dtype = _get_future_dtype(module, name) or getattr(disk_ref.meta, "dtype", None)
     if shape is None or dtype is None:
@@ -908,6 +1023,11 @@ def offload_module_weights(module: torch.nn.Module) -> int:
         ref_name = next(iter(refs.keys()), None)
         if ref_name is not None:
             _evict_module_weight(module, ref_name, False)
+            CACHE.remove_entry(module, ref_name)
+        elif ref_name is None:
+            raise RuntimeError(
+                f"Attempted to offload meta tensor without registry refs on module {module.__class__.__name__}."
+            )
         for disk_ref in refs.values():
             nbytes = _meta_nbytes(disk_ref.meta)
             if nbytes is not None:
@@ -915,6 +1035,7 @@ def offload_module_weights(module: torch.nn.Module) -> int:
         return offloaded_bytes
     for name, disk_ref in refs.items():
         _evict_module_weight(module, name, disk_ref.is_buffer)
+        CACHE.remove_entry(module, name)
         nbytes = _meta_nbytes(disk_ref.meta)
         if nbytes is not None:
             offloaded_bytes += nbytes
@@ -1039,6 +1160,49 @@ def load_module_tensor(
     state = _get_materialization_state(module)
     _rebuild_materialization_state(module, refs, state)
     _log_materialization(module, load_device, free_mem_start, refs, state, "Disk weight loaded")
+    return tensor
+
+
+def load_module_tensor_strict_for_compute(
+    module: torch.nn.Module,
+    name: str,
+    device: torch.device,
+    *,
+    dtype_override: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    refs = REGISTRY.get(module)
+    if not refs or name not in refs:
+        raise RuntimeError(
+            f"Meta tensor without disk reference for compute: {module.__class__.__name__}.{name}."
+        )
+    disk_ref = refs[name]
+    meta_nbytes = _meta_nbytes(disk_ref.meta)
+    if meta_nbytes is not None:
+        required_bytes = meta_nbytes
+        meta_dtype = getattr(disk_ref.meta, "dtype", None)
+        if dtype_override is not None and meta_dtype is not None:
+            required_bytes = int(
+                required_bytes
+                * torch.empty((), dtype=dtype_override).element_size()
+                / torch.empty((), dtype=meta_dtype).element_size()
+            )
+        from . import model_management
+        effective_free = model_management.get_effective_free_memory(device)
+        while effective_free < required_bytes:
+            model_management.free_memory(required_bytes, device)
+            new_effective = model_management.get_effective_free_memory(device)
+            if new_effective <= effective_free:
+                break
+            effective_free = new_effective
+        if effective_free < required_bytes:
+            raise RuntimeError(
+                f"Insufficient effective memory for compute load on device {device}."
+            )
+    tensor = disk_ref.load(device, ALLOW_GDS, PIN_IF_CPU, dtype_override=dtype_override)
+    if tensor.device.type == "meta":
+        raise RuntimeError(
+            f"Strict compute load returned meta tensor for {module.__class__.__name__}.{name}."
+        )
     return tensor
 
 

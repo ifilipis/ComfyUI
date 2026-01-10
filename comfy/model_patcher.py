@@ -620,6 +620,13 @@ class ModelPatcher:
 
         weight, set_func, convert_func = get_key_weight(self.model, key)
         inplace_update = self.weight_inplace_update or inplace_update
+        if comfy.disk_weights.disk_weights_enabled() and weight.device.type == "meta":
+            weight = comfy.disk_weights.materialize_model_key_tensor(
+                self.model,
+                key,
+                self.offload_device,
+                strict=True,
+            )
 
         if key not in self.backup:
             self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
@@ -861,6 +868,13 @@ class ModelPatcher:
                 full_load = True
             else:
                 full_load = False
+            if full_load and device_to is not None and device_to.type == "cuda":
+                model_bytes = self.model_size()
+                required_for_full = model_bytes + comfy.model_management.minimum_inference_memory()
+                free_mem = comfy.model_management.get_free_memory(device_to)
+                if free_mem < required_for_full:
+                    full_load = False
+                    lowvram_model_memory = max(0, free_mem - comfy.model_management.minimum_inference_memory())
 
             if load_weights:
                 self.load(device_to, lowvram_model_memory=lowvram_model_memory, force_patch_weights=force_patch_weights, full_load=full_load)
@@ -963,10 +977,13 @@ class ModelPatcher:
                                 freed_bytes = module_mem
                         else:
                             if remaining_ram is not None and remaining_ram < module_mem and comfy.disk_weights.disk_weights_enabled():
-                                logging.info("Insufficient CPU RAM for %s (need %.2f MB, free %.2f MB); offloading to disk.", n, module_mem / (1024 * 1024), remaining_ram / (1024 * 1024))
-                                freed_bytes = comfy.disk_weights.offload_module_weights(m)
-                                if freed_bytes == 0:
-                                    freed_bytes = module_mem
+                                comfy.model_management.free_memory(module_mem, torch.device("cpu"))
+                                remaining_ram = comfy.model_management.get_free_memory(device_to)
+                                if remaining_ram < module_mem:
+                                    logging.info("Insufficient CPU RAM for %s (need %.2f MB, free %.2f MB); offloading to disk.", n, module_mem / (1024 * 1024), remaining_ram / (1024 * 1024))
+                                    freed_bytes = comfy.disk_weights.offload_module_weights(m)
+                                    if freed_bytes == 0:
+                                        freed_bytes = module_mem
                             else:
                                 if comfy.disk_weights.disk_weights_enabled():
                                     comfy.disk_weights.move_module_tensors(m, device_to)
@@ -1341,6 +1358,13 @@ class ModelPatcher:
     def patch_cached_hook_weights(self, cached_weights: dict, key: str, memory_counter: MemoryCounter):
         if key not in self.hook_backup:
             weight: torch.Tensor = comfy.utils.get_attr(self.model, key)
+            if comfy.disk_weights.disk_weights_enabled() and weight.device.type == "meta":
+                weight = comfy.disk_weights.materialize_model_key_tensor(
+                    self.model,
+                    key,
+                    self.offload_device,
+                    strict=True,
+                )
             target_device = self.offload_device
             if self.hook_mode == comfy.hooks.EnumHookMode.MaxSpeed:
                 used = memory_counter.use(weight)
@@ -1359,6 +1383,14 @@ class ModelPatcher:
 
         weight, set_func, convert_func = get_key_weight(self.model, key)
         weight: torch.Tensor
+        if comfy.disk_weights.disk_weights_enabled() and weight.device.type == "meta":
+            materialize_device = self.offload_device if weight.device.type == "meta" else weight.device
+            weight = comfy.disk_weights.materialize_model_key_tensor(
+                self.model,
+                key,
+                materialize_device,
+                strict=True,
+            )
         if key not in self.hook_backup:
             target_device = self.offload_device
             if self.hook_mode == comfy.hooks.EnumHookMode.MaxSpeed:
@@ -1401,10 +1433,14 @@ class ModelPatcher:
             if whitelist_keys_set:
                 for k in keys:
                     if k in whitelist_keys_set:
+                        if self.hook_backup[k][0].device.type == "meta":
+                            raise RuntimeError(f"Hook backup for {k} is meta.")
                         comfy.utils.copy_to_param(self.model, k, self.hook_backup[k][0].to(device=self.hook_backup[k][1]))
                         self.hook_backup.pop(k)
             else:
                 for k in keys:
+                    if self.hook_backup[k][0].device.type == "meta":
+                        raise RuntimeError(f"Hook backup for {k} is meta.")
                     comfy.utils.copy_to_param(self.model, k, self.hook_backup[k][0].to(device=self.hook_backup[k][1]))
 
                 self.hook_backup.clear()

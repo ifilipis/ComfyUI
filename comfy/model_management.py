@@ -534,7 +534,21 @@ class LoadedModel:
         return False
 
     def model_unload(self, memory_to_free=None, unpatch_weights=True):
-        if memory_to_free is not None:
+        if self.device is not None and self.device.type == "cuda":
+            free_before = get_free_memory(self.device, torch_free_too=True)[0]
+            if memory_to_free is None:
+                memory_to_free = self.model.loaded_size()
+            freed = self.model.partially_unload(self.model.offload_device, memory_to_free)
+            free_after = get_free_memory(self.device, torch_free_too=True)[0]
+            logging.info(
+                "GPU unload via partial eviction: device=%s free_before=%.2f MB free_after=%.2f MB delta=%.2f MB",
+                self.device,
+                free_before / (1024 * 1024),
+                free_after / (1024 * 1024),
+                (free_after - free_before) / (1024 * 1024),
+            )
+            return False
+        elif memory_to_free is not None:
             if memory_to_free < self.model.loaded_size():
                 freed = self.model.partially_unload(self.model.offload_device, memory_to_free)
                 if freed >= memory_to_free:
@@ -605,18 +619,19 @@ def free_memory(memory_required, device, keep_loaded=[]):
     free_mem = None
     gpu_before_total = None
     gpu_before_torch = None
+    gpu_effective_before = None
     log_gpu_pressure = False
-    if device.type not in ("cpu", "meta"):
+    if device.type == "cuda":
         gpu_before_total, gpu_before_torch = get_free_memory(device, torch_free_too=True)
-        if gpu_before_total < memory_required:
+        gpu_effective_before = get_effective_free_memory(device)
+        if gpu_effective_before < memory_required:
             log_gpu_pressure = True
             logging.info(
-                "GPU memory pressure: device=%s required=%.2f MB free_before=%.2f MB minimum_inference=%.2f MB extra_reserved=%.2f MB",
+                "GPU memory pressure: device=%s requested=%.2f MB effective_free=%.2f MB reserved_vram=%.2f MB",
                 device,
                 memory_required / (1024 * 1024),
-                gpu_before_total / (1024 * 1024),
-                minimum_inference_memory() / (1024 * 1024),
-                EXTRA_RESERVED_VRAM / (1024 * 1024),
+                gpu_effective_before / (1024 * 1024),
+                extra_reserved_memory() / (1024 * 1024),
             )
     if is_device_cpu(device) and disk_weights_enabled:
         free_mem = get_free_memory(device)
@@ -641,7 +656,7 @@ def free_memory(memory_required, device, keep_loaded=[]):
     for x in sorted(can_unload):
         i = x[-1]
         memory_to_free = None
-        free_mem = get_free_memory(device)
+        free_mem = get_effective_free_memory(device) if device.type == "cuda" else get_free_memory(device)
         if free_mem > memory_required:
             break
         if not DISABLE_SMART_MEMORY or (is_device_cpu(device) and disk_weights_enabled):
@@ -669,14 +684,18 @@ def free_memory(memory_required, device, keep_loaded=[]):
                 soft_empty_cache()
     if log_gpu_pressure:
         gpu_after_total, gpu_after_torch = get_free_memory(device, torch_free_too=True)
+        gpu_effective_after = get_effective_free_memory(device)
         logging.info(
-            "GPU memory freed: device=%s free_total_before=%.2f MB free_total_after=%.2f MB delta=%.2f MB; torch_free_before=%.2f MB torch_free_after=%.2f MB",
+            "GPU memory freed: device=%s free_total_before=%.2f MB free_total_after=%.2f MB delta=%.2f MB; torch_free_before=%.2f MB torch_free_after=%.2f MB effective_free_before=%.2f MB effective_free_after=%.2f MB delta_effective=%.2f MB",
             device,
             gpu_before_total / (1024 * 1024),
             gpu_after_total / (1024 * 1024),
             (gpu_after_total - gpu_before_total) / (1024 * 1024),
             gpu_before_torch / (1024 * 1024),
             gpu_after_torch / (1024 * 1024),
+            gpu_effective_before / (1024 * 1024),
+            gpu_effective_after / (1024 * 1024),
+            (gpu_effective_after - gpu_effective_before) / (1024 * 1024),
         )
     return unloaded_models
 
@@ -1147,6 +1166,8 @@ def sync_stream(device, stream):
 def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, stream=None):
     if device is not None and not isinstance(device, torch.device):
         device = torch.device(device)
+    target_device = device if device is not None else weight.device
+    allocation_needed = copy or (dtype is not None and weight.dtype != dtype) or (device is not None and weight.device != device)
     if device is None or weight.device == device:
         if not copy:
             if dtype is None or weight.dtype == dtype:
@@ -1160,20 +1181,26 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
         return weight.to(dtype=dtype, copy=copy)
 
 
-    if device.type not in ("cpu", "meta"):
+    if allocation_needed and target_device.type == "cuda":
         dtype_to_allocate = dtype if dtype is not None else weight.dtype
         bytes_needed = weight.numel() * torch.empty((), dtype=dtype_to_allocate).element_size()
-        required_free_before = bytes_needed + minimum_inference_memory()
-        free_memory(required_free_before, device)
-        free_after = get_free_memory(device)
-        if free_after < required_free_before:
-            logging.error(
-                "Insufficient free VRAM for cast_to: device=%s required=%.2f MB free_after=%.2f MB",
-                device,
-                required_free_before / (1024 * 1024),
-                free_after / (1024 * 1024),
-            )
-            raise RuntimeError("Insufficient free VRAM for cast_to allocation.")
+        effective_before = get_effective_free_memory(target_device)
+        effective_after = effective_before
+        while effective_after < bytes_needed:
+            free_memory(bytes_needed, target_device)
+            new_effective = get_effective_free_memory(target_device)
+            if new_effective <= effective_after:
+                break
+            effective_after = new_effective
+        logging.debug(
+            "cast_to VRAM gate: required=%.2f MB effective_free_before=%.2f MB effective_free_after=%.2f MB reserved_vram=%.2f MB",
+            bytes_needed / (1024 * 1024),
+            effective_before / (1024 * 1024),
+            effective_after / (1024 * 1024),
+            extra_reserved_memory() / (1024 * 1024),
+        )
+        if effective_after < bytes_needed:
+            raise RuntimeError("Insufficient effective VRAM for cast_to allocation.")
 
     if stream is not None:
         wf_context = stream
@@ -1420,6 +1447,12 @@ def get_free_memory(dev=None, torch_free_too=False):
         return (mem_free_total, mem_free_torch)
     else:
         return mem_free_total
+
+
+def get_effective_free_memory(device: torch.device) -> int:
+    if device.type == "cuda":
+        return max(0, get_free_memory(device) - extra_reserved_memory())
+    return get_free_memory(device)
 
 def cpu_mode():
     global cpu_state

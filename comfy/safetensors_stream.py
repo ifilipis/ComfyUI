@@ -209,7 +209,19 @@ class _SafeTensorFile:
         )
         if device_is_cuda:
             if pin_if_cpu:
+                from . import model_management
+                model_management.ensure_allocation_possible(
+                    torch.device("cpu"),
+                    cpu_tensor.numel() * cpu_tensor.element_size(),
+                    reason="safetensors_stream pin_memory",
+                )
                 cpu_tensor = cpu_tensor.pin_memory()
+            from . import model_management
+            model_management.ensure_allocation_possible(
+                device,
+                cpu_tensor.numel() * cpu_tensor.element_size(),
+                reason="safetensors_stream read_tensor",
+            )
             gpu_tensor = torch.empty_like(cpu_tensor, device=device)
             gpu_tensor.copy_(cpu_tensor, non_blocking=pin_if_cpu)
             return gpu_tensor
@@ -241,6 +253,16 @@ class _SafeTensorFile:
         chunk_bytes = int(os.getenv("COMFY_SAFETENSORS_NOGDS_CHUNK_BYTES", _NOGDS_CHUNK_BYTES_DEFAULT))
         chunk_bytes = max(1, chunk_bytes)
         ptr_align = framework.get_device_ptr_align()
+        max_chunk_len = min(length, chunk_bytes)
+        _, max_aligned_length, _ = self._aligned_range(abs_start, max_chunk_len)
+        read_buffer_bytes = max_aligned_length + ptr_align
+        loaded_tensor_bytes = meta.nbytes
+        converted_tensor_bytes = 0
+        if dtype is not None and dtype != meta.dtype:
+            converted_tensor_bytes = meta.numel * torch.tensor([], dtype=dtype).element_size()
+        peak = read_buffer_bytes + loaded_tensor_bytes + converted_tensor_bytes
+        from . import model_management
+        model_management.ensure_allocation_possible(torch.device("cpu"), peak, reason="safetensors_stream read_tensor")
         dest_tensor = torch.empty_strided(meta.shape, meta.strides, dtype=meta.dtype, device="cpu")
         buffer_length = 0
         buf_ptr = None
@@ -291,6 +313,13 @@ class _SafeTensorFile:
         aligned_offset, aligned_length, head = self._aligned_range(abs_start, length)
         ptr_align = framework.get_device_ptr_align()
         buffer_length = aligned_length + ptr_align
+        loaded_tensor_bytes = meta.nbytes
+        converted_tensor_bytes = 0
+        if dtype is not None and dtype != meta.dtype:
+            converted_tensor_bytes = meta.numel * torch.tensor([], dtype=dtype).element_size()
+        peak = buffer_length + loaded_tensor_bytes + converted_tensor_bytes
+        from . import model_management
+        model_management.ensure_allocation_possible(device, peak, reason="safetensors_stream read_tensor")
         fst_device = _fst_device_from_torch(fst, device)
         gbuf = framework.alloc_tensor_memory(buffer_length, fst_device)
         ptr_off = (- (gbuf.get_base_address() + head)) % ptr_align
@@ -348,8 +377,7 @@ def _dlpack_tensor_from_buffer(
 
 
 def _validate_dtype_conversion(src: torch.dtype, dst: torch.dtype):
-    if torch.tensor([], dtype=dst).element_size() > torch.tensor([], dtype=src).element_size():
-        raise ValueError(f"Online type conversion to larger sizes is not supported ({src} -> {dst})")
+    return
 
 
 def _get_gds_o_direct(framework) -> bool:
@@ -517,17 +545,21 @@ class StreamStateDict(collections.abc.MutableMapping):
 
     def pop(self, key: str, default: object = _MISSING) -> torch.Tensor:
         if key in self._overrides:
-            return self._overrides.pop(key)
+            value = self._overrides[key]
+            self._deleted.add(key)
+            del self._overrides[key]
+            return value
         if key in self._deleted:
             if default is _MISSING:
                 raise KeyError(key)
             return default
-        if self._index.has(key):
-            self._deleted.add(key)
-            return self.get_tensor(key)
-        if default is _MISSING:
-            raise KeyError(key)
-        return default
+        if not self._index.has(key):
+            if default is _MISSING:
+                raise KeyError(key)
+            return default
+        value = self.get_tensor(key)
+        self._deleted.add(key)
+        return value
 
     def copy(self) -> "StreamStateDict":
         new = StreamStateDict(self._index, self._file.acquire(), self._device, allow_gds=self._allow_gds)
@@ -623,21 +655,24 @@ class _BaseViewStateDict(MutableMapping):
 
     def pop(self, key: str, default: object = _MISSING) -> torch.Tensor:
         if key in self._overrides:
-            return self._overrides.pop(key)
+            value = self._overrides[key]
+            self._deleted.add(key)
+            del self._overrides[key]
+            return value
         base_key = self._resolve_base_key(key)
         if base_key is None or key in self._deleted:
             if default is _MISSING:
                 raise KeyError(key)
             return default
-        if self._mutate_base:
-            try:
-                return self._base.pop(base_key)
-            except KeyError:
-                if default is _MISSING:
-                    raise
-                return default
+        if not self._mutate_base and base_key not in self._base:
+            if default is _MISSING:
+                raise KeyError(key)
+            return default
+        value = self.get_tensor(key)
+        if self._mutate_base and base_key in self._base:
+            del self._base[base_key]
         self._deleted.add(key)
-        return self.get_tensor(key)
+        return value
 
     def meta(self, key: str):
         if key in self._overrides:
@@ -717,59 +752,6 @@ class DeviceViewStateDict(_BaseViewStateDict):
             numel=numel,
             nbytes=numel * t.element_size(),
         )
-
-    def __getitem__(self, key: str) -> torch.Tensor:
-        return self.get_tensor(key)
-
-    def __setitem__(self, key: str, value: torch.Tensor) -> None:
-        base_key = self._resolve_base_key(key)
-        if self._mutate_base and base_key is not None and base_key in self._base:
-            self._base[base_key] = value
-        else:
-            self._overrides[key] = value
-        self._deleted.discard(key)
-
-    def __delitem__(self, key: str) -> None:
-        if key in self._overrides:
-            del self._overrides[key]
-            return
-        base_key = self._resolve_base_key(key)
-        if base_key is None or key in self._deleted:
-            raise KeyError(key)
-        if self._mutate_base and base_key in self._base:
-            del self._base[base_key]
-        else:
-            self._deleted.add(key)
-
-    def __iter__(self) -> Iterator[str]:
-        for k in self._iter_base_keys():
-            if k in self._deleted:
-                continue
-            yield k
-        for k in self._overrides.keys():
-            yield k
-
-    def __len__(self) -> int:
-        base_keys = list(self._iter_base_keys())
-        return len(base_keys) - len(self._deleted) + len(self._overrides)
-
-    def pop(self, key: str, default: object = _MISSING) -> torch.Tensor:
-        if key in self._overrides:
-            return self._overrides.pop(key)
-        base_key = self._resolve_base_key(key)
-        if base_key is None or key in self._deleted:
-            if default is _MISSING:
-                raise KeyError(key)
-            return default
-        if self._mutate_base:
-            try:
-                return self._base.pop(base_key)
-            except KeyError:
-                if default is _MISSING:
-                    raise
-                return default
-        self._deleted.add(key)
-        return self.get_tensor(key)
 
 
 class FilterViewStateDict(_BaseViewStateDict):

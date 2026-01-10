@@ -44,6 +44,7 @@
 - [x] Represent disk-resident weights as meta tensors (`device='meta'`) plus a `DiskRef` registry that stores `(module, param_name) -> TensorMeta + loader handle`.
 - [x] Add an LRU cache for RAM-resident weights loaded from disk with configurable max bytes. Eviction replaces RAM tensors with meta tensors and keeps `DiskRef` for reload.
 - [x] Add a general `forward_pre_hook` to materialize any meta+DiskRef weights before compute; this covers modules that bypass `comfy.ops`.
+- [x] CLI wiring: `--low-ram` enables disk-backed weight streaming/offload, `--weights-gds` enables GPUDirect Storage, RAM headroom is enforced by default, and `--cache-ram` overrides the default headroom.
 
 ### Pipeline refactors
 - [x] Update `load_torch_file` to return `StreamStateDict` for `.safetensors`/`.sft` and return metadata without loading.

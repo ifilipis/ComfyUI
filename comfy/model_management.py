@@ -423,6 +423,8 @@ DISABLE_SMART_MEMORY = args.disable_smart_memory
 if DISABLE_SMART_MEMORY:
     logging.info("Disabling smart memory management")
 
+RAM_HEADROOM_BYTES = int(args.cache_ram * (1024 ** 3)) if args.cache_ram > 0 else 512 * 1024 ** 2
+
 def get_torch_device_name(device):
     if hasattr(device, 'type'):
         if device.type == "cuda":
@@ -587,13 +589,100 @@ def extra_reserved_memory():
 def minimum_inference_memory():
     return (1024 * 1024 * 1024) * 0.8 + extra_reserved_memory()
 
+def ensure_allocation_possible(device: torch.device, bytes_needed: int, *, reason: str) -> None:
+    if bytes_needed <= 0:
+        return
+    if device.type == "cpu":
+        available = psutil.virtual_memory().available
+        if available - RAM_HEADROOM_BYTES < bytes_needed:
+            logging.debug(
+                "CPU allocation blocked: available=%d headroom=%d needed=%d reason=%s",
+                available,
+                RAM_HEADROOM_BYTES,
+                bytes_needed,
+                reason,
+            )
+            logging.debug("Triggering CPU free_memory for %d bytes", bytes_needed)
+            free_memory(bytes_needed, device=torch.device("cpu"))
+            available = psutil.virtual_memory().available
+            logging.debug(
+                "CPU free_memory complete: available=%d headroom=%d needed=%d",
+                available,
+                RAM_HEADROOM_BYTES,
+                bytes_needed,
+            )
+        if available - RAM_HEADROOM_BYTES < bytes_needed:
+            raise RuntimeError(
+                f"CPU allocation denied: available={available} headroom={RAM_HEADROOM_BYTES} "
+                f"bytes_needed={bytes_needed} reason={reason}"
+            )
+        return
+    free = get_free_memory(device)
+    reserve = int(args.reserve_vram * 1024**2) if args.reserve_vram is not None else 0
+    required = bytes_needed + reserve
+    if free < required:
+        logging.debug(
+            "VRAM allocation blocked: free=%d reserve=%d needed=%d reason=%s",
+            free,
+            reserve,
+            bytes_needed,
+            reason,
+        )
+        logging.debug("Triggering VRAM free_memory for %d bytes", required)
+        free_memory(required, device=device)
+        free = get_free_memory(device)
+        logging.debug(
+            "VRAM free_memory complete: free=%d reserve=%d needed=%d",
+            free,
+            reserve,
+            bytes_needed,
+        )
+    if free < required:
+        raise RuntimeError(
+            f"VRAM allocation denied: free={free} reserve={reserve} "
+            f"bytes_needed={bytes_needed} reason={reason}"
+        )
+
 def free_memory(memory_required, device, keep_loaded=[]):
     cleanup_models_gc()
-    if is_device_cpu(device) and comfy.disk_weights.disk_weights_enabled():
-        logging.info("RAM pressure: requested %.2f MB, free %.2f MB", memory_required / (1024 * 1024), get_free_memory(device) / (1024 * 1024))
-        freed_cache = comfy.disk_weights.evict_ram_cache(memory_required)
-        if freed_cache < memory_required:
-            evict_ram_to_disk(memory_required - freed_cache)
+    reserve = int(args.reserve_vram * 1024**2) if args.reserve_vram is not None else 0
+    if comfy.disk_weights.disk_weights_enabled():
+        if is_device_cpu(device):
+            available = psutil.virtual_memory().available
+            need = memory_required - (available - RAM_HEADROOM_BYTES)
+            if need > 0:
+                logging.debug(
+                    "CPU cache eviction triggered: available=%d headroom=%d needed=%d",
+                    available,
+                    RAM_HEADROOM_BYTES,
+                    memory_required,
+                )
+                freed_cache = comfy.disk_weights.CACHE.evict_cpu_bytes(need)
+                available_after = psutil.virtual_memory().available
+                logging.debug(
+                    "CPU cache eviction complete: before=%d after=%d freed=%d",
+                    available,
+                    available_after,
+                    freed_cache,
+                )
+        else:
+            free_before = get_free_memory(device)
+            need = memory_required - (free_before - reserve)
+            if need > 0:
+                logging.debug(
+                    "VRAM cache eviction triggered: free=%d reserve=%d needed=%d",
+                    free_before,
+                    reserve,
+                    memory_required,
+                )
+                freed_cache = comfy.disk_weights.CACHE.evict_cuda_bytes(device, need)
+                free_after = get_free_memory(device)
+                logging.debug(
+                    "VRAM cache eviction complete: before=%d after=%d freed=%d",
+                    free_before,
+                    free_after,
+                    freed_cache,
+                )
     unloaded_model = []
     can_unload = []
     unloaded_models = []
@@ -609,7 +698,10 @@ def free_memory(memory_required, device, keep_loaded=[]):
         i = x[-1]
         memory_to_free = None
         if not DISABLE_SMART_MEMORY:
-            free_mem = get_free_memory(device)
+            if is_device_cpu(device):
+                free_mem = psutil.virtual_memory().available - RAM_HEADROOM_BYTES
+            else:
+                free_mem = get_free_memory(device) - reserve
             if free_mem > memory_required:
                 break
             memory_to_free = memory_required - free_mem
@@ -628,34 +720,6 @@ def free_memory(memory_required, device, keep_loaded=[]):
             if mem_free_torch > mem_free_total * 0.25:
                 soft_empty_cache()
     return unloaded_models
-
-
-def evict_ram_to_disk(memory_to_free, keep_loaded=[]):
-    if memory_to_free <= 0:
-        return 0
-    if not comfy.disk_weights.disk_weights_enabled():
-        return 0
-
-    freed = 0
-    can_unload = []
-    for i in range(len(current_loaded_models) - 1, -1, -1):
-        shift_model = current_loaded_models[i]
-        if shift_model not in keep_loaded and not shift_model.is_dead():
-            loaded_memory = shift_model.model_loaded_memory()
-            if loaded_memory > 0:
-                can_unload.append((-loaded_memory, sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
-
-    for x in sorted(can_unload):
-        i = x[-1]
-        memory_needed = memory_to_free - freed
-        if memory_needed <= 0:
-            break
-        logging.debug(f"Offloading {current_loaded_models[i].model.model.__class__.__name__} to disk")
-        freed += current_loaded_models[i].model.partially_unload(torch.device("meta"), memory_needed)
-
-    if freed > 0:
-        logging.info("RAM evicted to disk: {:.2f} MB freed".format(freed / (1024 * 1024)))
-    return freed
 
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
     cleanup_models_gc()
@@ -1126,6 +1190,9 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
         if not copy:
             if dtype is None or weight.dtype == dtype:
                 return weight
+        target_dtype = dtype or weight.dtype
+        bytes_needed = weight.numel() * torch.tensor([], dtype=target_dtype).element_size()
+        ensure_allocation_possible(weight.device, bytes_needed, reason="cast_to")
         if stream is not None:
             wf_context = stream
             if hasattr(wf_context, "as_context"):
@@ -1134,7 +1201,9 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
                 return weight.to(dtype=dtype, copy=copy)
         return weight.to(dtype=dtype, copy=copy)
 
-
+    target_dtype = dtype or weight.dtype
+    bytes_needed = weight.numel() * torch.tensor([], dtype=target_dtype).element_size()
+    ensure_allocation_possible(device, bytes_needed, reason="cast_to")
     if stream is not None:
         wf_context = stream
         if hasattr(wf_context, "as_context"):
@@ -1163,15 +1232,19 @@ if not args.disable_pinned_memory:
             MAX_PINNED_MEMORY = get_total_memory(torch.device("cpu")) * 0.95
         logging.info("Enabled pinned memory {}".format(MAX_PINNED_MEMORY // (1024 * 1024)))
 
-WEIGHTS_RAM_CACHE_BYTES = 0
 WEIGHTS_GDS_ENABLED = bool(args.weights_gds)
-if args.weights_ram_cache_gb is not None:
-    WEIGHTS_RAM_CACHE_BYTES = int(max(0.0, args.weights_ram_cache_gb) * (1024 ** 3))
-    comfy.disk_weights.configure(
-        WEIGHTS_RAM_CACHE_BYTES,
-        allow_gds=WEIGHTS_GDS_ENABLED,
-        pin_if_cpu=not args.disable_pinned_memory,
-    )
+DISK_WEIGHTS_ENABLED = bool(args.low_ram)
+comfy.disk_weights.configure(
+    allow_gds=WEIGHTS_GDS_ENABLED,
+    pin_if_cpu=not args.disable_pinned_memory,
+    enabled=DISK_WEIGHTS_ENABLED,
+)
+logging.debug(
+    "disk_weights %s, allow_gds=%s, RAM_HEADROOM_BYTES=%.2f MB",
+    "enabled" if DISK_WEIGHTS_ENABLED else "disabled",
+    WEIGHTS_GDS_ENABLED,
+    RAM_HEADROOM_BYTES / (1024 * 1024),
+)
 
 PINNING_ALLOWED_TYPES = set(["Parameter", "QuantizedTensor"])
 

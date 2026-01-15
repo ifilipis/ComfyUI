@@ -652,7 +652,6 @@ def ensure_allocation_possible(device: torch.device, bytes_needed: int, *, reaso
 
 def free_memory(memory_required, device, keep_loaded=[]):
     cleanup_models_gc()
-    reserve = int(args.reserve_vram * 1024**2) if args.reserve_vram is not None else 0
     if comfy.disk_weights.disk_weights_enabled():
         if is_device_cpu(device):
             available = psutil.virtual_memory().available
@@ -674,12 +673,11 @@ def free_memory(memory_required, device, keep_loaded=[]):
                 )
         else:
             free_before = get_free_memory(device)
-            need = memory_required - (free_before - reserve)
+            need = memory_required - free_before
             if need > 0:
                 logging.debug(
-                    "VRAM cache eviction triggered: free=%d reserve=%d needed=%d",
+                    "VRAM cache eviction triggered: free=%d needed=%d",
                     free_before,
-                    reserve,
                     memory_required,
                 )
                 freed_cache = comfy.disk_weights.CACHE.evict_cuda_bytes(device, need)
@@ -708,7 +706,7 @@ def free_memory(memory_required, device, keep_loaded=[]):
             if is_device_cpu(device):
                 free_mem = psutil.virtual_memory().available - RAM_HEADROOM_BYTES
             else:
-                free_mem = get_free_memory(device) - reserve
+                free_mem = get_free_memory(device)
             if free_mem > memory_required:
                 break
             memory_to_free = memory_required - free_mem

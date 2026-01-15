@@ -581,6 +581,10 @@ if args.reserve_vram is not None:
     EXTRA_RESERVED_VRAM = args.reserve_vram * 1024 * 1024 * 1024
     logging.debug("Reserving {}MB vram for other applications.".format(EXTRA_RESERVED_VRAM / (1024 * 1024)))
 
+EXTRA_RESERVED_RAM = 0
+if args.low_ram:
+    EXTRA_RESERVED_RAM = 1024 * 1024 * 1024
+
 def extra_reserved_memory():
     return EXTRA_RESERVED_VRAM
 
@@ -588,12 +592,28 @@ def minimum_inference_memory():
     return (1024 * 1024 * 1024) * 0.8 + extra_reserved_memory()
 
 def free_memory(memory_required, device, keep_loaded=[]):
+    _flush_pending_unpins()
     cleanup_models_gc()
-    if is_device_cpu(device) and comfy.disk_weights.disk_weights_enabled():
-        logging.info("RAM pressure: requested %.2f MB, free %.2f MB", memory_required / (1024 * 1024), get_free_memory(device) / (1024 * 1024))
-        freed_cache = comfy.disk_weights.evict_ram_cache(memory_required)
-        if freed_cache < memory_required:
-            evict_ram_to_disk(memory_required - freed_cache)
+    free_before = get_free_memory(device)
+    bytes_evicted = 0
+    if free_before < memory_required:
+        if comfy.disk_weights.disk_weights_enabled():
+            bytes_needed = memory_required - free_before
+            if is_device_cpu(device):
+                bytes_evicted = comfy.disk_weights.evict_ram_bytes(bytes_needed)
+            else:
+                bytes_evicted = comfy.disk_weights.evict_vram_bytes(bytes_needed)
+        free_after = get_free_memory(device)
+        headroom = EXTRA_RESERVED_RAM if is_device_cpu(device) else extra_reserved_memory()
+        logging.debug(
+            "Memory pressure: device=%s free_before=%d required=%d headroom=%d bytes_evicted=%d free_after=%d",
+            device,
+            free_before,
+            memory_required,
+            headroom,
+            bytes_evicted,
+            free_after,
+        )
     unloaded_model = []
     can_unload = []
     unloaded_models = []
@@ -629,33 +649,6 @@ def free_memory(memory_required, device, keep_loaded=[]):
                 soft_empty_cache()
     return unloaded_models
 
-
-def evict_ram_to_disk(memory_to_free, keep_loaded=[]):
-    if memory_to_free <= 0:
-        return 0
-    if not comfy.disk_weights.disk_weights_enabled():
-        return 0
-
-    freed = 0
-    can_unload = []
-    for i in range(len(current_loaded_models) - 1, -1, -1):
-        shift_model = current_loaded_models[i]
-        if shift_model not in keep_loaded and not shift_model.is_dead():
-            loaded_memory = shift_model.model_loaded_memory()
-            if loaded_memory > 0:
-                can_unload.append((-loaded_memory, sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
-
-    for x in sorted(can_unload):
-        i = x[-1]
-        memory_needed = memory_to_free - freed
-        if memory_needed <= 0:
-            break
-        logging.debug(f"Offloading {current_loaded_models[i].model.model.__class__.__name__} to disk")
-        freed += current_loaded_models[i].model.partially_unload(torch.device("meta"), memory_needed)
-
-    if freed > 0:
-        logging.info("RAM evicted to disk: {:.2f} MB freed".format(freed / (1024 * 1024)))
-    return freed
 
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
     cleanup_models_gc()
@@ -1121,6 +1114,15 @@ def sync_stream(device, stream):
         return
     current_stream(device).wait_stream(stream)
 
+def _record_stream_tensor(tensor, device, stream):
+    if stream is None or not is_device_cuda(device):
+        return
+    current = current_stream(device)
+    if current is None:
+        return
+    current.wait_stream(stream)
+    tensor.record_stream(current)
+
 def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, stream=None):
     if device is None or weight.device == device:
         if not copy:
@@ -1131,7 +1133,9 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
             if hasattr(wf_context, "as_context"):
                 wf_context = wf_context.as_context(stream)
             with wf_context:
-                return weight.to(dtype=dtype, copy=copy)
+                result = weight.to(dtype=dtype, copy=copy)
+            _record_stream_tensor(result, weight.device, stream)
+            return result
         return weight.to(dtype=dtype, copy=copy)
 
 
@@ -1145,6 +1149,14 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
     else:
         r = torch.empty_like(weight, dtype=dtype, device=device)
         r.copy_(weight, non_blocking=non_blocking)
+    if stream is not None and device is not None and device.type == "cuda":
+        if weight.device.type == "cpu" and weight.is_pinned() and non_blocking:
+            ptr = weight.data_ptr()
+            if ptr != 0:
+                event = torch.cuda.Event()
+                event.record(stream)
+                PINNED_TRANSFER_EVENTS[ptr] = event
+        _record_stream_tensor(r, device, stream)
     return r
 
 def cast_to_device(tensor, device, dtype, copy=False):
@@ -1153,6 +1165,8 @@ def cast_to_device(tensor, device, dtype, copy=False):
 
 
 PINNED_MEMORY = {}
+PINNED_TRANSFER_EVENTS = {}
+PENDING_UNPIN = {}
 TOTAL_PINNED_MEMORY = 0
 MAX_PINNED_MEMORY = -1
 if not args.disable_pinned_memory:
@@ -1165,8 +1179,8 @@ if not args.disable_pinned_memory:
 
 WEIGHTS_RAM_CACHE_BYTES = 0
 WEIGHTS_GDS_ENABLED = bool(args.weights_gds)
-if args.weights_ram_cache_gb is not None:
-    WEIGHTS_RAM_CACHE_BYTES = int(max(0.0, args.weights_ram_cache_gb) * (1024 ** 3))
+if args.low_ram:
+    WEIGHTS_RAM_CACHE_BYTES = 0
     comfy.disk_weights.configure(
         WEIGHTS_RAM_CACHE_BYTES,
         allow_gds=WEIGHTS_GDS_ENABLED,
@@ -1185,8 +1199,31 @@ def discard_cuda_async_error():
         #Dump it! We already know about it from the synchronous return
         pass
 
+def _flush_pending_unpins():
+    global TOTAL_PINNED_MEMORY
+    if not PENDING_UNPIN:
+        return
+    for ptr, event in list(PENDING_UNPIN.items()):
+        if not event.query():
+            continue
+        size_stored = PINNED_MEMORY.get(ptr, None)
+        if size_stored is None:
+            PENDING_UNPIN.pop(ptr, None)
+            PINNED_TRANSFER_EVENTS.pop(ptr, None)
+            continue
+        if torch.cuda.cudart().cudaHostUnregister(ptr) == 0:
+            TOTAL_PINNED_MEMORY -= PINNED_MEMORY.pop(ptr)
+            PINNED_TRANSFER_EVENTS.pop(ptr, None)
+            PENDING_UNPIN.pop(ptr, None)
+            if len(PINNED_MEMORY) == 0:
+                TOTAL_PINNED_MEMORY = 0
+        else:
+            logging.warning("Unpin error.")
+            discard_cuda_async_error()
+
 def pin_memory(tensor):
     global TOTAL_PINNED_MEMORY
+    _flush_pending_unpins()
     if MAX_PINNED_MEMORY <= 0:
         return False
 
@@ -1225,6 +1262,7 @@ def pin_memory(tensor):
 
 def unpin_memory(tensor):
     global TOTAL_PINNED_MEMORY
+    _flush_pending_unpins()
     if MAX_PINNED_MEMORY <= 0:
         return False
 
@@ -1243,8 +1281,14 @@ def unpin_memory(tensor):
         logging.warning("Size of pinned tensor changed")
         return False
 
+    pending_event = PINNED_TRANSFER_EVENTS.get(ptr)
+    if pending_event is not None and not pending_event.query():
+        PENDING_UNPIN[ptr] = pending_event
+        return False
+
     if torch.cuda.cudart().cudaHostUnregister(ptr) == 0:
         TOTAL_PINNED_MEMORY -= PINNED_MEMORY.pop(ptr)
+        PINNED_TRANSFER_EVENTS.pop(ptr, None)
         if len(PINNED_MEMORY) == 0:
             TOTAL_PINNED_MEMORY = 0
         return True
@@ -1333,7 +1377,7 @@ def get_free_memory(dev=None, torch_free_too=False):
         mem_free_total = sys.maxsize
         mem_free_torch = mem_free_total
     elif hasattr(dev, 'type') and (dev.type == 'cpu' or dev.type == 'mps'):
-        mem_free_total = psutil.virtual_memory().available
+        mem_free_total = max(0, psutil.virtual_memory().available - EXTRA_RESERVED_RAM)
         mem_free_torch = mem_free_total
     else:
         if directml_enabled:

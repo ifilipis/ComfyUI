@@ -238,6 +238,7 @@ class _SafeTensorFile:
         reader = self._ensure_nogds_reader(use_cuda=False)
         abs_start = self.index.header_length + meta.data_offsets[0]
         length = meta.data_offsets[1] - meta.data_offsets[0]
+        file_size = self.index.size_bytes
         chunk_bytes = int(os.getenv("COMFY_SAFETENSORS_NOGDS_CHUNK_BYTES", _NOGDS_CHUNK_BYTES_DEFAULT))
         chunk_bytes = max(1, chunk_bytes)
         ptr_align = framework.get_device_ptr_align()
@@ -250,6 +251,8 @@ class _SafeTensorFile:
             while chunk_offset < length:
                 chunk_len = min(length - chunk_offset, chunk_bytes)
                 aligned_offset, aligned_length, head = self._aligned_range(abs_start + chunk_offset, chunk_len)
+                max_len = file_size - aligned_offset
+                aligned_length = min(aligned_length, max_len)
                 needed = aligned_length + ptr_align
                 if buf_ptr is None or needed > buffer_length:
                     if buf_ptr is not None:
@@ -523,8 +526,9 @@ class StreamStateDict(collections.abc.MutableMapping):
                 raise KeyError(key)
             return default
         if self._index.has(key):
+            tensor = self.get_tensor(key)
             self._deleted.add(key)
-            return self.get_tensor(key)
+            return tensor
         if default is _MISSING:
             raise KeyError(key)
         return default
@@ -636,8 +640,9 @@ class _BaseViewStateDict(MutableMapping):
                 if default is _MISSING:
                     raise
                 return default
+        tensor = self.get_tensor(key)
         self._deleted.add(key)
-        return self.get_tensor(key)
+        return tensor
 
     def meta(self, key: str):
         if key in self._overrides:
@@ -768,8 +773,9 @@ class DeviceViewStateDict(_BaseViewStateDict):
                 if default is _MISSING:
                     raise
                 return default
+        tensor = self.get_tensor(key)
         self._deleted.add(key)
-        return self.get_tensor(key)
+        return tensor
 
 
 class FilterViewStateDict(_BaseViewStateDict):

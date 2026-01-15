@@ -36,6 +36,7 @@ import comfy.disk_weights
 
 MMAP_TORCH_FILES = args.mmap_torch_files
 DISABLE_MMAP = args.disable_mmap
+_ORIGINAL_LOAD_STATE_DICT = torch.nn.Module.load_state_dict
 
 ALWAYS_SAFE_LOAD = False
 if hasattr(torch.serialization, "add_safe_globals"):  # TODO: this was added in pytorch 2.4, the unsafe path should be removed once earlier versions are deprecated
@@ -174,7 +175,16 @@ def load_state_dict(model, state_dict, strict=False, assign=False):
         comfy.disk_weights.attach_disk_weight_hooks(model)
         missing, unexpected = stream_load_state_dict(model, state_dict, strict=strict, assign=assign)
         return missing, unexpected
-    return model.load_state_dict(state_dict, strict=strict)
+    return _ORIGINAL_LOAD_STATE_DICT(model, state_dict, strict=strict)
+
+
+def patch_module_load_state_dict():
+    def _patched_load_state_dict(self, state_dict, strict=True, assign=False):
+        return load_state_dict(self, state_dict, strict=strict, assign=assign)
+    torch.nn.Module.load_state_dict = _patched_load_state_dict
+
+
+patch_module_load_state_dict()
 
 
 def stream_load_state_dict(model, state_dict, strict=False, assign=False):

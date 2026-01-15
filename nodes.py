@@ -17,6 +17,7 @@ from PIL import Image, ImageOps, ImageSequence
 from PIL.PngImagePlugin import PngInfo
 
 import numpy as np
+import safetensors.torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "comfy"))
 
@@ -524,7 +525,7 @@ class LoadLatent:
 
     def load(self, latent):
         latent_path = folder_paths.get_annotated_filepath(latent)
-        latent = comfy.utils.load_torch_file(latent_path, safe_load=True)
+        latent = safetensors.torch.load_file(latent_path, device="cpu")
         multiplier = 1.0
         if "latent_format_version_0" not in latent:
             multiplier = 1.0 / 0.18215

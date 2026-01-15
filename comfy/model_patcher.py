@@ -282,6 +282,8 @@ class ModelPatcher:
         return self.model_size()
 
     def loaded_size(self):
+        if comfy.disk_weights.disk_weights_enabled():
+            return comfy.disk_weights.module_loaded_bytes(self.model)
         return self.model.model_loaded_weight_memory
 
     def lowvram_patch_counter(self):
@@ -785,7 +787,7 @@ class ModelPatcher:
                 m.comfy_patched_weights = True
 
             for x in load_completely:
-                comfy.disk_weights.module_to(x[2], device_to)
+                x[2].to(device_to)
 
             for x in offloaded:
                 n = x[1]
@@ -800,11 +802,15 @@ class ModelPatcher:
                 logging.info("loaded completely; {:.2f} MB usable, {:.2f} MB loaded, full load: {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), full_load))
                 self.model.model_lowvram = False
                 if full_load:
-                    comfy.disk_weights.module_to(self.model, device_to)
+                    self.model.to(device_to)
                     mem_counter = self.model_size()
 
             self.model.lowvram_patch_counter += patch_counter
             self.model.device = device_to
+            if comfy.disk_weights.disk_weights_enabled():
+                # Root cause #3: loaded bytes must match disk cache truth for the root module.
+                # Module.to semantics: https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.to
+                mem_counter = comfy.disk_weights.module_loaded_bytes(self.model)
             self.model.model_loaded_weight_memory = mem_counter
             self.model.model_offload_buffer_memory = offload_buffer
             self.model.current_weight_patches_uuid = self.patches_uuid
@@ -857,7 +863,7 @@ class ModelPatcher:
             self.backup.clear()
 
             if device_to is not None:
-                comfy.disk_weights.module_to(self.model, device_to, allow_materialize=False)
+                self.model.to(device_to)
                 self.model.device = device_to
             self.model.model_loaded_weight_memory = 0
             self.model.model_offload_buffer_memory = 0
@@ -992,9 +998,21 @@ class ModelPatcher:
                 self.partially_unload(self.offload_device, -extra_memory, force_patch_weights=force_patch_weights)
                 return 0
             full_load = False
-            if self.model.model_lowvram == False and self.model.model_loaded_weight_memory > 0:
-                self.apply_hooks(self.forced_hooks, force_apply=True)
-                return 0
+            if comfy.disk_weights.disk_weights_enabled():
+                loaded = comfy.disk_weights.module_loaded_bytes(self.model)
+                total = comfy.disk_weights.module_total_bytes(self.model)
+                if self.model.model_lowvram == False and loaded == total and loaded > 0:
+                    self.apply_hooks(self.forced_hooks, force_apply=True)
+                    return 0
+                if loaded < total:
+                    # Root cause #3: re-materialize meta tensors after disk eviction before skipping load.
+                    # PyTorch meta tensors: https://pytorch.org/docs/stable/meta.html
+                    comfy.disk_weights.materialize_module_tree(self.model, device_to)
+                    self.model.model_loaded_weight_memory = comfy.disk_weights.module_loaded_bytes(self.model)
+            else:
+                if self.model.model_lowvram == False and self.model.model_loaded_weight_memory > 0:
+                    self.apply_hooks(self.forced_hooks, force_apply=True)
+                    return 0
             if self.model.model_loaded_weight_memory + extra_memory > self.model_size():
                 full_load = True
             current_used = self.model.model_loaded_weight_memory

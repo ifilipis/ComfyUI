@@ -139,16 +139,74 @@ class DiskWeightCache:
     def _device_key(self, device: torch.device) -> str:
         return _canonical_device_key(device)
 
+    def _find_device_key_for_entry(self, key: tuple[int, str]) -> Optional[str]:
+        for device_key, device_entries in self._entries_by_device.items():
+            if key in device_entries:
+                return device_key
+        return None
+
     def _remove_entry(self, key: tuple[int, str], entry: CacheEntry):
-        device_key = self._device_key(entry.device)
+        device_key = self._find_device_key_for_entry(key)
+        if device_key is None:
+            device_key = self._device_key(entry.device)
         device_entries = self._entries_by_device.get(device_key)
-        if device_entries is not None and key in device_entries:
+        if device_entries is not None:
             device_entries.pop(key, None)
         self._entries_by_key.pop(key, None)
         self.current_bytes_by_device[device_key] = max(
             0, self.current_bytes_by_device.get(device_key, 0) - entry.nbytes
         )
         self.current_bytes = max(0, self.current_bytes - entry.nbytes)
+
+    def _validate_or_relocate_entry(
+        self,
+        key: tuple[int, str],
+        entry: CacheEntry,
+        *,
+        device_key_hint: Optional[str] = None,
+    ) -> Optional[str]:
+        module = entry.module_ref()
+        if module is None:
+            self._remove_entry(key, entry)
+            return None
+        tensor = module._buffers.get(entry.name) if entry.is_buffer else module._parameters.get(entry.name)
+        if tensor is None or tensor.device.type == "meta":
+            self._remove_entry(key, entry)
+            return None
+        actual_device_key = self._device_key(tensor.device)
+        tracked_device_key = None
+        if device_key_hint is not None:
+            device_entries = self._entries_by_device.get(device_key_hint)
+            if device_entries is not None and key in device_entries:
+                tracked_device_key = device_key_hint
+        if tracked_device_key is None:
+            tracked_device_key = self._find_device_key_for_entry(key)
+        if tracked_device_key is None:
+            tracked_device_key = self._device_key(entry.device)
+        tracked_entries = self._entries_by_device.get(tracked_device_key)
+        tracked_present = tracked_entries is not None and key in tracked_entries
+        if not tracked_present and tracked_device_key == actual_device_key:
+            self._entries_by_device.setdefault(actual_device_key, collections.OrderedDict())[key] = entry
+            self.current_bytes_by_device[actual_device_key] = self.current_bytes_by_device.get(actual_device_key, 0) + entry.nbytes
+        new_nbytes = tensor.numel() * tensor.element_size()
+        if new_nbytes != entry.nbytes:
+            delta = new_nbytes - entry.nbytes
+            self.current_bytes += delta
+            self.current_bytes_by_device[tracked_device_key] = self.current_bytes_by_device.get(tracked_device_key, 0) + delta
+            entry.nbytes = new_nbytes
+        if tracked_device_key != actual_device_key:
+            if tracked_device_key is not None:
+                if tracked_device_key in self._entries_by_device:
+                    self._entries_by_device[tracked_device_key].pop(key, None)
+                self.current_bytes_by_device[tracked_device_key] = max(
+                    0, self.current_bytes_by_device.get(tracked_device_key, 0) - entry.nbytes
+                )
+            self._entries_by_device.setdefault(actual_device_key, collections.OrderedDict())[key] = entry
+            self.current_bytes_by_device[actual_device_key] = self.current_bytes_by_device.get(actual_device_key, 0) + entry.nbytes
+        else:
+            self._entries_by_device.setdefault(actual_device_key, collections.OrderedDict()).setdefault(key, entry)
+        entry.device = tensor.device
+        return actual_device_key
 
     def record(self, module: torch.nn.Module, name: str, tensor: torch.Tensor, is_buffer: bool):
         if tensor.device.type == "meta":
@@ -180,7 +238,9 @@ class DiskWeightCache:
         entry = self._entries_by_key.get(key)
         if entry is None:
             return
-        device_key = self._device_key(entry.device)
+        device_key = self._validate_or_relocate_entry(key, entry)
+        if device_key is None:
+            return
         device_entries = self._entries_by_device.get(device_key)
         if device_entries is None or key not in device_entries:
             return
@@ -193,6 +253,11 @@ class DiskWeightCache:
             return 0
         freed = 0
         while device_entries and freed < bytes_to_free:
+            key, entry = next(iter(device_entries.items()))
+            validated_device = self._validate_or_relocate_entry(key, entry, device_key_hint=device_type)
+            if validated_device is None or validated_device != device_type:
+                device_entries = self._entries_by_device.get(device_type)
+                continue
             key, entry = device_entries.popitem(last=False)
             self._entries_by_key.pop(key, None)
             freed += entry.nbytes
@@ -220,6 +285,11 @@ class DiskWeightCache:
             return 0
         freed = 0
         while device_entries and freed < bytes_to_free:
+            key, entry = next(iter(device_entries.items()))
+            validated_device = self._validate_or_relocate_entry(key, entry, device_key_hint=device_key)
+            if validated_device is None or validated_device != device_key:
+                device_entries = self._entries_by_device.get(device_key)
+                continue
             key, entry = device_entries.popitem(last=False)
             self._entries_by_key.pop(key, None)
             self.current_bytes_by_device[device_key] = max(
@@ -310,6 +380,11 @@ class DiskWeightCache:
             bytes_to_free,
         )
         while device_entries and self.current_bytes_by_device.get(device_key, 0) > limit:
+            key, entry = next(iter(device_entries.items()))
+            validated_device = self._validate_or_relocate_entry(key, entry, device_key_hint=device_key)
+            if validated_device is None or validated_device != device_key:
+                device_entries = self._entries_by_device.get(device_key)
+                continue
             key, entry = device_entries.popitem(last=False)
             self._entries_by_key.pop(key, None)
             self.current_bytes_by_device[device_key] = max(

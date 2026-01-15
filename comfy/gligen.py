@@ -3,7 +3,6 @@ import torch
 from torch import nn
 from .ldm.modules.attention import CrossAttention, FeedForward
 import comfy.ops
-import comfy.utils
 ops = comfy.ops.manual_cast
 
 
@@ -283,7 +282,7 @@ def load_gligen(sd):
 
                 gated = GatedSelfAttentionDense(
                     query_dim, key_dim, n_heads, d_head)
-                comfy.utils.load_state_dict(gated, n_sd, strict=False)
+                gated.load_state_dict(n_sd, strict=False)
                 output_list.append(gated)
 
     if "position_net.null_positive_feature" in sd_k:
@@ -294,7 +293,7 @@ def load_gligen(sd):
             pass
         w = WeightsLoader()
         w.position_net = PositionNet(in_dim, out_dim)
-        comfy.utils.load_state_dict(w, sd, strict=False)
+        w.load_state_dict(sd, strict=False)
 
     gligen = Gligen(output_list, w.position_net, key_dim)
     return gligen

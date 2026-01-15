@@ -807,6 +807,9 @@ class ModelPatcher:
 
             self.model.lowvram_patch_counter += patch_counter
             self.model.device = device_to
+            if comfy.disk_weights.disk_weights_enabled():
+                # Root cause #3: use disk_weights as the single source of truth for loaded bytes.
+                mem_counter = comfy.disk_weights.module_loaded_bytes(self.model)
             self.model.model_loaded_weight_memory = mem_counter
             self.model.model_offload_buffer_memory = offload_buffer
             self.model.current_weight_patches_uuid = self.patches_uuid
@@ -994,7 +997,17 @@ class ModelPatcher:
                 self.partially_unload(self.offload_device, -extra_memory, force_patch_weights=force_patch_weights)
                 return 0
             full_load = False
-            if self.model.model_lowvram == False and self.model.model_loaded_weight_memory > 0:
+            if comfy.disk_weights.disk_weights_enabled():
+                loaded = comfy.disk_weights.module_loaded_bytes(self.model)
+                total = comfy.disk_weights.module_total_bytes(self.model)
+                if self.model.model_lowvram is False and loaded == total:
+                    self.apply_hooks(self.forced_hooks, force_apply=True)
+                    return 0
+                if loaded < total:
+                    # Root cause #3: avoid treating partially materialized models as fully loaded.
+                    comfy.disk_weights.materialize_module_tree(self.model, device_to)
+                    self.model.model_loaded_weight_memory = comfy.disk_weights.module_loaded_bytes(self.model)
+            elif self.model.model_lowvram == False and self.model.model_loaded_weight_memory > 0:
                 self.apply_hooks(self.forced_hooks, force_apply=True)
                 return 0
             if self.model.model_loaded_weight_memory + extra_memory > self.model_size():

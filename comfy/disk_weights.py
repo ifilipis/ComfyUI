@@ -94,6 +94,7 @@ class DiskWeightRegistry:
 @dataclass
 class CacheEntry:
     module_ref: weakref.ReferenceType
+    root_ref: weakref.ReferenceType
     name: str
     size_bytes: int
     is_buffer: bool
@@ -112,21 +113,25 @@ class DiskWeightCache:
         if tensor.device.type == "meta":
             self.remove_entry(module, name)
             return
+        root = getattr(module, "_disk_weights_root", module)
         device_type = "cpu" if tensor.device.type == "cpu" else "gpu"
         size_bytes = tensor.numel() * tensor.element_size()
         key = self._entry_key(module, name)
         if key in self._entries:
             entry = self._entries.pop(key)
-            self._adjust_module_bytes(entry.module_ref(), -entry.size_bytes)
+            self._adjust_entry_bytes(entry, -entry.size_bytes)
         module_ref = weakref.ref(module, self._drop_module_entries)
+        root_ref = weakref.ref(root)
         self._entries[key] = CacheEntry(
             module_ref=module_ref,
+            root_ref=root_ref,
             name=name,
             size_bytes=size_bytes,
             is_buffer=is_buffer,
             device_type=device_type,
         )
-        self._adjust_module_bytes(module, size_bytes)
+        # Root-cached bytes prevent model-level loaded size from collapsing to zero. (Root cause #3)
+        self._adjust_module_and_root_bytes(module, root, size_bytes)
 
     def touch(self, module: torch.nn.Module, name: str):
         key = self._entry_key(module, name)
@@ -139,12 +144,12 @@ class DiskWeightCache:
             if not self._entries:
                 return None
             _, entry = self._entries.popitem(last=False)
-            self._adjust_module_bytes(entry.module_ref(), -entry.size_bytes)
+            self._adjust_entry_bytes(entry, -entry.size_bytes)
             return entry
         for key, entry in list(self._entries.items()):
             if entry.device_type == device_type:
                 self._entries.pop(key)
-                self._adjust_module_bytes(entry.module_ref(), -entry.size_bytes)
+                self._adjust_entry_bytes(entry, -entry.size_bytes)
                 return entry
         return None
 
@@ -153,7 +158,7 @@ class DiskWeightCache:
         entry = self._entries.pop(key, None)
         if entry is None:
             return
-        self._adjust_module_bytes(entry.module_ref(), -entry.size_bytes)
+        self._adjust_entry_bytes(entry, -entry.size_bytes)
 
     def remove_module(self, module: torch.nn.Module):
         to_remove = []
@@ -162,7 +167,7 @@ class DiskWeightCache:
                 to_remove.append(key)
         for key in to_remove:
             entry = self._entries.pop(key)
-            self._adjust_module_bytes(entry.module_ref(), -entry.size_bytes)
+            self._adjust_entry_bytes(entry, -entry.size_bytes)
         if module in self._module_bytes:
             del self._module_bytes[module]
 
@@ -173,7 +178,7 @@ class DiskWeightCache:
                 to_remove.append(key)
         for key in to_remove:
             entry = self._entries.pop(key)
-            self._adjust_module_bytes(entry.module_ref(), -entry.size_bytes)
+            self._adjust_entry_bytes(entry, -entry.size_bytes)
 
     def module_bytes(self, module: torch.nn.Module) -> int:
         return self._module_bytes.get(module, 0)
@@ -187,6 +192,18 @@ class DiskWeightCache:
             self._module_bytes.pop(module, None)
         else:
             self._module_bytes[module] = new_total
+
+    def _adjust_module_and_root_bytes(self, module: Optional[torch.nn.Module], root: Optional[torch.nn.Module], delta: int):
+        if module is root:
+            self._adjust_module_bytes(module, delta)
+            return
+        self._adjust_module_bytes(module, delta)
+        self._adjust_module_bytes(root, delta)
+
+    def _adjust_entry_bytes(self, entry: CacheEntry, delta: int):
+        module = entry.module_ref()
+        root = entry.root_ref()
+        self._adjust_module_and_root_bytes(module, root, delta)
 
 
 REGISTRY = DiskWeightRegistry()
@@ -244,6 +261,10 @@ def register_module_weights(module: torch.nn.Module, state_dict, prefix: str = "
         return
     if not hasattr(state_dict, "meta") or not hasattr(state_dict, "get_tensor"):
         return
+    # Root cause #3: tag the root so cache accounting is correct for model-level queries.
+    for submodule in module.modules():
+        submodule._disk_weights_root = module
+    total_bytes = 0
     for module_name, submodule in module.named_modules():
         module_prefix = f"{prefix}{module_name}." if module_name else prefix
         for name, param in submodule.named_parameters(recurse=False):
@@ -252,6 +273,7 @@ def register_module_weights(module: torch.nn.Module, state_dict, prefix: str = "
                 meta = state_dict.meta(key)
                 ref = DiskTensorRef(state_dict=state_dict, key=key, meta=meta, requires_grad=param.requires_grad, is_buffer=False)
                 REGISTRY.register(submodule, name, ref)
+                total_bytes += _meta_nbytes(meta) or 0
                 if param.device.type != "meta":
                     CACHE.record(submodule, name, param, is_buffer=False)
         for name, buf in submodule.named_buffers(recurse=False):
@@ -260,8 +282,10 @@ def register_module_weights(module: torch.nn.Module, state_dict, prefix: str = "
                 meta = state_dict.meta(key)
                 ref = DiskTensorRef(state_dict=state_dict, key=key, meta=meta, requires_grad=False, is_buffer=True)
                 REGISTRY.register(submodule, name, ref)
+                total_bytes += _meta_nbytes(meta) or 0
                 if buf.device.type != "meta":
                     CACHE.record(submodule, name, buf, is_buffer=True)
+    module._disk_weights_total_bytes = total_bytes
 
 
 @dataclass
@@ -322,6 +346,13 @@ def _meta_tensor(meta, dtype_override: Optional[torch.dtype] = None) -> torch.Te
     if dtype is None or shape is None:
         raise KeyError("Missing metadata for meta tensor")
     return torch.empty(shape, dtype=dtype, device="meta")
+
+
+def _attach_disk_identity(tensor: torch.Tensor, module: torch.nn.Module, name: str, is_buffer: bool):
+    # Root cause #1: meta tensors must carry identity for deterministic rematerialization. (PyTorch meta tensors doc)
+    tensor._disk_weights_module_ref = weakref.ref(module)
+    tensor._disk_weights_name = name
+    tensor._disk_weights_is_buffer = is_buffer
 
 
 def _state_dict_meta(state_dict: MutableMapping, key: str):
@@ -447,6 +478,22 @@ def module_loaded_bytes(module: torch.nn.Module) -> int:
     if not disk_weights_enabled():
         return getattr(module, "model_loaded_weight_memory", 0)
     return CACHE.module_bytes(module)
+
+
+def module_total_bytes(module: torch.nn.Module) -> int:
+    return getattr(module, "_disk_weights_total_bytes", 0)
+
+
+def materialize_meta_tensor(
+    tensor: torch.Tensor,
+    target_device: torch.device,
+    dtype_override: Optional[torch.dtype],
+) -> torch.Tensor:
+    # Root cause #1: meta tensors must be materialized before copy_ (Module.to semantics + meta tensors doc).
+    module_ref = tensor._disk_weights_module_ref
+    name = tensor._disk_weights_name
+    module = module_ref()
+    return load_module_tensor(module, name, target_device, dtype_override=dtype_override, temporary=False)
 
 
 def _wait_for_pinned_tensor(tensor: Optional[torch.Tensor]):
@@ -723,8 +770,11 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
                 meta_tensor = torch.empty(shape, dtype=dtype, device="meta")
                 if disk_ref.is_buffer:
                     module._buffers[ref_name] = meta_tensor
+                    _attach_disk_identity(meta_tensor, module, ref_name, True)
                 else:
-                    module._parameters[ref_name] = torch.nn.Parameter(meta_tensor, requires_grad=disk_ref.requires_grad)
+                    param = torch.nn.Parameter(meta_tensor, requires_grad=disk_ref.requires_grad)
+                    module._parameters[ref_name] = param
+                    _attach_disk_identity(param, module, ref_name, False)
                 nbytes = _meta_nbytes(disk_ref.meta)
                 if nbytes is not None:
                     state.loaded_keys.discard(ref_name)
@@ -750,8 +800,11 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
     meta_tensor = torch.empty(shape, dtype=dtype, device="meta")
     if is_buffer:
         module._buffers[name] = meta_tensor
+        _attach_disk_identity(meta_tensor, module, name, True)
     else:
-        module._parameters[name] = torch.nn.Parameter(meta_tensor, requires_grad=disk_ref.requires_grad)
+        param = torch.nn.Parameter(meta_tensor, requires_grad=disk_ref.requires_grad)
+        module._parameters[name] = param
+        _attach_disk_identity(param, module, name, False)
     state = _get_materialization_state(module)
     nbytes = _meta_nbytes(disk_ref.meta)
     if nbytes is not None:
@@ -980,40 +1033,46 @@ def move_module_tensors(module: torch.nn.Module, device_to: torch.device, dtype_
     from . import model_management
     non_blocking = model_management.device_supports_non_blocking(device_to)
     stream = model_management.get_offload_stream(device_to)
-    for name, param in module.named_parameters(recurse=True):
-        if param is None or param.device.type == "meta":
-            continue
-        target_dtype = dtype_override if dtype_override is not None else None
-        if param.device == device_to and (target_dtype is None or param.dtype == target_dtype):
-            continue
-        _wait_for_pinned_tensor(param)
-        tensor = model_management.cast_to(
-            param,
-            device=device_to,
-            dtype=target_dtype,
-            non_blocking=non_blocking,
-            stream=stream,
-        )
-        _replace_tensor(module, name, tensor, is_buffer=False, requires_grad=param.requires_grad)
-        if tensor.device.type != "meta":
-            CACHE.record(module, name, tensor, is_buffer=False)
-    for name, buf in module.named_buffers(recurse=True):
-        if buf is None or buf.device.type == "meta":
-            continue
-        target_dtype = dtype_override if dtype_override is not None else None
-        if buf.device == device_to and (target_dtype is None or buf.dtype == target_dtype):
-            continue
-        _wait_for_pinned_tensor(buf)
-        tensor = model_management.cast_to(
-            buf,
-            device=device_to,
-            dtype=target_dtype,
-            non_blocking=non_blocking,
-            stream=stream,
-        )
-        _replace_tensor(module, name, tensor, is_buffer=True, requires_grad=False)
-        if tensor.device.type != "meta":
-            CACHE.record(module, name, tensor, is_buffer=True)
+    def _move_module_tensors(target: torch.nn.Module):
+        # Root cause #2: record only direct names so eviction can resolve module._parameters/_buffers.
+        for name, param in target.named_parameters(recurse=False):
+            if param is None or param.device.type == "meta":
+                continue
+            target_dtype = dtype_override if dtype_override is not None else None
+            if param.device == device_to and (target_dtype is None or param.dtype == target_dtype):
+                continue
+            _wait_for_pinned_tensor(param)
+            tensor = model_management.cast_to(
+                param,
+                device=device_to,
+                dtype=target_dtype,
+                non_blocking=non_blocking,
+                stream=stream,
+            )
+            target._parameters[name] = torch.nn.Parameter(tensor, requires_grad=param.requires_grad)
+            if tensor.device.type != "meta":
+                CACHE.record(target, name, tensor, is_buffer=False)
+        for name, buf in target.named_buffers(recurse=False):
+            if buf is None or buf.device.type == "meta":
+                continue
+            target_dtype = dtype_override if dtype_override is not None else None
+            if buf.device == device_to and (target_dtype is None or buf.dtype == target_dtype):
+                continue
+            _wait_for_pinned_tensor(buf)
+            tensor = model_management.cast_to(
+                buf,
+                device=device_to,
+                dtype=target_dtype,
+                non_blocking=non_blocking,
+                stream=stream,
+            )
+            target._buffers[name] = tensor
+            if tensor.device.type != "meta":
+                CACHE.record(target, name, tensor, is_buffer=True)
+        for child in target.children():
+            _move_module_tensors(child)
+
+    _move_module_tensors(module)
     return module
 
 
@@ -1167,8 +1226,10 @@ def _replace_tensor(model: torch.nn.Module, name: str, tensor: torch.Tensor, is_
     attr = parts[-1]
     if is_buffer:
         module._buffers[attr] = tensor
-    else:
-        module._parameters[attr] = torch.nn.Parameter(tensor, requires_grad=requires_grad)
+        return tensor, module, attr
+    param = torch.nn.Parameter(tensor, requires_grad=requires_grad)
+    module._parameters[attr] = param
+    return param, module, attr
 
 
 def _materialize_module_from_state_dict(
@@ -1284,14 +1345,22 @@ def lazy_load_state_dict(model: torch.nn.Module, state_dict, strict: bool = Fals
             continue
         meta = state_dict.meta(name)
         meta_tensor = torch.empty(meta.shape, dtype=meta.dtype, device="meta")
-        _replace_tensor(model, name, meta_tensor, is_buffer=False, requires_grad=param.requires_grad)
+        # Root cause #1: meta placeholders must carry identity for later materialization.
+        param_tensor, owner_module, owner_name = _replace_tensor(
+            model, name, meta_tensor, is_buffer=False, requires_grad=param.requires_grad
+        )
+        _attach_disk_identity(param_tensor, owner_module, owner_name, False)
 
     for name, buf in model.named_buffers(recurse=True):
         if buf is None or name not in state_keys:
             continue
         meta = state_dict.meta(name)
         meta_tensor = torch.empty(meta.shape, dtype=meta.dtype, device="meta")
-        _replace_tensor(model, name, meta_tensor, is_buffer=True, requires_grad=False)
+        # Root cause #1: meta placeholders must carry identity for later materialization.
+        buf_tensor, owner_module, owner_name = _replace_tensor(
+            model, name, meta_tensor, is_buffer=True, requires_grad=False
+        )
+        _attach_disk_identity(buf_tensor, owner_module, owner_name, True)
 
     register_module_weights(model, state_dict)
     register_lazy_modules(model, state_dict)

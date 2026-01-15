@@ -1096,6 +1096,11 @@ def sync_stream(device, stream):
     current_stream(device).wait_stream(stream)
 
 def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, stream=None):
+    if comfy.disk_weights.disk_weights_enabled() and weight.device.type == "meta":
+        # Root cause #1: meta tensors have no storage; materialize before copy_ (PyTorch meta tensors doc + Module.to).
+        target_device = device if device is not None else torch.device("cpu")
+        target_dtype = dtype if dtype is not None else weight.dtype
+        weight = comfy.disk_weights.materialize_meta_tensor(weight, target_device, target_dtype)
     if device is None or weight.device == device:
         if not copy:
             if dtype is None or weight.dtype == dtype:

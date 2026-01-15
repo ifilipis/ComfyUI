@@ -205,14 +205,27 @@ class _SafeTensorFile:
             return tensor
 
         cpu_tensor = self._read_tensor_nogds(
-            fst, framework, meta, torch.device("cpu"), dtype
+            fst, framework, meta, torch.device("cpu"), None if device_is_cuda else dtype
         )
         if device_is_cuda:
             if pin_if_cpu:
                 cpu_tensor = cpu_tensor.pin_memory()
-            gpu_tensor = torch.empty_like(cpu_tensor, device=device)
-            gpu_tensor.copy_(cpu_tensor, non_blocking=pin_if_cpu)
+            if dtype is None or dtype == cpu_tensor.dtype:
+                gpu_tensor = torch.empty_like(cpu_tensor, device=device)
+                gpu_tensor.copy_(cpu_tensor, non_blocking=pin_if_cpu)
+            else:
+                gpu_tensor = cpu_tensor.to(device=device, dtype=dtype, non_blocking=pin_if_cpu)
+            if pin_if_cpu:
+                from . import model_management
+                try:
+                    event = torch.cuda.Event()
+                    event.record(torch.cuda.current_stream(device))
+                    model_management.register_async_lifetime(event, cpu_tensor)
+                except Exception:
+                    pass
             return gpu_tensor
+        if dtype is not None and dtype != cpu_tensor.dtype:
+            cpu_tensor = cpu_tensor.to(dtype=dtype)
         return cpu_tensor
 
     def _aligned_range(self, abs_start: int, length: int) -> Tuple[int, int, int]:
@@ -302,12 +315,25 @@ class _SafeTensorFile:
             framework.free_tensor_memory(gbuf, fst_device)
             raise RuntimeError("gds_file_reader read failed")
         owner = _BufferOwner(lambda: framework.free_tensor_memory(gbuf, fst_device))
+        attach_owner = dtype is None or dtype == meta.dtype
         tensor = _dlpack_tensor_from_buffer(
-            fst, framework, gbuf.get_base_address() + ptr_off + head, meta, device, owner
+            fst,
+            framework,
+            gbuf.get_base_address() + ptr_off + head,
+            meta,
+            device,
+            owner if attach_owner else None,
         )
         if dtype is not None and dtype != tensor.dtype:
-            _validate_dtype_conversion(tensor.dtype, dtype)
-            tensor = tensor.to(dtype=dtype)
+            out = tensor.to(dtype=dtype)
+            from . import model_management
+            try:
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(device))
+                model_management.register_async_lifetime(event, (tensor, owner), free_callback=owner.free)
+            except Exception:
+                owner.free()
+            return out
         return tensor
 
 
@@ -320,8 +346,15 @@ def _fst_device_from_torch(fst, device: torch.device):
 class _BufferOwner:
     def __init__(self, free_fn):
         self._free_fn = free_fn
+        self._freed = False
 
     def __del__(self):
+        self.free()
+
+    def free(self):
+        if self._freed:
+            return
+        self._freed = True
         try:
             self._free_fn()
         except Exception:
@@ -348,8 +381,7 @@ def _dlpack_tensor_from_buffer(
 
 
 def _validate_dtype_conversion(src: torch.dtype, dst: torch.dtype):
-    if torch.tensor([], dtype=dst).element_size() > torch.tensor([], dtype=src).element_size():
-        raise ValueError(f"Online type conversion to larger sizes is not supported ({src} -> {dst})")
+    return
 
 
 def _get_gds_o_direct(framework) -> bool:
@@ -523,8 +555,9 @@ class StreamStateDict(collections.abc.MutableMapping):
                 raise KeyError(key)
             return default
         if self._index.has(key):
+            value = self.get_tensor(key)
             self._deleted.add(key)
-            return self.get_tensor(key)
+            return value
         if default is _MISSING:
             raise KeyError(key)
         return default
@@ -636,8 +669,9 @@ class _BaseViewStateDict(MutableMapping):
                 if default is _MISSING:
                     raise
                 return default
+        value = self.get_tensor(key)
         self._deleted.add(key)
-        return self.get_tensor(key)
+        return value
 
     def meta(self, key: str):
         if key in self._overrides:
@@ -693,83 +727,6 @@ class DeviceViewStateDict(_BaseViewStateDict):
         return super().get_tensor(
             key, device=device, dtype=dtype, allow_gds=allow_gds, pin_if_cpu=pin_if_cpu
         )
-
-    def meta(self, key: str):
-        if key in self._overrides:
-            t = self._overrides[key]
-            numel = t.numel()
-            return SimpleNamespace(
-                dtype=t.dtype,
-                shape=tuple(t.shape),
-                numel=numel,
-                nbytes=numel * t.element_size(),
-            )
-        base_key = self._resolve_base_key(key)
-        if base_key is None or key in self._deleted:
-            raise KeyError(key)
-        if hasattr(self._base, "meta"):
-            return self._base.meta(base_key)
-        t = self._base[base_key]
-        numel = t.numel()
-        return SimpleNamespace(
-            dtype=t.dtype,
-            shape=tuple(t.shape),
-            numel=numel,
-            nbytes=numel * t.element_size(),
-        )
-
-    def __getitem__(self, key: str) -> torch.Tensor:
-        return self.get_tensor(key)
-
-    def __setitem__(self, key: str, value: torch.Tensor) -> None:
-        base_key = self._resolve_base_key(key)
-        if self._mutate_base and base_key is not None and base_key in self._base:
-            self._base[base_key] = value
-        else:
-            self._overrides[key] = value
-        self._deleted.discard(key)
-
-    def __delitem__(self, key: str) -> None:
-        if key in self._overrides:
-            del self._overrides[key]
-            return
-        base_key = self._resolve_base_key(key)
-        if base_key is None or key in self._deleted:
-            raise KeyError(key)
-        if self._mutate_base and base_key in self._base:
-            del self._base[base_key]
-        else:
-            self._deleted.add(key)
-
-    def __iter__(self) -> Iterator[str]:
-        for k in self._iter_base_keys():
-            if k in self._deleted:
-                continue
-            yield k
-        for k in self._overrides.keys():
-            yield k
-
-    def __len__(self) -> int:
-        base_keys = list(self._iter_base_keys())
-        return len(base_keys) - len(self._deleted) + len(self._overrides)
-
-    def pop(self, key: str, default: object = _MISSING) -> torch.Tensor:
-        if key in self._overrides:
-            return self._overrides.pop(key)
-        base_key = self._resolve_base_key(key)
-        if base_key is None or key in self._deleted:
-            if default is _MISSING:
-                raise KeyError(key)
-            return default
-        if self._mutate_base:
-            try:
-                return self._base.pop(base_key)
-            except KeyError:
-                if default is _MISSING:
-                    raise
-                return default
-        self._deleted.add(key)
-        return self.get_tensor(key)
 
 
 class FilterViewStateDict(_BaseViewStateDict):

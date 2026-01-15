@@ -174,7 +174,7 @@ def load_state_dict(model, state_dict, strict=False, assign=False):
         comfy.disk_weights.attach_disk_weight_hooks(model)
         missing, unexpected = stream_load_state_dict(model, state_dict, strict=strict, assign=assign)
         return missing, unexpected
-    return model.load_state_dict(state_dict, strict=strict)
+    return comfy.disk_weights.ORIGINAL_LOAD_STATE_DICT(model, state_dict, strict=strict, assign=assign)
 
 
 def stream_load_state_dict(model, state_dict, strict=False, assign=False):

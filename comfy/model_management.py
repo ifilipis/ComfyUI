@@ -489,7 +489,7 @@ class LoadedModel:
 
     def model_loaded_memory(self):
         if comfy.disk_weights.disk_weights_enabled():
-            return comfy.disk_weights.module_loaded_bytes(self.model.model)
+            return comfy.disk_weights.module_loaded_bytes_on_device(self.model.model, self.device)
         return self.model.loaded_size()
 
     def model_offloaded_memory(self):

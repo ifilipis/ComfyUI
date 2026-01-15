@@ -793,6 +793,9 @@ class ModelPatcher:
                 for param in params:
                     self.pin_weight_to_device("{}.{}".format(n, param))
 
+            if comfy.disk_weights.disk_weights_enabled():
+                comfy.disk_weights.refresh_cache_for_module_tree(self.model)
+
             if lowvram_counter > 0:
                 logging.info("loaded partially; {:.2f} MB usable, {:.2f} MB loaded, {:.2f} MB offloaded, {:.2f} MB buffer reserved, lowvram patches: {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), lowvram_mem_counter / (1024 * 1024), offload_buffer / (1024 * 1024), patch_counter))
                 self.model.model_lowvram = True
@@ -841,6 +844,9 @@ class ModelPatcher:
                     move_weight_functions(m, device_to)
                     wipe_lowvram_weight(m)
 
+                if comfy.disk_weights.disk_weights_enabled():
+                    comfy.disk_weights.refresh_cache_for_module_tree(self.model)
+
                 self.model.model_lowvram = False
                 self.model.lowvram_patch_counter = 0
 
@@ -852,6 +858,9 @@ class ModelPatcher:
                     comfy.utils.copy_to_param(self.model, k, bk.weight)
                 else:
                     comfy.utils.set_attr_param(self.model, k, bk.weight)
+
+            if comfy.disk_weights.disk_weights_enabled():
+                comfy.disk_weights.refresh_cache_for_module_tree(self.model)
 
             self.model.current_weight_patches_uuid = None
             self.backup.clear()
@@ -884,9 +893,6 @@ class ModelPatcher:
             if len(unload_list) > 0:
                 NS = comfy.model_management.NUM_STREAMS
                 offload_weight_factor = [ min(offload_buffer / (NS + 1), unload_list[0][1]) ] * NS
-            remaining_ram = None
-            if device_to is not None and comfy.model_management.is_device_cpu(device_to):
-                remaining_ram = comfy.model_management.get_free_memory(device_to)
 
             for unload in unload_list:
                 if memory_to_free + offload_buffer - self.model.model_offload_buffer_memory < memory_freed:
@@ -926,18 +932,25 @@ class ModelPatcher:
                             if freed_bytes == 0:
                                 freed_bytes = module_mem
                         else:
-                            if remaining_ram is not None and remaining_ram < module_mem and comfy.disk_weights.disk_weights_enabled():
-                                logging.info("Insufficient CPU RAM for %s (need %.2f MB, free %.2f MB); offloading to disk.", n, module_mem / (1024 * 1024), remaining_ram / (1024 * 1024))
-                                freed_bytes = comfy.disk_weights.offload_module_weights(m)
-                                if freed_bytes == 0:
-                                    freed_bytes = module_mem
-                            else:
-                                if comfy.disk_weights.disk_weights_enabled():
-                                    comfy.disk_weights.move_module_tensors(m, device_to)
+                            if device_to is not None:
+                                try:
+                                    comfy.model_management.ensure_allocation_possible(
+                                        device_to,
+                                        module_mem,
+                                        reason="ModelPatcher.partially_unload move module",
+                                    )
+                                except RuntimeError:
+                                    if comfy.disk_weights.disk_weights_enabled():
+                                        freed_bytes = comfy.disk_weights.offload_module_weights(m)
+                                        if freed_bytes == 0:
+                                            freed_bytes = module_mem
+                                    else:
+                                        raise
                                 else:
-                                    m.to(device_to)
-                                if remaining_ram is not None:
-                                    remaining_ram = max(0, remaining_ram - module_mem)
+                                    if comfy.disk_weights.disk_weights_enabled():
+                                        comfy.disk_weights.module_to(m, device_to)
+                                    else:
+                                        m.to(device_to)
                         module_mem += move_weight_functions(m, device_to)
                         if lowvram_possible:
                             if weight_key in self.patches:

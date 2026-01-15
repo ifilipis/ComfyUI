@@ -104,22 +104,40 @@ class CacheEntry:
     nbytes: int
 
 
+def _canonical_device_key(device: torch.device) -> str:
+    if device is None:
+        return "cpu"
+    if device.type == "cpu":
+        return "cpu"
+    if device.type == "meta":
+        return "meta"
+    if device.type == "cuda":
+        index = device.index
+        if index is None:
+            index = torch.cuda.current_device()
+        return f"cuda:{index}"
+    return str(device)
+
+
 class DiskWeightCache:
     def __init__(self, max_bytes: int = 0):
         self.max_bytes = max_bytes
         self.current_bytes = 0
+        self.max_bytes_by_device: Dict[str, int] = {}
+        self.current_bytes_by_device: Dict[str, int] = {}
         self._entries_by_device: Dict[str, "collections.OrderedDict[tuple[int, str], CacheEntry]"] = {}
         self._entries_by_key: Dict[tuple[int, str], CacheEntry] = {}
 
     def set_limit(self, max_bytes: int):
         self.max_bytes = max_bytes
-        self._evict_if_needed()
+        self.max_bytes_by_device["cpu"] = max_bytes
+        self._evict_if_needed("cpu")
 
     def _entry_key(self, module: torch.nn.Module, name: str) -> tuple[int, str]:
         return (id(module), name)
 
     def _device_key(self, device: torch.device) -> str:
-        return str(device)
+        return _canonical_device_key(device)
 
     def _remove_entry(self, key: tuple[int, str], entry: CacheEntry):
         device_key = self._device_key(entry.device)
@@ -127,7 +145,10 @@ class DiskWeightCache:
         if device_entries is not None and key in device_entries:
             device_entries.pop(key, None)
         self._entries_by_key.pop(key, None)
-        self.current_bytes -= entry.nbytes
+        self.current_bytes_by_device[device_key] = max(
+            0, self.current_bytes_by_device.get(device_key, 0) - entry.nbytes
+        )
+        self.current_bytes = max(0, self.current_bytes - entry.nbytes)
 
     def record(self, module: torch.nn.Module, name: str, tensor: torch.Tensor, is_buffer: bool):
         if tensor.device.type == "meta":
@@ -150,8 +171,9 @@ class DiskWeightCache:
         device_entries = self._entries_by_device.setdefault(device_key, collections.OrderedDict())
         device_entries[key] = entry
         self._entries_by_key[key] = entry
+        self.current_bytes_by_device[device_key] = self.current_bytes_by_device.get(device_key, 0) + nbytes
         self.current_bytes += nbytes
-        self._evict_if_needed()
+        self._evict_if_needed(device_key)
 
     def touch(self, module: torch.nn.Module, name: str):
         key = self._entry_key(module, name)
@@ -174,7 +196,11 @@ class DiskWeightCache:
             key, entry = device_entries.popitem(last=False)
             self._entries_by_key.pop(key, None)
             freed += entry.nbytes
-            self.current_bytes -= entry.nbytes
+            device_key = self._device_key(entry.device)
+            self.current_bytes_by_device[device_key] = max(
+                0, self.current_bytes_by_device.get(device_key, 0) - entry.nbytes
+            )
+            self.current_bytes = max(0, self.current_bytes - entry.nbytes)
             module = entry.module_ref()
             if module is not None:
                 _evict_module_weight(module, entry.name, entry.is_buffer)
@@ -184,6 +210,8 @@ class DiskWeightCache:
         return self.evict_bytes("cpu", bytes_to_free)
 
     def evict_cuda_bytes(self, cuda_device: torch.device, bytes_to_free: int):
+        from . import model_management
+        model_management.sync_offload_streams(cuda_device)
         if cuda_device.type == "cuda" and cuda_device.index is None:
             cuda_device = torch.device("cuda", torch.cuda.current_device())
         device_key = self._device_key(cuda_device)
@@ -194,7 +222,10 @@ class DiskWeightCache:
         while device_entries and freed < bytes_to_free:
             key, entry = device_entries.popitem(last=False)
             self._entries_by_key.pop(key, None)
-            self.current_bytes -= entry.nbytes
+            self.current_bytes_by_device[device_key] = max(
+                0, self.current_bytes_by_device.get(device_key, 0) - entry.nbytes
+            )
+            self.current_bytes = max(0, self.current_bytes - entry.nbytes)
             module = entry.module_ref()
             if module is None:
                 freed += entry.nbytes
@@ -255,21 +286,46 @@ class DiskWeightCache:
             if entry is not None:
                 self._remove_entry(key, entry)
 
-    def _evict_if_needed(self):
-        if self.max_bytes <= 0:
+    def _evict_if_needed(self, device_key: Optional[str] = None):
+        if not any(limit > 0 for limit in self.max_bytes_by_device.values()):
             return
-        while self._entries_by_key and self.current_bytes > self.max_bytes:
-            for device_key, device_entries in list(self._entries_by_device.items()):
-                if not device_entries:
-                    continue
-                key, entry = device_entries.popitem(last=False)
-                self._entries_by_key.pop(key, None)
-                self.current_bytes -= entry.nbytes
-                module = entry.module_ref()
-                if module is not None:
-                    _evict_module_weight(module, entry.name, entry.is_buffer)
-                if self.current_bytes <= self.max_bytes:
-                    return
+        if device_key is None:
+            return
+        limit = self.max_bytes_by_device.get(device_key, 0)
+        if limit <= 0:
+            return
+        current = self.current_bytes_by_device.get(device_key, 0)
+        if current <= limit:
+            return
+        bytes_to_free = current - limit
+        device_entries = self._entries_by_device.get(device_key)
+        if not device_entries:
+            return
+        evicted_entries = 0
+        LOGGER.debug(
+            "Cache eviction start device=%s limit=%d current=%d bytes_to_free=%d",
+            device_key,
+            limit,
+            current,
+            bytes_to_free,
+        )
+        while device_entries and self.current_bytes_by_device.get(device_key, 0) > limit:
+            key, entry = device_entries.popitem(last=False)
+            self._entries_by_key.pop(key, None)
+            self.current_bytes_by_device[device_key] = max(
+                0, self.current_bytes_by_device.get(device_key, 0) - entry.nbytes
+            )
+            self.current_bytes = max(0, self.current_bytes - entry.nbytes)
+            evicted_entries += 1
+            module = entry.module_ref()
+            if module is not None:
+                _evict_module_weight(module, entry.name, entry.is_buffer)
+        LOGGER.debug(
+            "Cache eviction end device=%s current=%d evicted_entries=%d",
+            device_key,
+            self.current_bytes_by_device.get(device_key, 0),
+            evicted_entries,
+        )
 
 
 REGISTRY = DiskWeightRegistry()
@@ -277,8 +333,15 @@ CACHE = DiskWeightCache(0)
 LOGGER = logging.getLogger(__name__)
 
 
-def configure(allow_gds: bool, pin_if_cpu: bool, enabled: bool = True):
+def configure(*args, allow_gds: bool, pin_if_cpu: bool, enabled: bool = True, **kwargs):
     global ALLOW_GDS, PIN_IF_CPU, DISK_WEIGHTS_ENABLED
+    if len(args) == 1:
+        if isinstance(args[0], int):
+            pass
+        else:
+            raise TypeError("configure() legacy cache_bytes must be int")
+    elif len(args) != 0:
+        raise TypeError("configure() takes at most 1 positional argument (legacy cache_bytes)")
     ALLOW_GDS = allow_gds
     PIN_IF_CPU = pin_if_cpu
     DISK_WEIGHTS_ENABLED = enabled
@@ -286,6 +349,8 @@ def configure(allow_gds: bool, pin_if_cpu: bool, enabled: bool = True):
         CACHE._entries_by_device.clear()
         CACHE._entries_by_key.clear()
         CACHE.current_bytes = 0
+        CACHE.max_bytes_by_device.clear()
+        CACHE.current_bytes_by_device.clear()
         return
     patch_torch_module_methods_once()
 
@@ -710,6 +775,11 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
         refs = REGISTRY.get(module)
         if not refs or name not in refs:
             return
+        current = module._buffers.get(name) if refs[name].is_buffer else module._parameters.get(name)
+        if current is not None and current.device.type == "cpu":
+            from . import model_management
+            if model_management.is_pinned_by_comfy(current):
+                model_management.unpin_memory(current)
         disk_ref = refs[name]
         shape = getattr(disk_ref.meta, "shape", None)
         dtype = _get_future_dtype(module, name) or getattr(disk_ref.meta, "dtype", None)
@@ -737,6 +807,11 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
     ref = REGISTRY.get(module)
     if not ref or name not in ref:
         return
+    current = module._buffers.get(name) if is_buffer else module._parameters.get(name)
+    if current is not None and current.device.type == "cpu":
+        from . import model_management
+        if model_management.is_pinned_by_comfy(current):
+            model_management.unpin_memory(current)
     disk_ref = ref[name]
     shape = getattr(disk_ref.meta, "shape", None)
     dtype = _get_future_dtype(module, name) or getattr(disk_ref.meta, "dtype", None)
@@ -1005,8 +1080,35 @@ def _refresh_cache_for_module_tree(module: torch.nn.Module):
     for submodule in module.modules():
         _refresh_cache_for_module(submodule)
 
+def refresh_cache_for_module_tree(module: torch.nn.Module) -> None:
+    _refresh_cache_for_module_tree(module)
+
+def _module_has_cuda(module: torch.nn.Module) -> bool:
+    for param in module.parameters(recurse=True):
+        if param is not None and param.device.type == "cuda":
+            return True
+    for buf in module.buffers(recurse=True):
+        if buf is not None and buf.device.type == "cuda":
+            return True
+    return False
+
+def _find_cuda_device(module: torch.nn.Module) -> Optional[torch.device]:
+    for param in module.parameters(recurse=True):
+        if param is not None and param.device.type == "cuda":
+            return param.device
+    for buf in module.buffers(recurse=True):
+        if buf is not None and buf.device.type == "cuda":
+            return buf.device
+    return None
+
 
 def move_module_tensors(module: torch.nn.Module, device_to: torch.device, dtype_override: Optional[torch.dtype] = None):
+    if device_to.type == "cuda" or _module_has_cuda(module):
+        from . import model_management
+        cuda_device = device_to if device_to.type == "cuda" else _find_cuda_device(module)
+        if cuda_device is not None:
+            model_management.sync_offload_streams(cuda_device)
+
     def _move(tensor):
         if tensor is None:
             return None
@@ -1016,6 +1118,9 @@ def move_module_tensors(module: torch.nn.Module, device_to: torch.device, dtype_
             return tensor
         target_dtype = dtype_override or tensor.dtype
         from . import model_management
+        if tensor.device.type == "cpu" and device_to.type != "cpu":
+            if model_management.is_pinned_by_comfy(tensor):
+                model_management.unpin_memory(tensor)
         bytes_needed = tensor.numel() * torch.tensor([], dtype=target_dtype).element_size()
         model_management.ensure_allocation_possible(device_to, bytes_needed, reason="disk_weights move_module_tensors")
         if dtype_override is not None and tensor.dtype != dtype_override:
@@ -1033,6 +1138,11 @@ def offload_module_weights(module: torch.nn.Module) -> int:
     refs = REGISTRY.get(module)
     if not refs:
         return 0
+    if _module_has_cuda(module):
+        from . import model_management
+        cuda_device = _find_cuda_device(module)
+        if cuda_device is not None:
+            model_management.sync_offload_streams(cuda_device)
     offloaded_bytes = 0
     if module in LAZY_MODULE_STATE:
         ref_name = next(iter(refs.keys()), None)
@@ -1057,6 +1167,11 @@ def module_to(module: torch.nn.Module, *args, **kwargs):
         target_device = _extract_to_device(args, kwargs)
         if target_device is None:
             target_device = _find_existing_device(module) or torch.device("cpu")
+        if target_device.type == "cuda" or _module_has_cuda(module):
+            from . import model_management
+            cuda_device = target_device if target_device.type == "cuda" else _find_cuda_device(module)
+            if cuda_device is not None:
+                model_management.sync_offload_streams(cuda_device)
         if target_device.type == "meta":
             offload_module_weights(module)
             return module
@@ -1102,6 +1217,9 @@ def load_module_tensor(
             required_dtype = target_dtype or current.dtype
             bytes_needed = current.numel() * torch.tensor([], dtype=required_dtype).element_size()
             model_management.ensure_allocation_possible(device, bytes_needed, reason="disk_weights load_module_tensor")
+            if current.device.type == "cpu" and device.type != "cpu":
+                if model_management.is_pinned_by_comfy(current):
+                    model_management.unpin_memory(current)
             if target_dtype is not None and current.dtype != target_dtype:
                 tensor = current.to(device=device, dtype=target_dtype)
             else:

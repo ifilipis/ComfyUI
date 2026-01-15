@@ -510,6 +510,8 @@ class LoadedModel:
         if use_more_vram == 0:
             use_more_vram = 1e32
         self.model_use_more_vram(use_more_vram, force_patch_weights=force_patch_weights)
+        if comfy.disk_weights.disk_weights_enabled():
+            comfy.disk_weights.refresh_cache_for_module_tree(self.model.model)
 
         real_model = self.model.model
 
@@ -535,16 +537,21 @@ class LoadedModel:
         offload_device = None
         if comfy.disk_weights.disk_weights_enabled():
             offload_device = torch.device("meta")
+            sync_offload_streams(self.device)
         self.model.detach(unpatch_weights, offload_device=offload_device)
         if offload_device is not None and offload_device.type == "meta":
             logging.info(f"Unloaded {self.model.model.__class__.__name__} to disk")
+            comfy.disk_weights.refresh_cache_for_module_tree(self.model.model)
         self.model_finalizer.detach()
         self.model_finalizer = None
         self.real_model = None
         return True
 
     def model_use_more_vram(self, extra_memory, force_patch_weights=False):
-        return self.model.partially_load(self.device, extra_memory, force_patch_weights=force_patch_weights)
+        loaded = self.model.partially_load(self.device, extra_memory, force_patch_weights=force_patch_weights)
+        if comfy.disk_weights.disk_weights_enabled():
+            comfy.disk_weights.refresh_cache_for_module_tree(self.model.model)
+        return loaded
 
     def __eq__(self, other):
         return self.model is other.model
@@ -1185,6 +1192,22 @@ def sync_stream(device, stream):
         return
     current_stream(device).wait_stream(stream)
 
+def sync_offload_streams(device: torch.device) -> None:
+    if device is None:
+        return
+    if is_device_cuda(device):
+        if device not in STREAMS:
+            return
+        for stream in STREAMS[device]:
+            stream.synchronize()
+        torch.cuda.current_stream(device).synchronize()
+    elif is_device_xpu(device):
+        if device not in STREAMS:
+            return
+        for stream in STREAMS[device]:
+            stream.synchronize()
+        torch.xpu.current_stream(device).synchronize()
+
 def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, stream=None):
     if device is None or weight.device == device:
         if not copy:
@@ -1257,6 +1280,14 @@ def discard_cuda_async_error():
     except torch.AcceleratorError:
         #Dump it! We already know about it from the synchronous return
         pass
+
+def is_pinned_by_comfy(tensor):
+    return (
+        tensor is not None
+        and tensor.device.type == "cpu"
+        and tensor.is_contiguous()
+        and tensor.data_ptr() in PINNED_MEMORY
+    )
 
 def pin_memory(tensor):
     global TOTAL_PINNED_MEMORY

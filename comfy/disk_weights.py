@@ -33,10 +33,15 @@ from . import safetensors_stream
 ALLOW_GDS = False
 PIN_IF_CPU = False
 DISK_WEIGHTS_ENABLED = False
+RAM_HEADROOM_BYTES = 0
+VRAM_HEADROOM_BYTES = 0
 BASE_LOAD_FROM_STATE_DICT = torch.nn.Module._load_from_state_dict
+BASE_MODULE_TO = torch.nn.Module.to
+BASE_MODULE_LOAD_STATE_DICT = torch.nn.Module.load_state_dict
 LAZY_MODULE_STATE = weakref.WeakKeyDictionary()
 DISK_MATERIALIZATION_STATE = weakref.WeakKeyDictionary()
 _MISSING = object()
+_PATCHED = False
 
 
 @dataclass
@@ -92,33 +97,36 @@ class CacheEntry:
     name: str
     size_bytes: int
     is_buffer: bool
+    device_type: str
 
 
 class DiskWeightCache:
-    def __init__(self, max_bytes: int = 0):
-        self.max_bytes = max_bytes
-        self.current_bytes = 0
+    def __init__(self):
         self._entries: "collections.OrderedDict[tuple[int, str], CacheEntry]" = collections.OrderedDict()
-
-    def set_limit(self, max_bytes: int):
-        self.max_bytes = max_bytes
-        self._evict_if_needed()
+        self._module_bytes: "weakref.WeakKeyDictionary[torch.nn.Module, int]" = weakref.WeakKeyDictionary()
 
     def _entry_key(self, module: torch.nn.Module, name: str) -> tuple[int, str]:
         return (id(module), name)
 
     def record(self, module: torch.nn.Module, name: str, tensor: torch.Tensor, is_buffer: bool):
-        if tensor.device.type != "cpu":
+        if tensor.device.type == "meta":
+            self.remove_entry(module, name)
             return
+        device_type = "cpu" if tensor.device.type == "cpu" else "gpu"
         size_bytes = tensor.numel() * tensor.element_size()
         key = self._entry_key(module, name)
         if key in self._entries:
             entry = self._entries.pop(key)
-            self.current_bytes -= entry.size_bytes
+            self._adjust_module_bytes(entry.module_ref(), -entry.size_bytes)
         module_ref = weakref.ref(module, self._drop_module_entries)
-        self._entries[key] = CacheEntry(module_ref=module_ref, name=name, size_bytes=size_bytes, is_buffer=is_buffer)
-        self.current_bytes += size_bytes
-        self._evict_if_needed()
+        self._entries[key] = CacheEntry(
+            module_ref=module_ref,
+            name=name,
+            size_bytes=size_bytes,
+            is_buffer=is_buffer,
+            device_type=device_type,
+        )
+        self._adjust_module_bytes(module, size_bytes)
 
     def touch(self, module: torch.nn.Module, name: str):
         key = self._entry_key(module, name)
@@ -126,16 +134,26 @@ class DiskWeightCache:
             entry = self._entries.pop(key)
             self._entries[key] = entry
 
-    def evict_bytes(self, bytes_to_free: int):
-        freed = 0
-        while self._entries and freed < bytes_to_free:
+    def pop_lru(self, device_type: Optional[str] = None) -> Optional[CacheEntry]:
+        if device_type is None:
+            if not self._entries:
+                return None
             _, entry = self._entries.popitem(last=False)
-            freed += entry.size_bytes
-            self.current_bytes -= entry.size_bytes
-            module = entry.module_ref()
-            if module is not None:
-                _evict_module_weight(module, entry.name, entry.is_buffer)
-        return freed
+            self._adjust_module_bytes(entry.module_ref(), -entry.size_bytes)
+            return entry
+        for key, entry in list(self._entries.items()):
+            if entry.device_type == device_type:
+                self._entries.pop(key)
+                self._adjust_module_bytes(entry.module_ref(), -entry.size_bytes)
+                return entry
+        return None
+
+    def remove_entry(self, module: torch.nn.Module, name: str):
+        key = self._entry_key(module, name)
+        entry = self._entries.pop(key, None)
+        if entry is None:
+            return
+        self._adjust_module_bytes(entry.module_ref(), -entry.size_bytes)
 
     def remove_module(self, module: torch.nn.Module):
         to_remove = []
@@ -144,7 +162,9 @@ class DiskWeightCache:
                 to_remove.append(key)
         for key in to_remove:
             entry = self._entries.pop(key)
-            self.current_bytes -= entry.size_bytes
+            self._adjust_module_bytes(entry.module_ref(), -entry.size_bytes)
+        if module in self._module_bytes:
+            del self._module_bytes[module]
 
     def _drop_module_entries(self, module_ref: weakref.ReferenceType):
         to_remove = []
@@ -153,35 +173,70 @@ class DiskWeightCache:
                 to_remove.append(key)
         for key in to_remove:
             entry = self._entries.pop(key)
-            self.current_bytes -= entry.size_bytes
+            self._adjust_module_bytes(entry.module_ref(), -entry.size_bytes)
 
-    def _evict_if_needed(self):
-        while self._entries and self.current_bytes > self.max_bytes:
-            _, entry = self._entries.popitem(last=False)
-            self.current_bytes -= entry.size_bytes
-            module = entry.module_ref()
-            if module is not None:
-                _evict_module_weight(module, entry.name, entry.is_buffer)
+    def module_bytes(self, module: torch.nn.Module) -> int:
+        return self._module_bytes.get(module, 0)
+
+    def _adjust_module_bytes(self, module: Optional[torch.nn.Module], delta: int):
+        if module is None:
+            return
+        current = self._module_bytes.get(module, 0)
+        new_total = current + delta
+        if new_total <= 0:
+            self._module_bytes.pop(module, None)
+        else:
+            self._module_bytes[module] = new_total
 
 
 REGISTRY = DiskWeightRegistry()
-CACHE = DiskWeightCache(0)
+CACHE = DiskWeightCache()
 LOGGER = logging.getLogger(__name__)
 
 
-def configure(cache_bytes: int, allow_gds: bool, pin_if_cpu: bool, enabled: bool = True):
-    global ALLOW_GDS, PIN_IF_CPU, DISK_WEIGHTS_ENABLED
+def configure(
+    ram_headroom_bytes: int,
+    vram_headroom_bytes: int,
+    allow_gds: bool,
+    pin_if_cpu: bool,
+    enabled: bool = True,
+):
+    global ALLOW_GDS, PIN_IF_CPU, DISK_WEIGHTS_ENABLED, RAM_HEADROOM_BYTES, VRAM_HEADROOM_BYTES
     ALLOW_GDS = allow_gds
     PIN_IF_CPU = pin_if_cpu
     DISK_WEIGHTS_ENABLED = enabled
-    CACHE.set_limit(cache_bytes if enabled else 0)
+    RAM_HEADROOM_BYTES = ram_headroom_bytes if enabled else 0
+    VRAM_HEADROOM_BYTES = vram_headroom_bytes if enabled else 0
+    _set_patch_state(enabled)
     if not enabled:
         CACHE._entries.clear()
-        CACHE.current_bytes = 0
+        CACHE._module_bytes.clear()
 
 
 def disk_weights_enabled() -> bool:
     return DISK_WEIGHTS_ENABLED
+
+
+def _set_patch_state(enabled: bool):
+    global _PATCHED
+    if enabled and not _PATCHED:
+        def _patched_to(module, *args, **kwargs):
+            if not disk_weights_enabled():
+                return BASE_MODULE_TO(module, *args, **kwargs)
+            return module_to(module, *args, **kwargs)
+
+        def _patched_load_state_dict(module, state_dict, strict=True, assign=False):
+            if disk_weights_enabled() and getattr(state_dict, "is_stream_state_dict", False):
+                return lazy_load_state_dict(module, state_dict, strict=strict)
+            return BASE_MODULE_LOAD_STATE_DICT(module, state_dict, strict=strict, assign=assign)
+
+        torch.nn.Module.to = _patched_to
+        torch.nn.Module.load_state_dict = _patched_load_state_dict
+        _PATCHED = True
+    elif not enabled and _PATCHED:
+        torch.nn.Module.to = BASE_MODULE_TO
+        torch.nn.Module.load_state_dict = BASE_MODULE_LOAD_STATE_DICT
+        _PATCHED = False
 
 
 def register_module_weights(module: torch.nn.Module, state_dict, prefix: str = ""):
@@ -197,7 +252,7 @@ def register_module_weights(module: torch.nn.Module, state_dict, prefix: str = "
                 meta = state_dict.meta(key)
                 ref = DiskTensorRef(state_dict=state_dict, key=key, meta=meta, requires_grad=param.requires_grad, is_buffer=False)
                 REGISTRY.register(submodule, name, ref)
-                if param.device.type == "cpu":
+                if param.device.type != "meta":
                     CACHE.record(submodule, name, param, is_buffer=False)
         for name, buf in submodule.named_buffers(recurse=False):
             key = f"{module_prefix}{name}" if module_prefix else name
@@ -205,7 +260,7 @@ def register_module_weights(module: torch.nn.Module, state_dict, prefix: str = "
                 meta = state_dict.meta(key)
                 ref = DiskTensorRef(state_dict=state_dict, key=key, meta=meta, requires_grad=False, is_buffer=True)
                 REGISTRY.register(submodule, name, ref)
-                if buf.device.type == "cpu":
+                if buf.device.type != "meta":
                     CACHE.record(submodule, name, buf, is_buffer=True)
 
 
@@ -347,7 +402,7 @@ def _log_materialization(
     if total_bytes == 0:
         return
     partial = meta_bytes > 0
-    LOGGER.info(
+    LOGGER.debug(
         "%s: module=%s dest=%s load=%0.2fMB free=%0.2fMB partial=%s "
         "loaded=%0.2fMB meta=%0.2fMB cpu=%0.2fMB gpu=%0.2fMB full_load=%s",
         context,
@@ -369,22 +424,12 @@ def _device_free_memory(device: torch.device) -> int:
     return int(model_management.get_free_memory(device))
 
 
-def _evict_ram_for_budget(required_bytes: int) -> int:
-    if required_bytes <= 0:
-        return 0
-    freed = evict_ram_cache(required_bytes)
-    if freed < required_bytes:
-        from . import model_management
-        freed += model_management.evict_ram_to_disk(required_bytes - freed)
-    return freed
+def _headroom_bytes(device: torch.device) -> int:
+    return RAM_HEADROOM_BYTES if device.type == "cpu" else VRAM_HEADROOM_BYTES
 
 
-def _maybe_free_ram_budget(device: torch.device, required_bytes: int) -> int:
-    free_mem = _device_free_memory(device)
-    if device.type == "cpu" and free_mem < required_bytes:
-        _evict_ram_for_budget(required_bytes - free_mem)
-        free_mem = _device_free_memory(device)
-    return free_mem
+def usable_free_memory(device: torch.device) -> int:
+    return _device_free_memory(device) - _headroom_bytes(device)
 
 
 def _choose_alternate_device(device: torch.device) -> Optional[torch.device]:
@@ -396,6 +441,101 @@ def _choose_alternate_device(device: torch.device) -> Optional[torch.device]:
     else:
         return torch.device("cpu")
     return None
+
+
+def module_loaded_bytes(module: torch.nn.Module) -> int:
+    if not disk_weights_enabled():
+        return getattr(module, "model_loaded_weight_memory", 0)
+    return CACHE.module_bytes(module)
+
+
+def _wait_for_pinned_tensor(tensor: Optional[torch.Tensor]):
+    if tensor is None:
+        return
+    if tensor.device.type != "cpu" or not tensor.is_pinned():
+        return
+    from . import model_management
+    model_management.wait_for_pinned_tensor(tensor)
+
+
+def _move_gpu_entry_to_cpu(entry: CacheEntry) -> int:
+    module = entry.module_ref()
+    if module is None:
+        return 0
+    if entry.is_buffer:
+        current = module._buffers.get(entry.name)
+    else:
+        current = module._parameters.get(entry.name)
+    if current is None or current.device.type in ("cpu", "meta"):
+        return 0
+    from . import model_management
+    stream = model_management.get_offload_stream(current.device)
+    non_blocking = model_management.device_supports_non_blocking(torch.device("cpu"))
+    tensor = model_management.cast_to(current, device=torch.device("cpu"), non_blocking=non_blocking, stream=stream)
+    if entry.is_buffer:
+        module._buffers[entry.name] = tensor
+    else:
+        module._parameters[entry.name] = torch.nn.Parameter(tensor, requires_grad=current.requires_grad)
+    CACHE.record(module, entry.name, tensor, is_buffer=entry.is_buffer)
+    return tensor.numel() * tensor.element_size()
+
+
+def _evict_cpu_entry_to_meta() -> int:
+    entry = CACHE.pop_lru(device_type="cpu")
+    if entry is None:
+        return 0
+    module = entry.module_ref()
+    if module is not None:
+        _evict_module_weight(module, entry.name, entry.is_buffer)
+    return entry.size_bytes
+
+
+def _evict_cpu_until_headroom() -> int:
+    cpu = torch.device("cpu")
+    freed = 0
+    while usable_free_memory(cpu) < 0:
+        evicted = _evict_cpu_entry_to_meta()
+        if evicted == 0:
+            break
+        freed += evicted
+    return freed
+
+
+def evict_for_budget(target_device: torch.device, required_bytes: int):
+    if not disk_weights_enabled() or required_bytes <= 0:
+        return
+    usable_before = usable_free_memory(target_device)
+    if usable_before >= required_bytes:
+        return
+    moved_gpu_to_cpu = 0
+    evicted_cpu_to_meta = 0
+    if target_device.type != "cpu":
+        while usable_free_memory(target_device) < required_bytes:
+            entry = CACHE.pop_lru(device_type="gpu")
+            if entry is None:
+                break
+            moved_gpu_to_cpu += _move_gpu_entry_to_cpu(entry)
+            evicted_cpu_to_meta += _evict_cpu_until_headroom()
+    else:
+        while usable_free_memory(target_device) < required_bytes:
+            evicted = _evict_cpu_entry_to_meta()
+            if evicted == 0:
+                break
+            evicted_cpu_to_meta += evicted
+    usable_after = usable_free_memory(target_device)
+    LOGGER.debug(
+        "Disk weight eviction: target=%s required=%0.2fMB usable_before=%0.2fMB "
+        "usable_after=%0.2fMB moved_gpu_to_cpu=%0.2fMB evicted_cpu_to_meta=%0.2fMB "
+        "headroom_ram=%0.2fMB headroom_vram=%0.2fMB",
+        target_device,
+        required_bytes / (1024 * 1024),
+        usable_before / (1024 * 1024),
+        usable_after / (1024 * 1024),
+        moved_gpu_to_cpu / (1024 * 1024),
+        evicted_cpu_to_meta / (1024 * 1024),
+        RAM_HEADROOM_BYTES / (1024 * 1024),
+        VRAM_HEADROOM_BYTES / (1024 * 1024),
+    )
 
 
 class _BudgetedStateDict(MutableMapping):
@@ -527,8 +667,9 @@ class _BudgetedStateDict(MutableMapping):
             if default is _MISSING:
                 raise KeyError(key)
             return default
+        tensor = self.get_tensor(key)
         self._deleted.add(key)
-        return self.get_tensor(key)
+        return tensor
 
     def meta(self, key: str):
         return self._get_meta(key)
@@ -571,6 +712,10 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
         if refs:
             state = _get_materialization_state(module)
             for ref_name, disk_ref in refs.items():
+                if ref_name in module._parameters:
+                    _wait_for_pinned_tensor(module._parameters.get(ref_name))
+                elif ref_name in module._buffers:
+                    _wait_for_pinned_tensor(module._buffers.get(ref_name))
                 shape = getattr(disk_ref.meta, "shape", None)
                 dtype = _get_future_dtype(module, ref_name) or getattr(disk_ref.meta, "dtype", None)
                 if shape is None or dtype is None:
@@ -593,6 +738,10 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
     ref = REGISTRY.get(module)
     if not ref or name not in ref:
         return
+    if name in module._parameters:
+        _wait_for_pinned_tensor(module._parameters.get(name))
+    elif name in module._buffers:
+        _wait_for_pinned_tensor(module._buffers.get(name))
     disk_ref = ref[name]
     shape = getattr(disk_ref.meta, "shape", None)
     dtype = _get_future_dtype(module, name) or getattr(disk_ref.meta, "dtype", None)
@@ -612,6 +761,7 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
             state.deferred_bytes += nbytes
         state.loaded_bytes = max(0, state.loaded_bytes - nbytes)
         _update_disk_state_attrs(module, state)
+    CACHE.remove_entry(module, name)
 
 
 def _find_tensor_device(args, kwargs) -> Optional[torch.device]:
@@ -692,7 +842,7 @@ def ensure_module_materialized(
             _set_future_dtype(module, name, dtype_override)
     _rebuild_materialization_state(module, refs, state)
     free_mem_start = _device_free_memory(target_device)
-    remaining_budget = free_mem_start
+    remaining_budget = usable_free_memory(target_device)
     for name in sorted(refs.keys()):
         disk_ref = refs[name]
         if name in module._parameters:
@@ -709,27 +859,26 @@ def ensure_module_materialized(
         if current.device.type != "meta" and current.device == target_device and (
             target_dtype is None or current.dtype == target_dtype
         ):
-            if current.device.type == "cpu":
-                CACHE.touch(module, name)
+            CACHE.touch(module, name)
             continue
         meta_nbytes = _meta_nbytes(disk_ref.meta)
         if meta_nbytes is None:
             continue
         required_bytes = meta_nbytes
-        if target_device.type == "cpu":
-            free_mem = _maybe_free_ram_budget(target_device, required_bytes)
-            remaining_budget = min(remaining_budget, free_mem)
+        target_for_load = target_device
+        if required_bytes > remaining_budget:
+            evict_for_budget(target_device, required_bytes)
+            remaining_budget = usable_free_memory(target_device)
         if required_bytes > remaining_budget:
             if fallback_device is not None and fallback_device != target_device:
-                fallback_free = _maybe_free_ram_budget(fallback_device, required_bytes)
-                if fallback_free >= required_bytes:
+                evict_for_budget(fallback_device, required_bytes)
+                if usable_free_memory(fallback_device) >= required_bytes:
                     target_for_load = fallback_device
                 else:
                     continue
             else:
                 continue
-        else:
-            target_for_load = target_device
+        evict_for_budget(target_for_load, required_bytes)
         if current.device.type == "meta":
             tensor = disk_ref.load(
                 target_for_load,
@@ -738,15 +887,22 @@ def ensure_module_materialized(
                 dtype_override=target_dtype,
             )
         else:
-            if target_dtype is not None and current.dtype != target_dtype:
-                tensor = current.to(device=target_for_load, dtype=target_dtype)
-            else:
-                tensor = current.to(device=target_for_load)
+            _wait_for_pinned_tensor(current)
+            from . import model_management
+            non_blocking = model_management.device_supports_non_blocking(target_for_load)
+            stream = model_management.get_offload_stream(target_for_load)
+            tensor = model_management.cast_to(
+                current,
+                device=target_for_load,
+                dtype=target_dtype,
+                non_blocking=non_blocking,
+                stream=stream,
+            )
         if is_buffer:
             module._buffers[name] = tensor
         else:
             module._parameters[name] = torch.nn.Parameter(tensor, requires_grad=disk_ref.requires_grad)
-        if tensor.device.type == "cpu":
+        if tensor.device.type != "meta":
             CACHE.record(module, name, tensor, is_buffer=is_buffer)
         remaining_budget = max(0, remaining_budget - required_bytes)
     _rebuild_materialization_state(module, refs, state)
@@ -781,12 +937,6 @@ def attach_disk_weight_hooks(model: torch.nn.Module):
             continue
         module.register_forward_pre_hook(disk_weight_pre_hook)
         module._disk_weight_hook_attached = True
-
-
-def evict_ram_cache(bytes_to_free: int):
-    if bytes_to_free <= 0:
-        return 0
-    return CACHE.evict_bytes(bytes_to_free)
 
 
 def materialize_module_tree(module: torch.nn.Module, target_device: torch.device):
@@ -827,16 +977,43 @@ def _find_existing_device(module: torch.nn.Module) -> Optional[torch.device]:
 
 
 def move_module_tensors(module: torch.nn.Module, device_to: torch.device, dtype_override: Optional[torch.dtype] = None):
-    def _move(tensor):
-        if tensor is None:
-            return None
-        if tensor.device.type == "meta":
-            return tensor
-        if dtype_override is not None and tensor.dtype != dtype_override:
-            return tensor.to(device=device_to, dtype=dtype_override)
-        return tensor.to(device=device_to)
-
-    module._apply(_move)
+    from . import model_management
+    non_blocking = model_management.device_supports_non_blocking(device_to)
+    stream = model_management.get_offload_stream(device_to)
+    for name, param in module.named_parameters(recurse=True):
+        if param is None or param.device.type == "meta":
+            continue
+        target_dtype = dtype_override if dtype_override is not None else None
+        if param.device == device_to and (target_dtype is None or param.dtype == target_dtype):
+            continue
+        _wait_for_pinned_tensor(param)
+        tensor = model_management.cast_to(
+            param,
+            device=device_to,
+            dtype=target_dtype,
+            non_blocking=non_blocking,
+            stream=stream,
+        )
+        _replace_tensor(module, name, tensor, is_buffer=False, requires_grad=param.requires_grad)
+        if tensor.device.type != "meta":
+            CACHE.record(module, name, tensor, is_buffer=False)
+    for name, buf in module.named_buffers(recurse=True):
+        if buf is None or buf.device.type == "meta":
+            continue
+        target_dtype = dtype_override if dtype_override is not None else None
+        if buf.device == device_to and (target_dtype is None or buf.dtype == target_dtype):
+            continue
+        _wait_for_pinned_tensor(buf)
+        tensor = model_management.cast_to(
+            buf,
+            device=device_to,
+            dtype=target_dtype,
+            non_blocking=non_blocking,
+            stream=stream,
+        )
+        _replace_tensor(module, name, tensor, is_buffer=True, requires_grad=False)
+        if tensor.device.type != "meta":
+            CACHE.record(module, name, tensor, is_buffer=True)
     return module
 
 
@@ -875,10 +1052,10 @@ def module_to(module: torch.nn.Module, *args, **kwargs):
             return module
         if allow_materialize:
             materialize_module_tree(module, target_device)
-            return module.to(*args, **kwargs)
+            return BASE_MODULE_TO(module, *args, **kwargs)
         dtype_override = _extract_to_dtype(args, kwargs)
         return move_module_tensors(module, target_device, dtype_override=dtype_override)
-    return module.to(*args, **kwargs)
+    return BASE_MODULE_TO(module, *args, **kwargs)
 
 
 def load_module_tensor(
@@ -909,10 +1086,17 @@ def load_module_tensor(
         _set_future_dtype(module, name, dtype_override)
     if current.device.type != "meta":
         if current.device != device or (target_dtype is not None and current.dtype != target_dtype):
-            if target_dtype is not None and current.dtype != target_dtype:
-                tensor = current.to(device=device, dtype=target_dtype)
-            else:
-                tensor = current.to(device=device)
+            _wait_for_pinned_tensor(current)
+            from . import model_management
+            non_blocking = model_management.device_supports_non_blocking(device)
+            stream = model_management.get_offload_stream(device)
+            tensor = model_management.cast_to(
+                current,
+                device=device,
+                dtype=target_dtype,
+                non_blocking=non_blocking,
+                stream=stream,
+            )
             if not temporary:
                 if is_buffer:
                     module._buffers[name] = tensor
@@ -927,13 +1111,13 @@ def load_module_tensor(
     if required_bytes is None:
         return current
     free_mem_start = _device_free_memory(device)
-    free_mem = _maybe_free_ram_budget(device, required_bytes)
     load_device = device
-    if free_mem < required_bytes and allow_alternate:
+    evict_for_budget(device, required_bytes)
+    if usable_free_memory(device) < required_bytes and allow_alternate:
         alt = _choose_alternate_device(device)
         if alt is not None:
-            alt_free = _maybe_free_ram_budget(alt, required_bytes)
-            if alt_free >= required_bytes:
+            evict_for_budget(alt, required_bytes)
+            if usable_free_memory(alt) >= required_bytes:
                 load_device = alt
             else:
                 state = _get_materialization_state(module)
@@ -951,7 +1135,7 @@ def load_module_tensor(
             _update_disk_state_attrs(module, state)
             _log_materialization(module, device, free_mem_start, refs, state, "Disk weight deferred")
             return current
-    elif free_mem < required_bytes:
+    elif usable_free_memory(device) < required_bytes:
         state = _get_materialization_state(module)
         if name not in state.deferred_keys:
             state.deferred_keys.add(name)
@@ -967,7 +1151,7 @@ def load_module_tensor(
         module._buffers[name] = tensor
     else:
         module._parameters[name] = torch.nn.Parameter(tensor, requires_grad=disk_ref.requires_grad)
-    if tensor.device.type == "cpu" and record_cache:
+    if tensor.device.type != "meta" and record_cache:
         CACHE.record(module, name, tensor, is_buffer=is_buffer)
     state = _get_materialization_state(module)
     _rebuild_materialization_state(module, refs, state)
@@ -1015,7 +1199,7 @@ def _materialize_module_from_state_dict(
         if key in lazy_state.state_dict and buf is not None and buf.device.type != "meta":
             existing[key] = buf
     free_mem_start = _device_free_memory(target_device)
-    remaining_budget = free_mem_start
+    remaining_budget = usable_free_memory(target_device)
     allowed = set(existing.keys())
     for key in keys:
         if key in allowed:
@@ -1024,9 +1208,9 @@ def _materialize_module_from_state_dict(
         required = _meta_nbytes(meta)
         if required is None:
             continue
-        if target_device.type == "cpu":
-            free_mem = _maybe_free_ram_budget(target_device, required)
-            remaining_budget = min(remaining_budget, free_mem)
+        if required > remaining_budget:
+            evict_for_budget(target_device, required)
+            remaining_budget = usable_free_memory(target_device)
         if required <= remaining_budget:
             allowed.add(key)
             remaining_budget = max(0, remaining_budget - required)
@@ -1068,10 +1252,10 @@ def _materialize_module_from_state_dict(
     lazy_state.loaded = len(deferred_state_dict_keys) == 0
     _log_materialization(module, target_device, free_mem_start, refs, state, "Disk weight streamed")
     for name, param in module.named_parameters(recurse=False):
-        if param.device.type == "cpu":
+        if param.device.type != "meta":
             CACHE.record(module, name, param, is_buffer=False)
     for name, buf in module.named_buffers(recurse=False):
-        if buf is not None and buf.device.type == "cpu":
+        if buf is not None and buf.device.type != "meta":
             CACHE.record(module, name, buf, is_buffer=True)
 
 

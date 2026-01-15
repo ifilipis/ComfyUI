@@ -245,11 +245,16 @@ class _SafeTensorFile:
         buffer_length = 0
         buf_ptr = None
         gbuf = None
+        file_length = self.index.size_bytes
         try:
             chunk_offset = 0
             while chunk_offset < length:
                 chunk_len = min(length - chunk_offset, chunk_bytes)
                 aligned_offset, aligned_length, head = self._aligned_range(abs_start + chunk_offset, chunk_len)
+                if aligned_offset + aligned_length > file_length:
+                    aligned_length = max(0, file_length - aligned_offset)
+                if aligned_length < head + chunk_len:
+                    raise RuntimeError("Aligned read does not cover requested tensor range")
                 needed = aligned_length + ptr_align
                 if buf_ptr is None or needed > buffer_length:
                     if buf_ptr is not None:
@@ -272,8 +277,9 @@ class _SafeTensorFile:
         if buf_ptr is not None:
             fst.cpp.cpu_free(buf_ptr)
         if dtype is not None and dtype != dest_tensor.dtype:
-            _validate_dtype_conversion(dest_tensor.dtype, dtype)
-            dest_tensor = dest_tensor.to(dtype=dtype)
+            converted = dest_tensor.to(dtype=dtype)
+            converted._comfy_source_tensor = dest_tensor
+            dest_tensor = converted
         return dest_tensor
 
     def _read_tensor_gds(
@@ -306,8 +312,9 @@ class _SafeTensorFile:
             fst, framework, gbuf.get_base_address() + ptr_off + head, meta, device, owner
         )
         if dtype is not None and dtype != tensor.dtype:
-            _validate_dtype_conversion(tensor.dtype, dtype)
-            tensor = tensor.to(dtype=dtype)
+            converted = tensor.to(dtype=dtype)
+            converted._comfy_source_tensor = tensor
+            tensor = converted
         return tensor
 
 
@@ -345,11 +352,6 @@ def _dlpack_tensor_from_buffer(
     if owner is not None:
         torch_tensor._comfy_disk_buffer_owner = owner
     return torch_tensor
-
-
-def _validate_dtype_conversion(src: torch.dtype, dst: torch.dtype):
-    if torch.tensor([], dtype=dst).element_size() > torch.tensor([], dtype=src).element_size():
-        raise ValueError(f"Online type conversion to larger sizes is not supported ({src} -> {dst})")
 
 
 def _get_gds_o_direct(framework) -> bool:
@@ -456,7 +458,6 @@ class StreamStateDict(collections.abc.MutableMapping):
             if device is not None and t.device != device:
                 t = t.to(device=device)
             if dtype is not None and t.dtype != dtype:
-                _validate_dtype_conversion(t.dtype, dtype)
                 t = t.to(dtype=dtype)
             return t
         if key in self._deleted:
@@ -466,8 +467,6 @@ class StreamStateDict(collections.abc.MutableMapping):
         if device.type == "meta":
             meta = self._index.meta(key)
             target_dtype = dtype or meta.dtype
-            if dtype is not None and dtype != meta.dtype:
-                _validate_dtype_conversion(meta.dtype, dtype)
             return torch.empty(meta.shape, dtype=target_dtype, device="meta")
         if allow_gds is None:
             allow_gds = self._allow_gds
@@ -523,8 +522,9 @@ class StreamStateDict(collections.abc.MutableMapping):
                 raise KeyError(key)
             return default
         if self._index.has(key):
+            tensor = self.get_tensor(key)
             self._deleted.add(key)
-            return self.get_tensor(key)
+            return tensor
         if default is _MISSING:
             raise KeyError(key)
         return default
@@ -568,7 +568,6 @@ class _BaseViewStateDict(MutableMapping):
             if device is not None and t.device != device:
                 t = t.to(device=device)
             if dtype is not None and t.dtype != dtype:
-                _validate_dtype_conversion(t.dtype, dtype)
                 t = t.to(dtype=dtype)
             return t
         base_key = self._resolve_base_key(key)
@@ -582,7 +581,6 @@ class _BaseViewStateDict(MutableMapping):
         if device is not None and t.device != device:
             t = t.to(device=device)
         if dtype is not None and t.dtype != dtype:
-            _validate_dtype_conversion(t.dtype, dtype)
             t = t.to(dtype=dtype)
         return t
 
@@ -637,7 +635,8 @@ class _BaseViewStateDict(MutableMapping):
                     raise
                 return default
         self._deleted.add(key)
-        return self.get_tensor(key)
+        tensor = self.get_tensor(key)
+        return tensor
 
     def meta(self, key: str):
         if key in self._overrides:
@@ -769,7 +768,8 @@ class DeviceViewStateDict(_BaseViewStateDict):
                     raise
                 return default
         self._deleted.add(key)
-        return self.get_tensor(key)
+        tensor = self.get_tensor(key)
+        return tensor
 
 
 class FilterViewStateDict(_BaseViewStateDict):

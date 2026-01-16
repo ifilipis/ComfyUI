@@ -348,8 +348,7 @@ def _dlpack_tensor_from_buffer(
 
 
 def _validate_dtype_conversion(src: torch.dtype, dst: torch.dtype):
-    if torch.tensor([], dtype=dst).element_size() > torch.tensor([], dtype=src).element_size():
-        raise ValueError(f"Online type conversion to larger sizes is not supported ({src} -> {dst})")
+    return
 
 
 def _get_gds_o_direct(framework) -> bool:
@@ -523,8 +522,9 @@ class StreamStateDict(collections.abc.MutableMapping):
                 raise KeyError(key)
             return default
         if self._index.has(key):
+            value = self.get_tensor(key)
             self._deleted.add(key)
-            return self.get_tensor(key)
+            return value
         if default is _MISSING:
             raise KeyError(key)
         return default
@@ -636,8 +636,9 @@ class _BaseViewStateDict(MutableMapping):
                 if default is _MISSING:
                     raise
                 return default
+        value = self.get_tensor(key)
         self._deleted.add(key)
-        return self.get_tensor(key)
+        return value
 
     def meta(self, key: str):
         if key in self._overrides:
@@ -768,8 +769,9 @@ class DeviceViewStateDict(_BaseViewStateDict):
                 if default is _MISSING:
                     raise
                 return default
+        value = self.get_tensor(key)
         self._deleted.add(key)
-        return self.get_tensor(key)
+        return value
 
 
 class FilterViewStateDict(_BaseViewStateDict):

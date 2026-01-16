@@ -241,6 +241,11 @@ total_vram = get_total_memory(get_torch_device()) / (1024 * 1024)
 total_ram = psutil.virtual_memory().total / (1024 * 1024)
 logging.info("Total VRAM {:0.0f} MB, total RAM {:0.0f} MB".format(total_vram, total_ram))
 
+RAM_HEADROOM_BYTES = 0
+if args.low_ram:
+    RAM_HEADROOM_BYTES = 1024 * 1024 * 1024
+    logging.debug("Low RAM mode: reserving 1024MB system RAM headroom.")
+
 try:
     logging.info("pytorch version: {}".format(torch_version))
     mac_ver = mac_version()
@@ -571,11 +576,14 @@ def offloaded_memory(loaded_models, device):
 
 WINDOWS = any(platform.win32_ver())
 
-EXTRA_RESERVED_VRAM = 400 * 1024 * 1024
-if WINDOWS:
-    EXTRA_RESERVED_VRAM = 600 * 1024 * 1024 #Windows is higher because of the shared vram issue
-    if total_vram > (15 * 1024):  # more extra reserved vram on 16GB+ cards
-        EXTRA_RESERVED_VRAM += 100 * 1024 * 1024
+if args.low_ram:
+    EXTRA_RESERVED_VRAM = 0
+else:
+    EXTRA_RESERVED_VRAM = 400 * 1024 * 1024
+    if WINDOWS:
+        EXTRA_RESERVED_VRAM = 600 * 1024 * 1024 #Windows is higher because of the shared vram issue
+        if total_vram > (15 * 1024):  # more extra reserved vram on 16GB+ cards
+            EXTRA_RESERVED_VRAM += 100 * 1024 * 1024
 
 if args.reserve_vram is not None:
     EXTRA_RESERVED_VRAM = args.reserve_vram * 1024 * 1024 * 1024
@@ -1121,6 +1129,18 @@ def sync_stream(device, stream):
         return
     current_stream(device).wait_stream(stream)
 
+def sync_offload_streams(device=None):
+    if device is not None:
+        devices = [device]
+    else:
+        devices = list(STREAMS.keys())
+    for dev in devices:
+        streams = STREAMS.get(dev)
+        if not streams:
+            continue
+        for stream in streams:
+            stream.synchronize()
+
 def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, stream=None):
     if device is None or weight.device == device:
         if not copy:
@@ -1165,8 +1185,7 @@ if not args.disable_pinned_memory:
 
 WEIGHTS_RAM_CACHE_BYTES = 0
 WEIGHTS_GDS_ENABLED = bool(args.weights_gds)
-if args.weights_ram_cache_gb is not None:
-    WEIGHTS_RAM_CACHE_BYTES = int(max(0.0, args.weights_ram_cache_gb) * (1024 ** 3))
+if args.low_ram:
     comfy.disk_weights.configure(
         WEIGHTS_RAM_CACHE_BYTES,
         allow_gds=WEIGHTS_GDS_ENABLED,
@@ -1333,7 +1352,7 @@ def get_free_memory(dev=None, torch_free_too=False):
         mem_free_total = sys.maxsize
         mem_free_torch = mem_free_total
     elif hasattr(dev, 'type') and (dev.type == 'cpu' or dev.type == 'mps'):
-        mem_free_total = psutil.virtual_memory().available
+        mem_free_total = max(0, psutil.virtual_memory().available - RAM_HEADROOM_BYTES)
         mem_free_torch = mem_free_total
     else:
         if directml_enabled:

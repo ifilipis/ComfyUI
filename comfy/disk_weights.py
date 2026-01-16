@@ -368,6 +368,10 @@ def _device_free_memory(device: torch.device) -> int:
     from . import model_management
     return int(model_management.get_free_memory(device))
 
+def _sync_offload_streams():
+    from . import model_management
+    model_management.sync_offload_streams()
+
 
 def _evict_ram_for_budget(required_bytes: int) -> int:
     if required_bytes <= 0:
@@ -376,12 +380,19 @@ def _evict_ram_for_budget(required_bytes: int) -> int:
     if freed < required_bytes:
         from . import model_management
         freed += model_management.evict_ram_to_disk(required_bytes - freed)
+    if freed > 0:
+        LOGGER.debug("Disk weight RAM budget freed %.2f MB", freed / (1024 * 1024))
     return freed
 
 
 def _maybe_free_ram_budget(device: torch.device, required_bytes: int) -> int:
     free_mem = _device_free_memory(device)
     if device.type == "cpu" and free_mem < required_bytes:
+        LOGGER.debug(
+            "Disk weight RAM limit detected: need %.2f MB, free %.2f MB",
+            required_bytes / (1024 * 1024),
+            free_mem / (1024 * 1024),
+        )
         _evict_ram_for_budget(required_bytes - free_mem)
         free_mem = _device_free_memory(device)
     return free_mem
@@ -527,8 +538,9 @@ class _BudgetedStateDict(MutableMapping):
             if default is _MISSING:
                 raise KeyError(key)
             return default
+        value = self.get_tensor(key)
         self._deleted.add(key)
-        return self.get_tensor(key)
+        return value
 
     def meta(self, key: str):
         return self._get_meta(key)
@@ -564,6 +576,7 @@ def register_lazy_modules(model: torch.nn.Module, state_dict):
 
 
 def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
+    _sync_offload_streams()
     lazy_state = LAZY_MODULE_STATE.get(module)
     if lazy_state is not None:
         CACHE.remove_module(module)
@@ -693,6 +706,7 @@ def ensure_module_materialized(
     _rebuild_materialization_state(module, refs, state)
     free_mem_start = _device_free_memory(target_device)
     remaining_budget = free_mem_start
+    synced = False
     for name in sorted(refs.keys()):
         disk_ref = refs[name]
         if name in module._parameters:
@@ -731,6 +745,9 @@ def ensure_module_materialized(
         else:
             target_for_load = target_device
         if current.device.type == "meta":
+            if not synced:
+                _sync_offload_streams()
+                synced = True
             tensor = disk_ref.load(
                 target_for_load,
                 ALLOW_GDS,
@@ -738,6 +755,9 @@ def ensure_module_materialized(
                 dtype_override=target_dtype,
             )
         else:
+            if not synced:
+                _sync_offload_streams()
+                synced = True
             if target_dtype is not None and current.dtype != target_dtype:
                 tensor = current.to(device=target_for_load, dtype=target_dtype)
             else:
@@ -827,6 +847,7 @@ def _find_existing_device(module: torch.nn.Module) -> Optional[torch.device]:
 
 
 def move_module_tensors(module: torch.nn.Module, device_to: torch.device, dtype_override: Optional[torch.dtype] = None):
+    _sync_offload_streams()
     def _move(tensor):
         if tensor is None:
             return None

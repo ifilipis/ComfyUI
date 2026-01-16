@@ -278,7 +278,6 @@ class _SafeTensorFile:
             fst.cpp.cpu_free(buf_ptr)
         if dtype is not None and dtype != dest_tensor.dtype:
             converted = dest_tensor.to(dtype=dtype)
-            converted._comfy_source_tensor = dest_tensor
             dest_tensor = converted
         return dest_tensor
 
@@ -313,7 +312,9 @@ class _SafeTensorFile:
         )
         if dtype is not None and dtype != tensor.dtype:
             converted = tensor.to(dtype=dtype)
-            converted._comfy_source_tensor = tensor
+            owner = getattr(tensor, "_comfy_disk_buffer_owner", None)
+            if owner is not None:
+                converted._comfy_disk_buffer_owner = owner
             tensor = converted
         return tensor
 
@@ -364,6 +365,31 @@ def _get_gds_o_direct(framework) -> bool:
                 return not (cudavers[0] > 12 or (cudavers[0] == 12 and cudavers[1] >= 2))
             return True
     return True
+
+
+def _aligned_range(abs_start: int, *, head: int, length: int, align: int) -> Tuple[int, int, int]:
+    aligned_offset = (abs_start // align) * align
+    aligned_length = length + head
+    tail = aligned_length % align
+    if tail:
+        aligned_length += align - tail
+    aligned_end = aligned_offset + aligned_length
+    return aligned_offset, aligned_end, aligned_length
+
+
+def gds_alloc_bytes(meta: TensorMeta) -> int:
+    fst = _init_fastsafetensors_lib()
+    framework = fst.frameworks.get_framework_op("pytorch")
+    alignment_size = framework.get_alignment_size()
+    header_length = meta.data_offsets[0]
+    _, _, aligned_length = _aligned_range(
+        header_length,
+        head=meta.data_offsets[0],
+        length=meta.nbytes,
+        align=alignment_size,
+    )
+    ptr_align = 256
+    return aligned_length + ptr_align
 
 
 def _ensure_gds_ready(device: torch.device):
@@ -618,6 +644,24 @@ class _BaseViewStateDict(MutableMapping):
     def __len__(self) -> int:
         base_keys = list(self._iter_base_keys())
         return len(base_keys) - len(self._deleted) + len(self._overrides)
+
+    def __contains__(self, key: object) -> bool:
+        if key in self._overrides:
+            return key not in self._deleted
+        if not isinstance(key, str):
+            return False
+        if key in self._deleted:
+            return False
+        base_key = self._resolve_base_key(key)
+        if base_key is None:
+            return False
+        if hasattr(self._base, "__contains__"):
+            return base_key in self._base
+        try:
+            self._base[base_key]
+        except KeyError:
+            return False
+        return True
 
     def pop(self, key: str, default: object = _MISSING) -> torch.Tensor:
         if key in self._overrides:

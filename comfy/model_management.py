@@ -489,7 +489,7 @@ class LoadedModel:
 
     def model_loaded_memory(self):
         if comfy.disk_weights.disk_weights_enabled():
-            return comfy.disk_weights.module_loaded_bytes(self.model.model)
+            return comfy.disk_weights.module_loaded_bytes_on_device(self.model.model, self.device)
         return self.model.loaded_size()
 
     def model_offloaded_memory(self):
@@ -1397,6 +1397,13 @@ def get_free_memory(dev=None, torch_free_too=False):
         return (mem_free_total, mem_free_torch)
     else:
         return mem_free_total
+
+
+def get_cuda_driver_free_memory(dev=None):
+    if dev is None:
+        dev = get_torch_device()
+    mem_free_cuda, _ = torch.cuda.mem_get_info(dev)
+    return mem_free_cuda
 
 def cpu_mode():
     global cpu_state

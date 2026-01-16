@@ -217,11 +217,9 @@ class ModelPatcher:
     def __init__(self, model, load_device, offload_device, size=0, weight_inplace_update=False):
         self.size = size
         self.model = model
-        if not hasattr(self.model, 'device'):
-            logging.debug("Model doesn't have a device attribute.")
-            self.model.device = offload_device
-        elif self.model.device is None:
-            self.model.device = offload_device
+        default_device = load_device if comfy.disk_weights.disk_weights_enabled() else offload_device
+        if not hasattr(self.model, 'device') or self.model.device is None:
+            self.model.device = default_device
 
         self.patches = {}
         self.backup = {}
@@ -283,7 +281,7 @@ class ModelPatcher:
 
     def loaded_size(self):
         if comfy.disk_weights.disk_weights_enabled():
-            return comfy.disk_weights.module_loaded_bytes(self.model)
+            return comfy.disk_weights.module_loaded_bytes_on_device(self.model, torch.device(self.model.device))
         return self.model.model_loaded_weight_memory
 
     def lowvram_patch_counter(self):
@@ -809,7 +807,7 @@ class ModelPatcher:
             self.model.device = device_to
             if comfy.disk_weights.disk_weights_enabled():
                 # Root cause #3: use disk_weights as the single source of truth for loaded bytes.
-                mem_counter = comfy.disk_weights.module_loaded_bytes(self.model)
+                mem_counter = comfy.disk_weights.module_loaded_bytes_on_device(self.model, device_to)
             self.model.model_loaded_weight_memory = mem_counter
             self.model.model_offload_buffer_memory = offload_buffer
             self.model.current_weight_patches_uuid = self.patches_uuid
@@ -977,7 +975,11 @@ class ModelPatcher:
 
             self.model.model_lowvram = True
             self.model.lowvram_patch_counter += patch_counter
-            self.model.model_loaded_weight_memory -= memory_freed
+            self.model.device = device_to
+            if comfy.disk_weights.disk_weights_enabled():
+                self.model.model_loaded_weight_memory = comfy.disk_weights.module_loaded_bytes_on_device(self.model, device_to)
+            else:
+                self.model.model_loaded_weight_memory -= memory_freed
             self.model.model_offload_buffer_memory = offload_buffer
             target_label = "disk" if device_to is not None and device_to.type == "meta" else device_to
             logging.info("Unloaded partially to {}: {:.2f} MB freed, {:.2f} MB remains loaded, {:.2f} MB buffer reserved, lowvram patches: {}".format(target_label, memory_freed / (1024 * 1024), self.model.model_loaded_weight_memory / (1024 * 1024), offload_buffer / (1024 * 1024), self.model.lowvram_patch_counter))
@@ -998,15 +1000,17 @@ class ModelPatcher:
                 return 0
             full_load = False
             if comfy.disk_weights.disk_weights_enabled():
-                loaded = comfy.disk_weights.module_loaded_bytes(self.model)
+                self.model.device = device_to
+                loaded = comfy.disk_weights.module_loaded_bytes_on_device(self.model, device_to)
                 total = comfy.disk_weights.module_total_bytes(self.model)
                 if self.model.model_lowvram is False and loaded == total:
                     self.apply_hooks(self.forced_hooks, force_apply=True)
                     return 0
                 if loaded < total:
                     # Root cause #3: avoid treating partially materialized models as fully loaded.
-                    comfy.disk_weights.materialize_module_tree(self.model, device_to)
-                    self.model.model_loaded_weight_memory = comfy.disk_weights.module_loaded_bytes(self.model)
+                    fallback_device = torch.device("cpu") if device_to.type != "cpu" else None
+                    comfy.disk_weights.materialize_module_tree(self.model, device_to, fallback_device=fallback_device)
+                    self.model.model_loaded_weight_memory = comfy.disk_weights.module_loaded_bytes_on_device(self.model, device_to)
             elif self.model.model_lowvram == False and self.model.model_loaded_weight_memory > 0:
                 self.apply_hooks(self.forced_hooks, force_apply=True)
                 return 0

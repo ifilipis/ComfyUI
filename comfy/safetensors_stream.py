@@ -37,6 +37,7 @@ _FST_LOADED = False
 _GDS_INITIALIZED = False
 _MISSING = object()
 _NOGDS_CHUNK_BYTES_DEFAULT = 64 * 1024 * 1024
+_PINNED_INFLIGHT = collections.deque()
 
 
 def _require_fastsafetensors():
@@ -205,13 +206,22 @@ class _SafeTensorFile:
             return tensor
 
         cpu_tensor = self._read_tensor_nogds(
-            fst, framework, meta, torch.device("cpu"), dtype
+            fst,
+            framework,
+            meta,
+            torch.device("cpu"),
+            dtype,
+            pin_memory=device_is_cuda and pin_if_cpu,
         )
         if device_is_cuda:
-            if pin_if_cpu:
-                cpu_tensor = cpu_tensor.pin_memory()
             gpu_tensor = torch.empty_like(cpu_tensor, device=device)
+            if pin_if_cpu:
+                _reap_pinned_inflight()
             gpu_tensor.copy_(cpu_tensor, non_blocking=pin_if_cpu)
+            if pin_if_cpu:
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(device))
+                _PINNED_INFLIGHT.append((event, cpu_tensor))
             return gpu_tensor
         return cpu_tensor
 
@@ -233,6 +243,7 @@ class _SafeTensorFile:
         meta: TensorMeta,
         device: torch.device,
         dtype: Optional[torch.dtype],
+        pin_memory: bool,
     ) -> torch.Tensor:
         fd = self._ensure_fd()
         reader = self._ensure_nogds_reader(use_cuda=False)
@@ -241,7 +252,13 @@ class _SafeTensorFile:
         chunk_bytes = int(os.getenv("COMFY_SAFETENSORS_NOGDS_CHUNK_BYTES", _NOGDS_CHUNK_BYTES_DEFAULT))
         chunk_bytes = max(1, chunk_bytes)
         ptr_align = framework.get_device_ptr_align()
-        dest_tensor = torch.empty_strided(meta.shape, meta.strides, dtype=meta.dtype, device="cpu")
+        dest_tensor = torch.empty_strided(
+            meta.shape,
+            meta.strides,
+            dtype=meta.dtype,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
         buffer_length = 0
         buf_ptr = None
         gbuf = None
@@ -250,6 +267,8 @@ class _SafeTensorFile:
             while chunk_offset < length:
                 chunk_len = min(length - chunk_offset, chunk_bytes)
                 aligned_offset, aligned_length, head = self._aligned_range(abs_start + chunk_offset, chunk_len)
+                file_end = self.index.size_bytes
+                aligned_length = max(0, min(aligned_length, file_end - aligned_offset))
                 needed = aligned_length + ptr_align
                 if buf_ptr is None or needed > buffer_length:
                     if buf_ptr is not None:
@@ -272,8 +291,9 @@ class _SafeTensorFile:
         if buf_ptr is not None:
             fst.cpp.cpu_free(buf_ptr)
         if dtype is not None and dtype != dest_tensor.dtype:
-            _validate_dtype_conversion(dest_tensor.dtype, dtype)
             dest_tensor = dest_tensor.to(dtype=dtype)
+            if pin_memory:
+                dest_tensor = dest_tensor.pin_memory()
         return dest_tensor
 
     def _read_tensor_gds(
@@ -289,6 +309,8 @@ class _SafeTensorFile:
         abs_start = self.index.header_length + meta.data_offsets[0]
         length = meta.data_offsets[1] - meta.data_offsets[0]
         aligned_offset, aligned_length, head = self._aligned_range(abs_start, length)
+        file_end = self.index.size_bytes
+        aligned_length = max(0, min(aligned_length, file_end - aligned_offset))
         ptr_align = framework.get_device_ptr_align()
         buffer_length = aligned_length + ptr_align
         fst_device = _fst_device_from_torch(fst, device)
@@ -306,7 +328,6 @@ class _SafeTensorFile:
             fst, framework, gbuf.get_base_address() + ptr_off + head, meta, device, owner
         )
         if dtype is not None and dtype != tensor.dtype:
-            _validate_dtype_conversion(tensor.dtype, dtype)
             tensor = tensor.to(dtype=dtype)
         return tensor
 
@@ -347,11 +368,6 @@ def _dlpack_tensor_from_buffer(
     return torch_tensor
 
 
-def _validate_dtype_conversion(src: torch.dtype, dst: torch.dtype):
-    if torch.tensor([], dtype=dst).element_size() > torch.tensor([], dtype=src).element_size():
-        raise ValueError(f"Online type conversion to larger sizes is not supported ({src} -> {dst})")
-
-
 def _get_gds_o_direct(framework) -> bool:
     cuda_ver = framework.get_cuda_ver()
     if cuda_ver and cuda_ver != "0.0":
@@ -388,6 +404,17 @@ def _ensure_gds_ready(device: torch.device):
             "Disable GPUDirect by omitting --weights-gds to use disk->RAM->GPU."
         )
     _init_gds()
+
+
+def _reap_pinned_inflight():
+    if not _PINNED_INFLIGHT:
+        return
+    while _PINNED_INFLIGHT:
+        event, _ = _PINNED_INFLIGHT[0]
+        if event.query():
+            _PINNED_INFLIGHT.popleft()
+        else:
+            break
 
 
 class StreamStateDict(collections.abc.MutableMapping):
@@ -456,7 +483,6 @@ class StreamStateDict(collections.abc.MutableMapping):
             if device is not None and t.device != device:
                 t = t.to(device=device)
             if dtype is not None and t.dtype != dtype:
-                _validate_dtype_conversion(t.dtype, dtype)
                 t = t.to(dtype=dtype)
             return t
         if key in self._deleted:
@@ -466,8 +492,6 @@ class StreamStateDict(collections.abc.MutableMapping):
         if device.type == "meta":
             meta = self._index.meta(key)
             target_dtype = dtype or meta.dtype
-            if dtype is not None and dtype != meta.dtype:
-                _validate_dtype_conversion(meta.dtype, dtype)
             return torch.empty(meta.shape, dtype=target_dtype, device="meta")
         if allow_gds is None:
             allow_gds = self._allow_gds
@@ -523,8 +547,10 @@ class StreamStateDict(collections.abc.MutableMapping):
                 raise KeyError(key)
             return default
         if self._index.has(key):
+            value = self.get_tensor(key)
             self._deleted.add(key)
-            return self.get_tensor(key)
+            self._overrides.pop(key, None)
+            return value
         if default is _MISSING:
             raise KeyError(key)
         return default
@@ -568,7 +594,6 @@ class _BaseViewStateDict(MutableMapping):
             if device is not None and t.device != device:
                 t = t.to(device=device)
             if dtype is not None and t.dtype != dtype:
-                _validate_dtype_conversion(t.dtype, dtype)
                 t = t.to(dtype=dtype)
             return t
         base_key = self._resolve_base_key(key)
@@ -582,7 +607,6 @@ class _BaseViewStateDict(MutableMapping):
         if device is not None and t.device != device:
             t = t.to(device=device)
         if dtype is not None and t.dtype != dtype:
-            _validate_dtype_conversion(t.dtype, dtype)
             t = t.to(dtype=dtype)
         return t
 
@@ -636,8 +660,10 @@ class _BaseViewStateDict(MutableMapping):
                 if default is _MISSING:
                     raise
                 return default
+        value = self.get_tensor(key)
         self._deleted.add(key)
-        return self.get_tensor(key)
+        self._overrides.pop(key, None)
+        return value
 
     def meta(self, key: str):
         if key in self._overrides:
@@ -768,8 +794,10 @@ class DeviceViewStateDict(_BaseViewStateDict):
                 if default is _MISSING:
                     raise
                 return default
+        value = self.get_tensor(key)
         self._deleted.add(key)
-        return self.get_tensor(key)
+        self._overrides.pop(key, None)
+        return value
 
 
 class FilterViewStateDict(_BaseViewStateDict):
@@ -932,3 +960,48 @@ class MappedStateDict(_BaseViewStateDict):
 
     def _iter_base_keys(self) -> Iterable[str]:
         return self._view_to_base.keys()
+
+
+def stream_load_state_dict(model, state_dict, strict: bool = False, assign: bool = False):
+    if getattr(state_dict, "is_stream_state_dict", False) and hasattr(state_dict, "copy"):
+        state_dict = state_dict.copy()
+    missing_keys = []
+    unexpected_keys = []
+    error_msgs = []
+    metadata = getattr(state_dict, "_metadata", None)
+
+    def load(module, local_state_dict, prefix=""):
+        local_metadata = {} if metadata is None else metadata.get(prefix[:-1], {})
+        if assign:
+            local_metadata["assign_to_params_buffers"] = assign
+        module._load_from_state_dict(
+            local_state_dict,
+            prefix,
+            local_metadata,
+            True,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        for name, child in module._modules.items():
+            if child is not None:
+                child_prefix = f"{prefix}{name}."
+                child_state_dict = FilterViewStateDict(
+                    local_state_dict, lambda k, p=child_prefix: k.startswith(p), mutate_base=False
+                )
+                load(child, child_state_dict, child_prefix)
+        incompatible = torch.nn.modules.module._IncompatibleKeys(missing_keys, unexpected_keys)
+        for hook in module._load_state_dict_post_hooks.values():
+            out = hook(module, incompatible)
+            if out is not None:
+                raise RuntimeError("load_state_dict post hook returned a value, which is unsupported.")
+
+    load(model, state_dict)
+    if strict:
+        if len(unexpected_keys) > 0:
+            error_msgs.insert(0, 'Unexpected key(s) in state_dict: {}. '.format(', '.join(f'"{k}"' for k in unexpected_keys)))
+        if len(missing_keys) > 0:
+            error_msgs.insert(0, 'Missing key(s) in state_dict: {}. '.format(', '.join(f'"{k}"' for k in missing_keys)))
+    if len(error_msgs) > 0:
+        raise RuntimeError('Error(s) in loading state_dict for {}:\n\t{}'.format(model.__class__.__name__, "\n\t".join(error_msgs)))
+    return torch.nn.modules.module._IncompatibleKeys(missing_keys, unexpected_keys)

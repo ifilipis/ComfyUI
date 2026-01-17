@@ -589,8 +589,21 @@ def minimum_inference_memory():
 
 def free_memory(memory_required, device, keep_loaded=[]):
     cleanup_models_gc()
+    free_before = get_free_memory(device)
+    if free_before < memory_required:
+        headroom = 0
+        if is_device_cpu(device) and comfy.disk_weights.disk_weights_enabled():
+            headroom = comfy.disk_weights.RAM_HEADROOM_BYTES
+        elif is_device_cuda(device):
+            headroom = extra_reserved_memory()
+        logging.debug(
+            "Memory pressure detected: device=%s required_bytes=%d free_bytes=%d headroom_bytes=%d",
+            device,
+            memory_required,
+            free_before,
+            headroom,
+        )
     if is_device_cpu(device) and comfy.disk_weights.disk_weights_enabled():
-        logging.info("RAM pressure: requested %.2f MB, free %.2f MB", memory_required / (1024 * 1024), get_free_memory(device) / (1024 * 1024))
         freed_cache = comfy.disk_weights.evict_ram_cache(memory_required)
         if freed_cache < memory_required:
             evict_ram_to_disk(memory_required - freed_cache)
@@ -627,6 +640,14 @@ def free_memory(memory_required, device, keep_loaded=[]):
             mem_free_total, mem_free_torch = get_free_memory(device, torch_free_too=True)
             if mem_free_torch > mem_free_total * 0.25:
                 soft_empty_cache()
+    free_after = get_free_memory(device)
+    if free_after > free_before:
+        logging.debug(
+            "Memory freed: device=%s freed_bytes=%d free_bytes=%d",
+            device,
+            free_after - free_before,
+            free_after,
+        )
     return unloaded_models
 
 
@@ -654,7 +675,7 @@ def evict_ram_to_disk(memory_to_free, keep_loaded=[]):
         freed += current_loaded_models[i].model.partially_unload(torch.device("meta"), memory_needed)
 
     if freed > 0:
-        logging.info("RAM evicted to disk: {:.2f} MB freed".format(freed / (1024 * 1024)))
+        logging.debug("RAM evicted to disk: %.2f MB freed", freed / (1024 * 1024))
     return freed
 
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
@@ -802,6 +823,8 @@ def dtype_size(dtype):
     return dtype_size
 
 def unet_offload_device():
+    if comfy.disk_weights.disk_weights_enabled():
+        return torch.device("meta")
     if vram_state == VRAMState.HIGH_VRAM:
         return get_torch_device()
     else:
@@ -906,6 +929,8 @@ def unet_manual_cast(weight_dtype, inference_device, supported_dtypes=[torch.flo
     return torch.float32
 
 def text_encoder_offload_device():
+    if comfy.disk_weights.disk_weights_enabled():
+        return torch.device("meta")
     if args.gpu_only:
         return get_torch_device()
     else:
@@ -966,6 +991,8 @@ def vae_device():
     return get_torch_device()
 
 def vae_offload_device():
+    if comfy.disk_weights.disk_weights_enabled():
+        return torch.device("meta")
     if args.gpu_only:
         return get_torch_device()
     else:
@@ -1163,14 +1190,12 @@ if not args.disable_pinned_memory:
             MAX_PINNED_MEMORY = get_total_memory(torch.device("cpu")) * 0.95
         logging.info("Enabled pinned memory {}".format(MAX_PINNED_MEMORY // (1024 * 1024)))
 
-WEIGHTS_RAM_CACHE_BYTES = 0
 WEIGHTS_GDS_ENABLED = bool(args.weights_gds)
-if args.weights_ram_cache_gb is not None:
-    WEIGHTS_RAM_CACHE_BYTES = int(max(0.0, args.weights_ram_cache_gb) * (1024 ** 3))
+if args.low_ram:
     comfy.disk_weights.configure(
-        WEIGHTS_RAM_CACHE_BYTES,
         allow_gds=WEIGHTS_GDS_ENABLED,
         pin_if_cpu=not args.disable_pinned_memory,
+        ram_headroom_bytes=1024 * 1024 * 1024,
     )
 
 PINNING_ALLOWED_TYPES = set(["Parameter", "QuantizedTensor"])

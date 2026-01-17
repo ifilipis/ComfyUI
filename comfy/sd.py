@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import torch
+import torch.nn as nn
 from enum import Enum
 import logging
 
@@ -218,7 +219,7 @@ class CLIP:
             if unprojected:
                 self.cond_stage_model.set_clip_options({"projected_pooled": False})
 
-            self.load_model()
+            self.load_model(tokens)
             self.cond_stage_model.set_clip_options({"execution_device": self.patcher.load_device})
             all_hooks.reset()
             self.patcher.patch_hooks(None)
@@ -266,7 +267,7 @@ class CLIP:
         if return_pooled == "unprojected":
             self.cond_stage_model.set_clip_options({"projected_pooled": False})
 
-        self.load_model()
+        self.load_model(tokens)
         self.cond_stage_model.set_clip_options({"execution_device": self.patcher.load_device})
         o = self.cond_stage_model.encode_token_weights(tokens)
         cond, pooled = o[:2]
@@ -299,12 +300,29 @@ class CLIP:
             sd_clip[k] = sd_tokenizer[k]
         return sd_clip
 
-    def load_model(self):
-        model_management.load_model_gpu(self.patcher)
+    def load_model(self, tokens={}):
+        memory_used = 0
+        if hasattr(self.cond_stage_model, "memory_estimation_function"):
+            memory_used = self.cond_stage_model.memory_estimation_function(tokens, device=self.patcher.load_device)
+        model_management.load_models_gpu([self.patcher], memory_required=memory_used)
         return self.patcher
 
     def get_key_patches(self):
         return self.patcher.get_key_patches()
+
+
+class LatentChannelAdapter(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        with torch.no_grad():
+            self.proj.weight.zero_()
+            for i in range(min(in_channels, out_channels)):
+                self.proj.weight[i, i, 0, 0] = 1.0
+
+    def forward(self, x):
+        return self.proj(x)
+
 
 class VAE:
     def __init__(self, sd=None, device=None, config=None, dtype=None, metadata=None):
@@ -324,6 +342,7 @@ class VAE:
         self.latent_dim = 2
         self.output_channels = 3
         self.pad_channel_value = None
+        self.latent_adapter = None
         self.process_input = lambda image: image * 2.0 - 1.0
         self.process_output = lambda image: torch.clamp((image + 1.0) / 2.0, min=0.0, max=1.0)
         self.working_dtypes = [torch.bfloat16, torch.float32]
@@ -476,8 +495,8 @@ class VAE:
                 self.first_stage_model = comfy.ldm.lightricks.vae.causal_video_autoencoder.VideoVAE(version=version, config=vae_config)
                 self.latent_channels = 128
                 self.latent_dim = 3
-                self.memory_used_decode = lambda shape, dtype: (900 * shape[2] * shape[3] * shape[4] * (8 * 8 * 8)) * model_management.dtype_size(dtype)
-                self.memory_used_encode = lambda shape, dtype: (70 * max(shape[2], 7) * shape[3] * shape[4]) * model_management.dtype_size(dtype)
+                self.memory_used_decode = lambda shape, dtype: (1200 * shape[2] * shape[3] * shape[4] * (8 * 8 * 8)) * model_management.dtype_size(dtype)
+                self.memory_used_encode = lambda shape, dtype: (80 * max(shape[2], 7) * shape[3] * shape[4]) * model_management.dtype_size(dtype)
                 self.upscale_ratio = (lambda a: max(0, a * 8 - 7), 32, 32)
                 self.upscale_index_formula = (8, 32, 32)
                 self.downscale_ratio = (lambda a: max(0, math.floor((a + 7) / 8)), 32, 32)
@@ -696,6 +715,14 @@ class VAE:
         if self.first_stage_model is None:
             raise RuntimeError("ERROR: VAE is invalid: None\n\nIf the VAE is from a checkpoint loader node your checkpoint does not contain a valid VAE.")
 
+    def adapt_latent_channels(self, samples):
+        if samples.ndim == 4 and self.latent_channels == 32 and samples.shape[1] == 16:
+            if self.latent_adapter is None:
+                self.latent_adapter = LatentChannelAdapter(16, 32)
+            adapter = self.latent_adapter.to(device=samples.device, dtype=samples.dtype)
+            return adapter(samples)
+        return samples
+
     def vae_encode_crop_pixels(self, pixels):
         if self.crop_input:
             downscale_ratio = self.spacial_compression_encode()
@@ -791,6 +818,7 @@ class VAE:
         do_tile = False
         if self.latent_dim == 2 and samples_in.ndim == 5:
             samples_in = samples_in[:, :, 0]
+        samples_in = self.adapt_latent_channels(samples_in)
         try:
             memory_used = self.memory_used_decode(samples_in.shape, self.vae_dtype)
             model_management.load_models_gpu([self.patcher], memory_required=memory_used, force_full_load=self.disable_offload)
@@ -828,6 +856,7 @@ class VAE:
 
     def decode_tiled(self, samples, tile_x=None, tile_y=None, overlap=None, tile_t=None, overlap_t=None):
         self.throw_exception_if_invalid()
+        samples = self.adapt_latent_channels(samples)
         memory_used = self.memory_used_decode(samples.shape, self.vae_dtype) #TODO: calculate mem required for tile
         model_management.load_models_gpu([self.patcher], memory_required=memory_used, force_full_load=self.disable_offload)
         dims = samples.ndim - 2
@@ -1011,6 +1040,7 @@ class CLIPType(Enum):
     KANDINSKY5 = 22
     KANDINSKY5_IMAGE = 23
     NEWBIE = 24
+    FLUX2 = 25
 
 
 def load_clip(ckpt_paths, embedding_directory=None, clip_type=CLIPType.STABLE_DIFFUSION, model_options={}):
@@ -1043,6 +1073,7 @@ class TEModel(Enum):
     QWEN3_2B = 17
     GEMMA_3_12B = 18
     JINA_CLIP_2 = 19
+    QWEN3_8B = 20
 
 
 def detect_te_model(sd):
@@ -1056,9 +1087,9 @@ def detect_te_model(sd):
         return TEModel.JINA_CLIP_2
     if "encoder.block.23.layer.1.DenseReluDense.wi_1.weight" in sd:
         weight = sd["encoder.block.23.layer.1.DenseReluDense.wi_1.weight"]
-        if weight.shape[-1] == 4096:
+        if weight.shape[0] == 10240:
             return TEModel.T5_XXL
-        elif weight.shape[-1] == 2048:
+        elif weight.shape[0] == 5120:
             return TEModel.T5_XL
     if 'encoder.block.23.layer.1.DenseReluDense.wi.weight' in sd:
         return TEModel.T5_XXL_OLD
@@ -1086,6 +1117,8 @@ def detect_te_model(sd):
                 return TEModel.QWEN3_4B
             elif weight.shape[0] == 2048:
                 return TEModel.QWEN3_2B
+            elif weight.shape[0] == 4096:
+                return TEModel.QWEN3_8B
         if weight.shape[0] == 5120:
             if "model.layers.39.post_attention_layernorm.weight" in sd:
                 return TEModel.MISTRAL3_24B
@@ -1211,11 +1244,18 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
             clip_target.tokenizer = comfy.text_encoders.flux.Flux2Tokenizer
             tokenizer_data["tekken_model"] = clip_data[0].get("tekken_model", None)
         elif te_model == TEModel.QWEN3_4B:
-            clip_target.clip = comfy.text_encoders.z_image.te(**llama_detect(clip_data))
-            clip_target.tokenizer = comfy.text_encoders.z_image.ZImageTokenizer
+            if clip_type == CLIPType.FLUX or clip_type == CLIPType.FLUX2:
+                clip_target.clip = comfy.text_encoders.flux.klein_te(**llama_detect(clip_data), model_type="qwen3_4b")
+                clip_target.tokenizer = comfy.text_encoders.flux.KleinTokenizer
+            else:
+                clip_target.clip = comfy.text_encoders.z_image.te(**llama_detect(clip_data))
+                clip_target.tokenizer = comfy.text_encoders.z_image.ZImageTokenizer
         elif te_model == TEModel.QWEN3_2B:
             clip_target.clip = comfy.text_encoders.ovis.te(**llama_detect(clip_data))
             clip_target.tokenizer = comfy.text_encoders.ovis.OvisTokenizer
+        elif te_model == TEModel.QWEN3_8B:
+            clip_target.clip = comfy.text_encoders.flux.klein_te(**llama_detect(clip_data), model_type="qwen3_8b")
+            clip_target.tokenizer = comfy.text_encoders.flux.KleinTokenizer8B
         elif te_model == TEModel.JINA_CLIP_2:
             clip_target.clip = comfy.text_encoders.jina_clip_2.JinaClip2TextModelWrapper
             clip_target.tokenizer = comfy.text_encoders.jina_clip_2.JinaClip2TokenizerWrapper

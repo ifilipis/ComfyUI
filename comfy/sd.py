@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import torch
 import torch.nn as nn
+from einops import rearrange
 from enum import Enum
 import logging
 
@@ -716,11 +717,15 @@ class VAE:
             raise RuntimeError("ERROR: VAE is invalid: None\n\nIf the VAE is from a checkpoint loader node your checkpoint does not contain a valid VAE.")
 
     def adapt_latent_channels(self, samples):
-        if samples.ndim == 4 and self.latent_channels == 32 and samples.shape[1] == 16:
-            if self.latent_adapter is None:
-                self.latent_adapter = LatentChannelAdapter(16, 32)
-            adapter = self.latent_adapter.to(device=samples.device, dtype=samples.dtype)
-            return adapter(samples)
+        if samples.ndim != 4 or samples.shape[1] != 16:
+            return samples
+        if self.latent_adapter is None:
+            self.latent_adapter = LatentChannelAdapter(16, 32)
+        adapter = self.latent_adapter.to(device=samples.device, dtype=samples.dtype)
+        samples = adapter(samples)
+        if getattr(self.first_stage_model, "bn", None) is not None and getattr(self.first_stage_model, "ps", None) is not None:
+            pi, pj = self.first_stage_model.ps
+            samples = rearrange(samples, "... c (i pi) (j pj) -> ... (c pi pj) i j", pi=pi, pj=pj)
         return samples
 
     def vae_encode_crop_pixels(self, pixels):

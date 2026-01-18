@@ -467,7 +467,11 @@ def _ensure_free_memory(device: torch.device, required_bytes: int, headroom_byte
         safetensors_stream._reap_pinned_inflight()
         from . import model_management
         model_management._reap_pinned_inflight()
-        model_management.free_memory(required_bytes + headroom_bytes, device)
+        model_management.free_memory(
+            required_bytes + headroom_bytes,
+            device,
+            keep_loaded=model_management.loaded_models(only_currently_used=True),
+        )
         free_after = _device_free_memory(device)
         freed = max(0, free_after - free_before)
         LOGGER.debug(
@@ -648,10 +652,20 @@ def register_lazy_modules(model: torch.nn.Module, state_dict):
         LAZY_MODULE_STATE[module] = LazyModuleState(state_dict=view, prefix=prefix)
 
 
-def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
+def _evict_module_weight(
+    module: torch.nn.Module,
+    name: str,
+    is_buffer: bool,
+    current_device_type: Optional[str] = None,
+    evict_all: bool = True,
+):
+    if current_device_type is not None:
+        current = module._buffers.get(name) if is_buffer else module._parameters.get(name)
+        if current is None or current.device.type != current_device_type:
+            return
     safetensors_stream._reap_pinned_inflight()
     lazy_state = LAZY_MODULE_STATE.get(module)
-    if lazy_state is not None:
+    if lazy_state is not None and evict_all:
         CACHE.remove_module(module)
         refs = REGISTRY.get(module)
         if refs:
@@ -676,6 +690,8 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
             _update_disk_state_attrs(module, state)
         lazy_state.loaded = False
         return
+    if lazy_state is not None and not evict_all:
+        CACHE.remove_module(module)
     ref = REGISTRY.get(module)
     if not ref or name not in ref:
         return
@@ -698,6 +714,8 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
             state.deferred_bytes += nbytes
         state.loaded_bytes = max(0, state.loaded_bytes - nbytes)
         _update_disk_state_attrs(module, state)
+    if lazy_state is not None:
+        lazy_state.loaded = False
 
 
 def _find_tensor_device(args, kwargs) -> Optional[torch.device]:
@@ -759,6 +777,8 @@ def ensure_module_materialized(
     target_device: torch.device,
     dtype_override: Optional[torch.dtype] = None,
 ):
+    from . import model_management
+    model_management.drain_async_offload_streams()
     lazy_state = LAZY_MODULE_STATE.get(module)
     if lazy_state is not None:
         _materialize_module_from_state_dict(
@@ -906,14 +926,17 @@ def move_module_tensors(module: torch.nn.Module, device_to: torch.device, dtype_
     return module
 
 
-def offload_module_weights(module: torch.nn.Module) -> int:
+def offload_module_weights(module: torch.nn.Module, current_device_type: Optional[str] = None) -> int:
     if not disk_weights_enabled():
         return 0
     refs = REGISTRY.get(module)
     if not refs:
         return 0
+    from . import model_management
+    model_management.drain_async_offload_streams()
     offloaded_bytes = 0
-    if module in LAZY_MODULE_STATE:
+    evict_all = current_device_type is None
+    if module in LAZY_MODULE_STATE and evict_all:
         ref_name = next(iter(refs.keys()), None)
         if ref_name is not None:
             _evict_module_weight(module, ref_name, False)
@@ -923,7 +946,17 @@ def offload_module_weights(module: torch.nn.Module) -> int:
                 offloaded_bytes += nbytes
         return offloaded_bytes
     for name, disk_ref in refs.items():
-        _evict_module_weight(module, name, disk_ref.is_buffer)
+        if current_device_type is not None:
+            current = module._buffers.get(name) if disk_ref.is_buffer else module._parameters.get(name)
+            if current is None or current.device.type != current_device_type:
+                continue
+        _evict_module_weight(
+            module,
+            name,
+            disk_ref.is_buffer,
+            current_device_type=current_device_type,
+            evict_all=evict_all,
+        )
         nbytes = _meta_nbytes(disk_ref.meta)
         if nbytes is not None:
             offloaded_bytes += nbytes
@@ -943,6 +976,8 @@ def module_to(
     arg_device = _extract_to_device(args, kwargs)
     arg_dtype = _extract_to_dtype(args, kwargs)
     if disk_weights_enabled():
+        from . import model_management
+        model_management.drain_async_offload_streams()
         target_device = device or arg_device
         if target_device is None:
             target_device = _find_existing_device(module) or torch.device("cpu")

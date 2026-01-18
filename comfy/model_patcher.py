@@ -884,6 +884,8 @@ class ModelPatcher:
 
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
         with self.use_ejected():
+            if comfy.disk_weights.disk_weights_enabled():
+                comfy.model_management.drain_async_offload_streams()
             hooks_unpatched = False
             memory_freed = 0
             patch_counter = 0
@@ -899,10 +901,13 @@ class ModelPatcher:
             if device_to is not None and comfy.model_management.is_device_cpu(device_to):
                 remaining_ram = comfy.model_management.get_free_memory(device_to)
 
-            def offload_module_tree(module):
+            def offload_module_tree(module, current_device_type=None):
                 freed = 0
                 for submodule in module.modules():
-                    freed += comfy.disk_weights.offload_module_weights(submodule)
+                    freed += comfy.disk_weights.offload_module_weights(
+                        submodule,
+                        current_device_type=current_device_type,
+                    )
                 return freed
 
             for unload in unload_list:
@@ -939,7 +944,7 @@ class ModelPatcher:
                         cast_weight = self.force_cast_weights
                         freed_bytes = module_mem
                         if device_to is not None and device_to.type == "meta" and comfy.disk_weights.disk_weights_enabled():
-                            freed_bytes = offload_module_tree(m)
+                            freed_bytes = offload_module_tree(m, current_device_type="cpu")
                             if freed_bytes == 0:
                                 freed_bytes = module_mem
                         else:

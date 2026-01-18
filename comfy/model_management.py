@@ -587,6 +587,7 @@ def minimum_inference_memory():
 def free_memory(memory_required, device, keep_loaded=[]):
     cleanup_models_gc()
     if comfy.disk_weights.disk_weights_enabled():
+        drain_async_offload_streams()
         free_before = get_free_memory(device)
         if is_device_cpu(device):
             headroom = comfy.disk_weights.ram_headroom_bytes()
@@ -616,7 +617,10 @@ def free_memory(memory_required, device, keep_loaded=[]):
 
     for i in range(len(current_loaded_models) -1, -1, -1):
         shift_model = current_loaded_models[i]
-        if shift_model.device == device:
+        candidate_device = shift_model.device
+        if comfy.disk_weights.disk_weights_enabled() and is_device_cpu(device):
+            candidate_device = shift_model.model.current_loaded_device()
+        if candidate_device == device:
             if shift_model not in keep_loaded and not shift_model.is_dead():
                 can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
                 shift_model.currently_used = False
@@ -665,6 +669,7 @@ def evict_ram_to_disk(memory_to_free, keep_loaded=[]):
     if not comfy.disk_weights.disk_weights_enabled():
         return 0
 
+    drain_async_offload_streams()
     free_before = get_free_memory(torch.device("cpu"))
     freed = 0
     can_unload = []
@@ -1157,6 +1162,25 @@ def sync_stream(device, stream):
     if stream is None or current_stream(device) is None:
         return
     current_stream(device).wait_stream(stream)
+
+def drain_async_offload_streams():
+    if NUM_STREAMS == 0 or not STREAMS:
+        return
+    for device, streams in STREAMS.items():
+        if not streams:
+            continue
+        event_cls = None
+        if is_device_cuda(device):
+            event_cls = torch.cuda.Event
+        elif is_device_xpu(device) and hasattr(torch.xpu, "Event"):
+            event_cls = torch.xpu.Event
+        for stream in streams:
+            if event_cls is None:
+                stream.synchronize()
+                continue
+            event = event_cls()
+            event.record(stream)
+            event.synchronize()
 
 def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, stream=None):
     if device is None or weight.device == device:

@@ -586,8 +586,20 @@ def minimum_inference_memory():
 
 def free_memory(memory_required, device, keep_loaded=[]):
     cleanup_models_gc()
-    if comfy.disk_weights.disk_weights_enabled():
+    free_before = None
+    if comfy.disk_weights.disk_weights_enabled() and is_device_cuda(device):
         free_before = get_free_memory(device)
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(
+                "DW_FREE_CUDA_BEGIN required=%d free_before=%d device=%s loaded_models=%d",
+                memory_required,
+                free_before,
+                device,
+                len(current_loaded_models),
+            )
+    if comfy.disk_weights.disk_weights_enabled():
+        if free_before is None:
+            free_before = get_free_memory(device)
         if is_device_cpu(device):
             headroom = comfy.disk_weights.ram_headroom_bytes()
             if free_before < memory_required:
@@ -629,6 +641,14 @@ def free_memory(memory_required, device, keep_loaded=[]):
             if free_mem > memory_required:
                 break
             memory_to_free = memory_required - free_mem
+        if comfy.disk_weights.disk_weights_enabled() and is_device_cuda(device):
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(
+                    "DW_FREE_CUDA_VICTIM name=%s loaded=%d model_dev=%s reason=VRAM_PRESSURE",
+                    current_loaded_models[i].model.model.__class__.__name__,
+                    current_loaded_models[i].model_loaded_memory(),
+                    current_loaded_models[i].device,
+                )
         logging.debug(f"Unloading {current_loaded_models[i].model.model.__class__.__name__}")
         offload_device = None
         if comfy.disk_weights.disk_weights_enabled() and is_device_cpu(device):
@@ -656,6 +676,13 @@ def free_memory(memory_required, device, keep_loaded=[]):
             free_after,
             freed_total,
         )
+        if is_device_cuda(device) and logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(
+                "DW_FREE_CUDA_END free_after=%d freed_delta=%d unloaded_models=%d",
+                free_after,
+                free_after - free_before,
+                len(unloaded_model),
+            )
     return unloaded_models
 
 
@@ -1163,6 +1190,15 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
         if not copy:
             if dtype is None or weight.dtype == dtype:
                 return weight
+    target_device = device if device is not None else weight.device
+    target_dtype = dtype if dtype is not None else weight.dtype
+    if comfy.disk_weights.disk_weights_enabled() and is_device_cuda(target_device):
+        required_bytes = weight.numel() * torch.empty((), dtype=target_dtype).element_size()
+        comfy.disk_weights.evict_for_budget(target_device, required_bytes)
+    if device is None or weight.device == device:
+        if not copy:
+            if dtype is None or weight.dtype == dtype:
+                return weight
         if stream is not None:
             wf_context = stream
             if hasattr(wf_context, "as_context"):
@@ -1190,7 +1226,23 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
     ):
         record_stream = stream if stream is not None else current_stream(device)
         if record_stream is not None:
-            _track_pinned_inflight(record_stream, weight)
+            event, inflight_count = _track_pinned_inflight(record_stream, weight)
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(
+                    "DW_PIN_COPY_ENQ src_ptr=%d bytes=%d dst=%s stream=%s event_id=%d inflight_for_ptr=%d",
+                    weight.data_ptr(),
+                    weight.nbytes,
+                    device,
+                    record_stream,
+                    id(event),
+                    inflight_count,
+                )
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(
+                    "DW_PIN_COPY_RET src_ptr=%d inflight_for_ptr=%d",
+                    weight.data_ptr(),
+                    inflight_count,
+                )
     return r
 
 def cast_to_device(tensor, device, dtype, copy=False):
@@ -1201,8 +1253,7 @@ def cast_to_device(tensor, device, dtype, copy=False):
 PINNED_MEMORY = {}
 TOTAL_PINNED_MEMORY = 0
 MAX_PINNED_MEMORY = -1
-PINNED_INFLIGHT = collections.deque()
-DEFERRED_UNPIN = collections.deque()
+PINNED_INFLIGHT = {}
 if not args.disable_pinned_memory:
     if is_nvidia() or is_amd():
         if WINDOWS:
@@ -1273,14 +1324,10 @@ def pin_memory(tensor):
 def _track_pinned_inflight(stream, tensor):
     event = torch.cuda.Event()
     event.record(stream)
-    PINNED_INFLIGHT.append((event, tensor))
-
-def _tensor_inflight(tensor):
     ptr = tensor.data_ptr()
-    for _, inflight_tensor in PINNED_INFLIGHT:
-        if inflight_tensor.data_ptr() == ptr:
-            return True
-    return False
+    inflight = PINNED_INFLIGHT.setdefault(ptr, [])
+    inflight.append(event)
+    return event, len(inflight)
 
 def _unpin_memory_now(tensor):
     global TOTAL_PINNED_MEMORY
@@ -1313,31 +1360,45 @@ def _unpin_memory_now(tensor):
 
     return False
 
-def _retry_deferred_unpins():
-    if not DEFERRED_UNPIN:
-        return
-    remaining = collections.deque()
-    while DEFERRED_UNPIN:
-        tensor = DEFERRED_UNPIN.popleft()
-        if _tensor_inflight(tensor):
-            remaining.append(tensor)
-            continue
-        if not _unpin_memory_now(tensor):
-            remaining.append(tensor)
-    DEFERRED_UNPIN.extend(remaining)
-
 def _reap_pinned_inflight():
     if not PINNED_INFLIGHT:
-        _retry_deferred_unpins()
         return
-    remaining = collections.deque()
-    while PINNED_INFLIGHT:
-        event, tensor = PINNED_INFLIGHT.popleft()
-        if event.query():
-            continue
-        remaining.append((event, tensor))
-    PINNED_INFLIGHT.extend(remaining)
-    _retry_deferred_unpins()
+    remove_ptrs = []
+    for ptr, events in PINNED_INFLIGHT.items():
+        remaining = [event for event in events if not event.query()]
+        if remaining:
+            PINNED_INFLIGHT[ptr] = remaining
+        else:
+            remove_ptrs.append(ptr)
+    for ptr in remove_ptrs:
+        PINNED_INFLIGHT.pop(ptr, None)
+
+def wait_for_pinned_tensor(tensor):
+    if MAX_PINNED_MEMORY <= 0:
+        return
+    if not is_device_cpu(tensor.device):
+        return
+    if not tensor.is_pinned():
+        return
+    ptr = tensor.data_ptr()
+    events = PINNED_INFLIGHT.pop(ptr, None)
+    if not events:
+        return
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        logging.debug(
+            "DW_PIN_WAIT ptr=%d events=%d action=WAIT",
+            ptr,
+            len(events),
+        )
+    for event in events:
+        event.synchronize()
+    remaining_events = len(PINNED_INFLIGHT.get(ptr, []))
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        logging.debug(
+            "DW_PIN_WAIT_DONE ptr=%d remaining=%d",
+            ptr,
+            remaining_events,
+        )
 
 def unpin_memory(tensor):
     global TOTAL_PINNED_MEMORY
@@ -1347,11 +1408,26 @@ def unpin_memory(tensor):
     if not is_device_cpu(tensor.device):
         return False
 
-    _reap_pinned_inflight()
-    if _tensor_inflight(tensor):
-        DEFERRED_UNPIN.append(tensor)
-        return False
-    return _unpin_memory_now(tensor)
+    ptr = tensor.data_ptr()
+    events_before = len(PINNED_INFLIGHT.get(ptr, []))
+    action = "WAITED" if events_before > 0 else "NOWAIT"
+    wait_for_pinned_tensor(tensor)
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        logging.debug(
+            "DW_UNPIN_REQ ptr=%d events=%d action=%s",
+            ptr,
+            events_before,
+            action,
+        )
+    result = _unpin_memory_now(tensor)
+    events_after = len(PINNED_INFLIGHT.get(ptr, []))
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        logging.debug(
+            "DW_UNPIN_DONE ptr=%d events_after=%d",
+            ptr,
+            events_after,
+        )
+    return result
 
 def sage_attention_enabled():
     return args.use_sage_attention

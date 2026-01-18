@@ -884,6 +884,24 @@ class ModelPatcher:
 
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
         with self.use_ejected():
+            tier2 = None
+            tier3 = None
+            if device_to is not None:
+                if device_to.type == "cuda":
+                    tier2 = torch.device("cpu")
+                    tier3 = torch.device("meta")
+                elif device_to.type == "cpu":
+                    tier2 = torch.device("meta")
+                elif device_to.type == "meta":
+                    tier3 = torch.device("meta")
+            logging.debug(
+                "DW_PATCHER_BEGIN op=UNLOAD target=%s tier2=%s tier3=%s lowvram_mem=%s extra=%s",
+                device_to,
+                tier2,
+                tier3,
+                memory_to_free,
+                0,
+            )
             hooks_unpatched = False
             memory_freed = 0
             patch_counter = 0
@@ -936,6 +954,19 @@ class ModelPatcher:
                     weight_key = "{}.weight".format(n)
                     bias_key = "{}.bias".format(n)
                     if move_weight:
+                        action = "MOVE_T1"
+                        if device_to is not None:
+                            if device_to.type == "cpu":
+                                action = "MOVE_T2"
+                            elif device_to.type == "meta":
+                                action = "OFFLOAD_T3"
+                        logging.debug(
+                            "DW_PATCHER_DECISION op=UNLOAD mod=%s mod_id=%d mem=%d action=%s",
+                            m.__class__.__name__,
+                            id(m),
+                            module_mem,
+                            action,
+                        )
                         cast_weight = self.force_cast_weights
                         freed_bytes = module_mem
                         if device_to is not None and device_to.type == "meta" and comfy.disk_weights.disk_weights_enabled():
@@ -1006,10 +1037,29 @@ class ModelPatcher:
             self.model.model_offload_buffer_memory = offload_buffer
             target_label = "disk" if device_to is not None and device_to.type == "meta" else device_to
             logging.info("Unloaded partially to {}: {:.2f} MB freed, {:.2f} MB remains loaded, {:.2f} MB buffer reserved, lowvram patches: {}".format(target_label, memory_freed / (1024 * 1024), self.model.model_loaded_weight_memory / (1024 * 1024), offload_buffer / (1024 * 1024), self.model.lowvram_patch_counter))
+            logging.debug("DW_PATCHER_END op=UNLOAD target=%s", device_to)
             return memory_freed
 
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
         with self.use_ejected(skip_and_inject_on_exit_only=True):
+            tier2 = None
+            tier3 = None
+            if device_to is not None:
+                if device_to.type == "cuda":
+                    tier2 = torch.device("cpu")
+                    tier3 = torch.device("meta")
+                elif device_to.type == "cpu":
+                    tier2 = torch.device("meta")
+                elif device_to.type == "meta":
+                    tier3 = torch.device("meta")
+            logging.debug(
+                "DW_PATCHER_BEGIN op=LOAD target=%s tier2=%s tier3=%s lowvram_mem=%s extra=%s",
+                device_to,
+                tier2,
+                tier3,
+                self.model.model_loaded_weight_memory + extra_memory,
+                extra_memory,
+            )
             offload_device = self.offload_device
             if comfy.disk_weights.disk_weights_enabled() and device_to is not None:
                 if comfy.model_management.is_device_cpu(device_to):
@@ -1035,11 +1085,25 @@ class ModelPatcher:
                 full_load = True
             current_used = self.model.model_loaded_weight_memory
             try:
+                action = "MOVE_T1"
+                if device_to is not None:
+                    if device_to.type == "cpu":
+                        action = "MOVE_T2"
+                    elif device_to.type == "meta":
+                        action = "OFFLOAD_T3"
+                logging.debug(
+                    "DW_PATCHER_DECISION op=LOAD mod=%s mod_id=%d mem=%d action=%s",
+                    self.model.model.__class__.__name__,
+                    id(self.model.model),
+                    current_used,
+                    action,
+                )
                 self.load(device_to, lowvram_model_memory=current_used + extra_memory, force_patch_weights=force_patch_weights, full_load=full_load)
             except Exception as e:
                 self.detach()
                 raise e
 
+            logging.debug("DW_PATCHER_END op=LOAD target=%s", device_to)
             return self.model.model_loaded_weight_memory - current_used
 
     def detach(self, unpatch_all=True, offload_device=None):

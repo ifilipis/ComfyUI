@@ -826,12 +826,13 @@ def dtype_size(dtype):
     return dtype_size
 
 def unet_offload_device():
-    if comfy.disk_weights.disk_weights_enabled():
-        return torch.device("meta")
     if vram_state == VRAMState.HIGH_VRAM:
-        return get_torch_device()
+        default_offload = get_torch_device()
     else:
-        return torch.device("cpu")
+        default_offload = torch.device("cpu")
+    if comfy.disk_weights.disk_weights_enabled() and is_device_cpu(get_torch_device()):
+        return torch.device("meta")
+    return default_offload
 
 def unet_inital_load_device(parameters, dtype):
     torch_dev = get_torch_device()
@@ -932,12 +933,13 @@ def unet_manual_cast(weight_dtype, inference_device, supported_dtypes=[torch.flo
     return torch.float32
 
 def text_encoder_offload_device():
-    if comfy.disk_weights.disk_weights_enabled():
-        return torch.device("meta")
     if args.gpu_only:
-        return get_torch_device()
+        default_offload = get_torch_device()
     else:
-        return torch.device("cpu")
+        default_offload = torch.device("cpu")
+    if comfy.disk_weights.disk_weights_enabled() and is_device_cpu(text_encoder_device()):
+        return torch.device("meta")
+    return default_offload
 
 def text_encoder_device():
     if args.gpu_only:
@@ -994,12 +996,13 @@ def vae_device():
     return get_torch_device()
 
 def vae_offload_device():
-    if comfy.disk_weights.disk_weights_enabled():
-        return torch.device("meta")
     if args.gpu_only:
-        return get_torch_device()
+        default_offload = get_torch_device()
     else:
-        return torch.device("cpu")
+        default_offload = torch.device("cpu")
+    if comfy.disk_weights.disk_weights_enabled() and is_device_cpu(vae_device()):
+        return torch.device("meta")
+    return default_offload
 
 def vae_dtype(device=None, allowed_dtypes=[]):
     if args.fp16_vae:

@@ -111,6 +111,8 @@ def wipe_lowvram_weight(m):
 def move_weight_functions(m, device):
     if device is None:
         return 0
+    if hasattr(device, "type") and device.type == "meta":
+        return 0
 
     memory = 0
     if hasattr(m, "weight_function"):
@@ -133,6 +135,12 @@ class LowVramPatch:
 
     def __call__(self, weight):
         return comfy.lora.calculate_weight(self.patches[self.key], weight, self.key, intermediate_dtype=weight.dtype)
+
+
+class DiskWeightBackup:
+    def __init__(self, inplace_update: bool):
+        self.inplace_update = inplace_update
+
 
 LOWVRAM_PATCH_ESTIMATE_MATH_FACTOR = 2
 
@@ -169,6 +177,13 @@ def get_key_weight(model, key):
             weight = comfy.utils.get_attr(model, key)
 
     return weight, set_func, convert_func
+
+
+def get_key_module_and_name(model, key):
+    op_keys = key.rsplit('.', 1)
+    if len(op_keys) < 2:
+        return model, key
+    return comfy.utils.get_attr(model, op_keys[0]), op_keys[1]
 
 class AutoPatcherEjector:
     def __init__(self, model: 'ModelPatcher', skip_and_inject_on_exit_only=False):
@@ -591,7 +606,7 @@ class ModelPatcher:
             bk = self.backup.get(k, None)
             hbk = self.hook_backup.get(k, None)
             weight, set_func, convert_func = get_key_weight(self.model, k)
-            if bk is not None:
+            if bk is not None and not isinstance(bk, DiskWeightBackup):
                 weight = bk.weight
             if hbk is not None:
                 weight = hbk[0]
@@ -621,8 +636,27 @@ class ModelPatcher:
         weight, set_func, convert_func = get_key_weight(self.model, key)
         inplace_update = self.weight_inplace_update or inplace_update
 
+        disk_ref = None
+        if comfy.disk_weights.disk_weights_enabled():
+            module, param_name = get_key_module_and_name(self.model, key)
+            disk_ref = comfy.disk_weights.get_disk_weight_ref(module, param_name)
+            if weight is not None and hasattr(weight, "device") and weight.device.type == "meta":
+                materialize_device = device_to or torch.device("cpu")
+                loaded = comfy.disk_weights.load_module_tensor(module, param_name, materialize_device)
+                if loaded is not None:
+                    weight = loaded
+
         if key not in self.backup:
-            self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
+            if comfy.disk_weights.disk_weights_enabled() and disk_ref is not None:
+                self.backup[key] = DiskWeightBackup(inplace_update)
+            else:
+                backup_device = self.offload_device
+                if comfy.disk_weights.disk_weights_enabled() and backup_device is not None and backup_device.type == "meta":
+                    backup_device = torch.device("cpu")
+                self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(
+                    weight.to(device=backup_device, copy=inplace_update),
+                    inplace_update,
+                )
 
         temp_dtype = comfy.model_management.lora_compute_dtype(device_to)
         if device_to is not None:
@@ -644,12 +678,17 @@ class ModelPatcher:
 
     def pin_weight_to_device(self, key):
         weight, set_func, convert_func = get_key_weight(self.model, key)
+        if weight is None or (hasattr(weight, "device") and weight.device.type == "meta"):
+            return
         if comfy.model_management.pin_memory(weight):
             self.pinned.add(key)
 
     def unpin_weight(self, key):
         if key in self.pinned:
             weight, set_func, convert_func = get_key_weight(self.model, key)
+            if weight is None or (hasattr(weight, "device") and weight.device.type == "meta"):
+                self.pinned.remove(key)
+                return
             comfy.model_management.unpin_memory(weight)
             self.pinned.remove(key)
 
@@ -848,6 +887,11 @@ class ModelPatcher:
 
             for k in keys:
                 bk = self.backup[k]
+                if isinstance(bk, DiskWeightBackup):
+                    if comfy.disk_weights.disk_weights_enabled():
+                        module, param_name = get_key_module_and_name(self.model, k)
+                        comfy.disk_weights.evict_module_tensor(module, param_name, is_buffer=False)
+                    continue
                 if bk.inplace_update:
                     comfy.utils.copy_to_param(self.model, k, bk.weight)
                 else:
@@ -857,7 +901,26 @@ class ModelPatcher:
             self.backup.clear()
 
             if device_to is not None:
-                comfy.disk_weights.module_to(self.model, device_to, allow_materialize=False)
+                if comfy.disk_weights.disk_weights_enabled():
+                    if device_to.type == "cpu":
+                        remaining_ram = comfy.model_management.get_free_memory(device_to)
+                        for _, module_mem, _, module, _ in self._load_list():
+                            if remaining_ram < module_mem:
+                                bytes_needed = max(0, module_mem - remaining_ram)
+                                if bytes_needed > 0:
+                                    comfy.disk_weights.evict_ram_cache(bytes_needed)
+                                    remaining_ram = comfy.model_management.get_free_memory(device_to)
+                            if remaining_ram >= module_mem:
+                                comfy.disk_weights.move_module_tensors(module, device_to)
+                                remaining_ram = max(0, remaining_ram - module_mem)
+                            else:
+                                comfy.disk_weights.offload_module_weights(module)
+                    elif device_to.type == "meta":
+                        comfy.disk_weights.offload_module_tree(self.model)
+                    else:
+                        comfy.disk_weights.module_to(self.model, device_to, allow_materialize=False)
+                else:
+                    comfy.disk_weights.module_to(self.model, device_to, allow_materialize=False)
                 self.model.device = device_to
             self.model.model_loaded_weight_memory = 0
             self.model.model_offload_buffer_memory = 0
@@ -910,11 +973,17 @@ class ModelPatcher:
                                 self.unpatch_hooks()
                                 hooks_unpatched = True
 
-                            if bk.inplace_update:
-                                comfy.utils.copy_to_param(self.model, key, bk.weight)
+                            if isinstance(bk, DiskWeightBackup):
+                                if comfy.disk_weights.disk_weights_enabled():
+                                    module, param_name = get_key_module_and_name(self.model, key)
+                                    comfy.disk_weights.evict_module_tensor(module, param_name, is_buffer=False)
+                                self.backup.pop(key)
                             else:
-                                comfy.utils.set_attr_param(self.model, key, bk.weight)
-                            self.backup.pop(key)
+                                if bk.inplace_update:
+                                    comfy.utils.copy_to_param(self.model, key, bk.weight)
+                                else:
+                                    comfy.utils.set_attr_param(self.model, key, bk.weight)
+                                self.backup.pop(key)
 
                     weight_key = "{}.weight".format(n)
                     bias_key = "{}.bias".format(n)

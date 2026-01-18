@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import sys
 import weakref
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -179,7 +180,7 @@ def configure(*, allow_gds: bool, pin_if_cpu: bool, ram_headroom_bytes: int, ena
     PIN_IF_CPU = pin_if_cpu
     DISK_WEIGHTS_ENABLED = enabled
     RAM_HEADROOM_BYTES = max(0, int(ram_headroom_bytes))
-    CACHE.set_limit(0 if enabled else 0)
+    CACHE.set_limit(sys.maxsize if enabled else 0)
     if enabled:
         install_monkeypatches()
     else:
@@ -880,8 +881,50 @@ def _find_existing_device(module: torch.nn.Module) -> Optional[torch.device]:
     return None
 
 
-def move_module_tensors(module: torch.nn.Module, device_to: torch.device, dtype_override: Optional[torch.dtype] = None):
-    ensure_module_materialized(module, device_to, dtype_override=dtype_override)
+def _move_tensor_to_device(tensor: torch.Tensor, device_to: torch.device, dtype_override: Optional[torch.dtype]) -> torch.Tensor:
+    if tensor is None or tensor.device.type == "meta":
+        return tensor
+    if dtype_override is not None:
+        if tensor.device != device_to or tensor.dtype != dtype_override:
+            return tensor.to(device=device_to, dtype=dtype_override)
+        return tensor
+    if tensor.device != device_to:
+        return tensor.to(device=device_to)
+    return tensor
+
+
+def _move_existing_module_tensors(
+    module: torch.nn.Module,
+    device_to: torch.device,
+    dtype_override: Optional[torch.dtype],
+):
+    for name, param in module._parameters.items():
+        if param is None:
+            continue
+        moved = _move_tensor_to_device(param, device_to, dtype_override)
+        if moved is not param:
+            module._parameters[name] = torch.nn.Parameter(moved, requires_grad=param.requires_grad)
+    for name, buf in module._buffers.items():
+        if buf is None:
+            continue
+        moved = _move_tensor_to_device(buf, device_to, dtype_override)
+        if moved is not buf:
+            module._buffers[name] = moved
+
+
+def move_module_tensors(
+    module: torch.nn.Module,
+    device_to: torch.device,
+    dtype_override: Optional[torch.dtype] = None,
+    *,
+    allow_materialize: bool = True,
+):
+    for submodule in module.modules():
+        refs = REGISTRY.get(submodule)
+        lazy_state = LAZY_MODULE_STATE.get(submodule)
+        if allow_materialize and (refs or lazy_state):
+            ensure_module_materialized(submodule, device_to, dtype_override=dtype_override)
+        _move_existing_module_tensors(submodule, device_to, dtype_override)
     return module
 
 
@@ -909,6 +952,28 @@ def offload_module_weights(module: torch.nn.Module) -> int:
     return offloaded_bytes
 
 
+def offload_module_tree(module: torch.nn.Module) -> int:
+    if not disk_weights_enabled():
+        return 0
+    offloaded_bytes = 0
+    for submodule in module.modules():
+        offloaded_bytes += offload_module_weights(submodule)
+    return offloaded_bytes
+
+
+def evict_module_tensor(module: torch.nn.Module, name: str, *, is_buffer: bool = False):
+    if not disk_weights_enabled():
+        return
+    _evict_module_weight(module, name, is_buffer)
+
+
+def get_disk_weight_ref(module: torch.nn.Module, name: str) -> Optional[DiskTensorRef]:
+    refs = REGISTRY.get(module)
+    if not refs:
+        return None
+    return refs.get(name)
+
+
 def module_to(
     module: torch.nn.Module,
     *args,
@@ -926,22 +991,10 @@ def module_to(
         if target_device is None:
             target_device = _find_existing_device(module) or torch.device("cpu")
         if target_device.type == "meta":
-            offload_module_weights(module)
+            offload_module_tree(module)
             return module
-        if allow_materialize:
-            materialize_module_tree(module, target_device)
-            base_kwargs = dict(kwargs)
-            if device is not None and arg_device is None:
-                base_kwargs["device"] = device
-            if dtype is not None and arg_dtype is None:
-                base_kwargs["dtype"] = dtype
-            if non_blocking:
-                base_kwargs["non_blocking"] = non_blocking
-            if memory_format is not None:
-                base_kwargs["memory_format"] = memory_format
-            return BASE_MODULE_TO(module, *args, **base_kwargs)
         dtype_override = dtype or arg_dtype
-        return move_module_tensors(module, target_device, dtype_override=dtype_override)
+        return move_module_tensors(module, target_device, dtype_override=dtype_override, allow_materialize=allow_materialize)
     base_kwargs = dict(kwargs)
     if device is not None and arg_device is None:
         base_kwargs["device"] = device

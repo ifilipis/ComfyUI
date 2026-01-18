@@ -898,6 +898,7 @@ class ModelPatcher:
             cpu_device = torch.device("cpu")
             if device_to is not None and comfy.model_management.is_device_cpu(device_to):
                 remaining_ram = comfy.model_management.get_free_memory(device_to)
+            device_from = self.model.current_loaded_device()
 
             def offload_module_tree(module):
                 freed = 0
@@ -913,6 +914,22 @@ class ModelPatcher:
                 potential_offload = module_offload_mem + sum(offload_weight_factor)
 
                 lowvram_possible = hasattr(m, "comfy_cast_weights")
+                bytes_on_device_from = 0
+                if comfy.disk_weights.disk_weights_enabled():
+                    for param_name in params:
+                        param = getattr(m, param_name, None)
+                        if param is None or param.device.type == "meta":
+                            continue
+                        if param.device == device_from:
+                            bytes_on_device_from += param.numel() * param.element_size()
+                    for _, buf in m.named_buffers(recurse=False):
+                        if buf is None or buf.device.type == "meta":
+                            continue
+                        if buf.device == device_from:
+                            bytes_on_device_from += buf.numel() * buf.element_size()
+                    if bytes_on_device_from == 0:
+                        continue
+                move_weight = False
                 if hasattr(m, "comfy_patched_weights") and m.comfy_patched_weights == True:
                     move_weight = True
                     for param in params:
@@ -932,72 +949,75 @@ class ModelPatcher:
                             else:
                                 comfy.utils.set_attr_param(self.model, key, bk.weight)
                             self.backup.pop(key)
+                elif comfy.disk_weights.disk_weights_enabled() and bytes_on_device_from > 0:
+                    move_weight = True
 
+                if move_weight:
                     weight_key = "{}.weight".format(n)
                     bias_key = "{}.bias".format(n)
-                    if move_weight:
-                        cast_weight = self.force_cast_weights
-                        freed_bytes = module_mem
-                        if device_to is not None and device_to.type == "meta" and comfy.disk_weights.disk_weights_enabled():
-                            freed_bytes = offload_module_tree(m)
-                            if freed_bytes == 0:
-                                freed_bytes = module_mem
-                        else:
-                            if remaining_ram is not None and comfy.disk_weights.disk_weights_enabled():
-                                required_bytes = module_mem
-                                headroom = comfy.disk_weights.ram_headroom_bytes()
-                                comfy.model_management.free_memory(required_bytes + headroom, cpu_device, keep_loaded=[self])
-                                remaining_ram = comfy.model_management.get_free_memory(cpu_device)
-                                if remaining_ram < required_bytes:
-                                    logging.info(
-                                        "Insufficient CPU RAM for %s (need %.2f MB, free %.2f MB); offloading to disk.",
-                                        n,
-                                        required_bytes / (1024 * 1024),
-                                        remaining_ram / (1024 * 1024),
-                                    )
-                                    freed_bytes = offload_module_tree(m)
-                                    if freed_bytes == 0:
-                                        freed_bytes = module_mem
-                                else:
-                                    comfy.disk_weights.move_module_tensors(m, device_to)
-                                    remaining_ram = max(0, remaining_ram - required_bytes)
+                    cast_weight = self.force_cast_weights
+                    effective_bytes = bytes_on_device_from if comfy.disk_weights.disk_weights_enabled() else module_mem
+                    freed_bytes = effective_bytes
+                    if device_to is not None and device_to.type == "meta" and comfy.disk_weights.disk_weights_enabled():
+                        freed_bytes = offload_module_tree(m)
+                        if freed_bytes == 0:
+                            freed_bytes = effective_bytes
+                    else:
+                        if remaining_ram is not None and comfy.disk_weights.disk_weights_enabled():
+                            required_bytes = effective_bytes
+                            headroom = comfy.disk_weights.ram_headroom_bytes()
+                            comfy.model_management.free_memory(required_bytes + headroom, cpu_device, keep_loaded=[self])
+                            remaining_ram = comfy.model_management.get_free_memory(cpu_device)
+                            if remaining_ram < required_bytes:
+                                logging.info(
+                                    "Insufficient CPU RAM for %s (need %.2f MB, free %.2f MB); offloading to disk.",
+                                    n,
+                                    required_bytes / (1024 * 1024),
+                                    remaining_ram / (1024 * 1024),
+                                )
+                                freed_bytes = offload_module_tree(m)
+                                if freed_bytes == 0:
+                                    freed_bytes = effective_bytes
                             else:
-                                if comfy.disk_weights.disk_weights_enabled():
-                                    comfy.disk_weights.move_module_tensors(m, device_to)
-                                else:
-                                    m.to(device_to)
-                                if remaining_ram is not None:
-                                    remaining_ram = max(0, remaining_ram - module_mem)
-                        module_mem += move_weight_functions(m, device_to)
-                        if lowvram_possible:
-                            if weight_key in self.patches:
-                                if force_patch_weights:
-                                    self.patch_weight_to_device(weight_key)
-                                else:
-                                    _, set_func, convert_func = get_key_weight(self.model, weight_key)
-                                    m.weight_function.append(LowVramPatch(weight_key, self.patches, convert_func, set_func))
-                                    patch_counter += 1
-                            if bias_key in self.patches:
-                                if force_patch_weights:
-                                    self.patch_weight_to_device(bias_key)
-                                else:
-                                    _, set_func, convert_func = get_key_weight(self.model, bias_key)
-                                    m.bias_function.append(LowVramPatch(bias_key, self.patches, convert_func, set_func))
-                                    patch_counter += 1
-                            cast_weight = True
+                                comfy.disk_weights.move_module_tensors(m, device_to, allow_materialize=False)
+                                remaining_ram = max(0, remaining_ram - required_bytes)
+                        else:
+                            if comfy.disk_weights.disk_weights_enabled():
+                                comfy.disk_weights.move_module_tensors(m, device_to, allow_materialize=False)
+                            else:
+                                m.to(device_to)
+                            if remaining_ram is not None:
+                                remaining_ram = max(0, remaining_ram - effective_bytes)
+                    module_mem += move_weight_functions(m, device_to)
+                    if lowvram_possible:
+                        if weight_key in self.patches:
+                            if force_patch_weights:
+                                self.patch_weight_to_device(weight_key)
+                            else:
+                                _, set_func, convert_func = get_key_weight(self.model, weight_key)
+                                m.weight_function.append(LowVramPatch(weight_key, self.patches, convert_func, set_func))
+                                patch_counter += 1
+                        if bias_key in self.patches:
+                            if force_patch_weights:
+                                self.patch_weight_to_device(bias_key)
+                            else:
+                                _, set_func, convert_func = get_key_weight(self.model, bias_key)
+                                m.bias_function.append(LowVramPatch(bias_key, self.patches, convert_func, set_func))
+                                patch_counter += 1
+                        cast_weight = True
 
-                        if cast_weight and hasattr(m, "comfy_cast_weights"):
-                            m.prev_comfy_cast_weights = m.comfy_cast_weights
-                            m.comfy_cast_weights = True
-                        m.comfy_patched_weights = False
-                        memory_freed += freed_bytes
-                        offload_buffer = max(offload_buffer, potential_offload)
-                        offload_weight_factor.append(module_mem)
-                        offload_weight_factor.pop(0)
-                        logging.debug("freed {}".format(n))
+                    if cast_weight and hasattr(m, "comfy_cast_weights"):
+                        m.prev_comfy_cast_weights = m.comfy_cast_weights
+                        m.comfy_cast_weights = True
+                    m.comfy_patched_weights = False
+                    memory_freed += freed_bytes
+                    offload_buffer = max(offload_buffer, potential_offload)
+                    offload_weight_factor.append(module_mem)
+                    offload_weight_factor.pop(0)
+                    logging.debug("freed {}".format(n))
 
-                        for param in params:
-                            self.pin_weight_to_device("{}.{}".format(n, param))
+                    for param in params:
+                        self.pin_weight_to_device("{}.{}".format(n, param))
 
 
             self.model.model_lowvram = True

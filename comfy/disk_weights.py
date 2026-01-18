@@ -905,6 +905,8 @@ def disk_weight_pre_hook(module: torch.nn.Module, args, kwargs={}):
     else:
         target_device = _find_tensor_device(args, kwargs) or torch.device("cpu")
     root = getattr(module, "_disk_weights_root_model", None)
+    if isinstance(root, weakref.ReferenceType):
+        root = root()
     patcher = getattr(root, "current_patcher", None) if root is not None else None
     keep_loaded = [patcher] if patcher is not None else []
     ensure_module_materialized(
@@ -920,7 +922,7 @@ def attach_disk_weight_hooks(model: torch.nn.Module):
     if not disk_weights_enabled():
         return
     for module in model.modules():
-        module._disk_weights_root_model = model
+        module._disk_weights_root_model = weakref.ref(model)
         if getattr(module, "_disk_weight_hook_attached", False):
             continue
         module.register_forward_pre_hook(disk_weight_pre_hook)

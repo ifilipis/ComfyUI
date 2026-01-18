@@ -100,6 +100,15 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
 
     weight_source = s.weight
     bias_source = s.bias
+    if offloadable and (device != weight_source.device or (bias_source is not None and device != bias_source.device)):
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(
+                "DW_OPS_CAST_COPY op=cast_bias_weight weight_dev=%s bias_dev=%s input_dev=%s offload_stream=%s",
+                weight_source.device,
+                bias_source.device if bias_source is not None else None,
+                device,
+                offload_stream is not None,
+            )
 
     weight = comfy.model_management.cast_to(weight_source, None, device, non_blocking=non_blocking, copy=weight_has_function, stream=offload_stream)
 

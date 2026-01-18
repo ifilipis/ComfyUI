@@ -1158,10 +1158,34 @@ def disk_weight_pre_hook(module: torch.nn.Module, args, kwargs={}):
     input_dtype = _find_tensor_dtype(args, kwargs)
     manual_cast_dtype = getattr(module, "manual_cast_dtype", None)
     dtype_override = _select_weight_dtype(input_dtype, manual_cast_dtype)
-    if getattr(module, "comfy_cast_weights", False):
-        target_device = torch.device("cpu")
-    else:
-        target_device = _find_tensor_device(args, kwargs) or torch.device("cpu")
+    input_device = _find_tensor_device(args, kwargs)
+    if input_device is None:
+        input_device = torch.device("cpu")
+    existing_device = _find_existing_device(module)
+    target_device = existing_device if existing_device is not None else input_device
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        LOGGER.debug(
+            "DW_PREHOOK mod=%s mod_id=%d comfy_cast=%s input_dev=%s existing_dev=%s target=%s dtype_override=%s",
+            module.__class__.__name__,
+            id(module),
+            getattr(module, "comfy_cast_weights", False),
+            input_device,
+            existing_device,
+            target_device,
+            dtype_override,
+        )
+    if (
+        getattr(module, "comfy_cast_weights", False)
+        and existing_device is not None
+        and existing_device.type != "cpu"
+        and LOGGER.isEnabledFor(logging.DEBUG)
+    ):
+        LOGGER.debug(
+            "DW_PREHOOK_COMFYCAST_KEEP_EXISTING mod=%s mod_id=%d kept=%s",
+            module.__class__.__name__,
+            id(module),
+            existing_device,
+        )
     ensure_module_materialized(
         module,
         target_device,

@@ -213,6 +213,27 @@ def ram_headroom_bytes() -> int:
     return RAM_HEADROOM_BYTES
 
 
+def model_tree_loaded_bytes_on_device(root_module: torch.nn.Module, device: torch.device) -> int:
+    if not disk_weights_enabled():
+        return 0
+    total = 0
+    for module in root_module.modules():
+        refs = REGISTRY.get(module)
+        if not refs:
+            continue
+        for name in refs:
+            tensor = None
+            if name in module._parameters:
+                tensor = module._parameters[name]
+            elif name in module._buffers:
+                tensor = module._buffers[name]
+            if tensor is None or tensor.device.type == "meta":
+                continue
+            if tensor.device == device:
+                total += tensor.numel() * tensor.element_size()
+    return total
+
+
 def _is_stream_state_dict(state_dict) -> bool:
     return (
         getattr(state_dict, "is_stream_state_dict", False)
@@ -454,7 +475,12 @@ def _device_free_memory(device: torch.device) -> int:
     return int(model_management.get_free_memory(device))
 
 
-def _ensure_free_memory(device: torch.device, required_bytes: int, headroom_bytes: int) -> int:
+def _ensure_free_memory(
+    device: torch.device,
+    required_bytes: int,
+    headroom_bytes: int,
+    keep_loaded: Optional[list] = None,
+) -> int:
     free_before = _device_free_memory(device)
     if free_before < required_bytes + headroom_bytes:
         LOGGER.debug(
@@ -466,8 +492,7 @@ def _ensure_free_memory(device: torch.device, required_bytes: int, headroom_byte
         )
         safetensors_stream._reap_pinned_inflight()
         from . import model_management
-        model_management._reap_pinned_inflight()
-        model_management.free_memory(required_bytes + headroom_bytes, device)
+        model_management.free_memory(required_bytes + headroom_bytes, device, keep_loaded=keep_loaded or [])
         free_after = _device_free_memory(device)
         freed = max(0, free_after - free_before)
         LOGGER.debug(
@@ -757,7 +782,9 @@ def _select_weight_dtype(input_dtype: Optional[torch.dtype], manual_cast_dtype: 
 def ensure_module_materialized(
     module: torch.nn.Module,
     target_device: torch.device,
+    fallback_device: Optional[torch.device] = None,
     dtype_override: Optional[torch.dtype] = None,
+    keep_loaded: Optional[list] = None,
 ):
     lazy_state = LAZY_MODULE_STATE.get(module)
     if lazy_state is not None:
@@ -766,6 +793,7 @@ def ensure_module_materialized(
             lazy_state,
             target_device,
             dtype_override=dtype_override,
+            keep_loaded=keep_loaded,
         )
         return
     refs = REGISTRY.get(module)
@@ -800,12 +828,34 @@ def ensure_module_materialized(
         if meta_nbytes is None:
             continue
         required_bytes = meta_nbytes
+        target_for_load = target_device
         if target_device.type == "cpu":
-            _ensure_free_memory(target_device, required_bytes, RAM_HEADROOM_BYTES)
+            free_mem = _ensure_free_memory(
+                target_device,
+                required_bytes,
+                RAM_HEADROOM_BYTES,
+                keep_loaded=keep_loaded,
+            )
+            if fallback_device is not None and fallback_device != target_device:
+                if free_mem < required_bytes + RAM_HEADROOM_BYTES:
+                    from . import model_management
+                    alt_headroom = RAM_HEADROOM_BYTES if fallback_device.type == "cpu" else model_management.extra_reserved_memory()
+                    alt_free = _ensure_free_memory(
+                        fallback_device,
+                        required_bytes,
+                        alt_headroom,
+                        keep_loaded=keep_loaded,
+                    )
+                    if alt_free >= required_bytes + alt_headroom:
+                        target_for_load = fallback_device
         else:
             from . import model_management
-            _ensure_free_memory(target_device, required_bytes, model_management.extra_reserved_memory())
-        target_for_load = target_device
+            _ensure_free_memory(
+                target_device,
+                required_bytes,
+                model_management.extra_reserved_memory(),
+                keep_loaded=keep_loaded,
+            )
         if current.device.type == "meta":
             tensor = disk_ref.load(
                 target_for_load,
@@ -815,9 +865,34 @@ def ensure_module_materialized(
             )
         else:
             if target_dtype is not None and current.dtype != target_dtype:
-                tensor = current.to(device=target_for_load, dtype=target_dtype)
+                use_cast = target_for_load.type in ("cuda", "xpu") or current.device.type in ("cuda", "xpu")
+                if use_cast:
+                    from . import model_management
+                    stream_device = target_for_load if target_for_load.type in ("cuda", "xpu") else current.device
+                    stream = model_management.get_offload_stream(stream_device)
+                    tensor = model_management.cast_to(
+                        current,
+                        device=target_for_load,
+                        dtype=target_dtype,
+                        non_blocking=model_management.device_supports_non_blocking(target_for_load),
+                        stream=stream,
+                    )
+                else:
+                    tensor = current.to(device=target_for_load, dtype=target_dtype)
             else:
-                tensor = current.to(device=target_for_load)
+                use_cast = target_for_load.type in ("cuda", "xpu") or current.device.type in ("cuda", "xpu")
+                if use_cast:
+                    from . import model_management
+                    stream_device = target_for_load if target_for_load.type in ("cuda", "xpu") else current.device
+                    stream = model_management.get_offload_stream(stream_device)
+                    tensor = model_management.cast_to(
+                        current,
+                        device=target_for_load,
+                        non_blocking=model_management.device_supports_non_blocking(target_for_load),
+                        stream=stream,
+                    )
+                else:
+                    tensor = current.to(device=target_for_load)
         if is_buffer:
             module._buffers[name] = tensor
         else:
@@ -828,30 +903,52 @@ def ensure_module_materialized(
     _log_materialization(module, target_device, free_mem_start, refs, state, "Disk weight materialized")
 
 
-def disk_weight_pre_hook(module: torch.nn.Module, args, kwargs={}):
+def disk_weight_pre_hook(module: torch.nn.Module, args, kwargs={}, keep_loaded: Optional[list] = None):
     if not REGISTRY.has(module) and module not in LAZY_MODULE_STATE:
         return
+    if keep_loaded is None:
+        keep_loaded = []
     input_dtype = _find_tensor_dtype(args, kwargs)
     manual_cast_dtype = getattr(module, "manual_cast_dtype", None)
     dtype_override = _select_weight_dtype(input_dtype, manual_cast_dtype)
+    existing_device = _find_existing_device(module)
+    input_device = _find_tensor_device(args, kwargs)
     if getattr(module, "comfy_cast_weights", False):
         target_device = torch.device("cpu")
+        fallback_device = input_device if input_device is not None else existing_device
     else:
-        target_device = _find_tensor_device(args, kwargs) or torch.device("cpu")
+        if input_device is not None:
+            target_device = input_device
+        elif existing_device is not None:
+            target_device = existing_device
+        else:
+            target_device = torch.device("cpu")
+        fallback_device = None
+    if existing_device is not None and existing_device.type in {"cuda", "xpu"} and target_device.type == "cpu":
+        target_device = existing_device
     ensure_module_materialized(
         module,
         target_device,
+        fallback_device=fallback_device,
         dtype_override=dtype_override,
+        keep_loaded=keep_loaded,
     )
 
 
 def attach_disk_weight_hooks(model: torch.nn.Module):
     if not disk_weights_enabled():
         return
+    def _hook(module, args, kwargs):
+        if kwargs is None:
+            kwargs = {}
+        patcher = getattr(model, "current_patcher", None)
+        keep_loaded = [patcher] if patcher is not None else []
+        return disk_weight_pre_hook(module, args, kwargs, keep_loaded=keep_loaded)
+
     for module in model.modules():
         if getattr(module, "_disk_weight_hook_attached", False):
             continue
-        module.register_forward_pre_hook(disk_weight_pre_hook)
+        module.register_forward_pre_hook(_hook, with_kwargs=True)
         module._disk_weight_hook_attached = True
 
 
@@ -859,8 +956,6 @@ def evict_ram_cache(bytes_to_free: int):
     if bytes_to_free <= 0:
         return 0
     safetensors_stream._reap_pinned_inflight()
-    from . import model_management
-    model_management._reap_pinned_inflight()
     return CACHE.evict_bytes(bytes_to_free)
 
 
@@ -902,7 +997,37 @@ def _find_existing_device(module: torch.nn.Module) -> Optional[torch.device]:
 
 
 def move_module_tensors(module: torch.nn.Module, device_to: torch.device, dtype_override: Optional[torch.dtype] = None):
-    ensure_module_materialized(module, device_to, dtype_override=dtype_override)
+    def _move(tensor):
+        if tensor is None:
+            return None
+        if tensor.device.type == "meta":
+            return tensor
+        if dtype_override is not None and tensor.dtype != dtype_override:
+            if device_to.type in ("cuda", "xpu") or tensor.device.type in ("cuda", "xpu"):
+                from . import model_management
+                stream_device = device_to if device_to.type in ("cuda", "xpu") else tensor.device
+                stream = model_management.get_offload_stream(stream_device)
+                return model_management.cast_to(
+                    tensor,
+                    device=device_to,
+                    dtype=dtype_override,
+                    non_blocking=model_management.device_supports_non_blocking(device_to),
+                    stream=stream,
+                )
+            return tensor.to(device=device_to, dtype=dtype_override)
+        if device_to.type in ("cuda", "xpu") or tensor.device.type in ("cuda", "xpu"):
+            from . import model_management
+            stream_device = device_to if device_to.type in ("cuda", "xpu") else tensor.device
+            stream = model_management.get_offload_stream(stream_device)
+            return model_management.cast_to(
+                tensor,
+                device=device_to,
+                non_blocking=model_management.device_supports_non_blocking(device_to),
+                stream=stream,
+            )
+        return tensor.to(device=device_to)
+
+    module._apply(_move)
     return module
 
 
@@ -965,10 +1090,23 @@ def module_to(
                 if param is None or param.device.type == "meta":
                     continue
                 if param.device != target_device or (dtype_override is not None and param.dtype != dtype_override):
-                    if dtype_override is not None:
-                        tensor = param.to(device=target_device, dtype=dtype_override, **to_kwargs)
+                    use_cast = target_device.type in ("cuda", "xpu") or param.device.type in ("cuda", "xpu")
+                    if use_cast:
+                        from . import model_management
+                        stream_device = target_device if target_device.type in ("cuda", "xpu") else param.device
+                        stream = model_management.get_offload_stream(stream_device)
+                        tensor = model_management.cast_to(
+                            param,
+                            device=target_device,
+                            dtype=dtype_override,
+                            non_blocking=model_management.device_supports_non_blocking(target_device),
+                            stream=stream,
+                        )
                     else:
-                        tensor = param.to(device=target_device, **to_kwargs)
+                        if dtype_override is not None:
+                            tensor = param.to(device=target_device, dtype=dtype_override, **to_kwargs)
+                        else:
+                            tensor = param.to(device=target_device, **to_kwargs)
                     submodule._parameters[name] = torch.nn.Parameter(tensor, requires_grad=param.requires_grad)
             for name, buf in submodule.named_buffers(recurse=False):
                 if name in refs:
@@ -976,10 +1114,23 @@ def module_to(
                 if buf is None or buf.device.type == "meta":
                     continue
                 if buf.device != target_device or (dtype_override is not None and buf.dtype != dtype_override):
-                    if dtype_override is not None:
-                        tensor = buf.to(device=target_device, dtype=dtype_override, **to_kwargs)
+                    use_cast = target_device.type in ("cuda", "xpu") or buf.device.type in ("cuda", "xpu")
+                    if use_cast:
+                        from . import model_management
+                        stream_device = target_device if target_device.type in ("cuda", "xpu") else buf.device
+                        stream = model_management.get_offload_stream(stream_device)
+                        tensor = model_management.cast_to(
+                            buf,
+                            device=target_device,
+                            dtype=dtype_override,
+                            non_blocking=model_management.device_supports_non_blocking(target_device),
+                            stream=stream,
+                        )
                     else:
-                        tensor = buf.to(device=target_device, **to_kwargs)
+                        if dtype_override is not None:
+                            tensor = buf.to(device=target_device, dtype=dtype_override, **to_kwargs)
+                        else:
+                            tensor = buf.to(device=target_device, **to_kwargs)
                     submodule._buffers[name] = tensor
         return module
     base_kwargs = dict(kwargs)
@@ -1077,6 +1228,7 @@ def _materialize_module_from_state_dict(
     lazy_state: LazyModuleState,
     target_device: torch.device,
     dtype_override: Optional[torch.dtype] = None,
+    keep_loaded: Optional[list] = None,
 ):
     missing_keys = []
     unexpected_keys = []
@@ -1108,7 +1260,7 @@ def _materialize_module_from_state_dict(
         required = _meta_nbytes(meta)
         if required is None:
             continue
-        _ensure_free_memory(target_device, required, headroom)
+        _ensure_free_memory(target_device, required, headroom, keep_loaded=keep_loaded)
     state_dict = _BudgetedStateDict(
         lazy_state.state_dict,
         allowed_keys=allowed,

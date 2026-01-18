@@ -880,6 +880,64 @@ def _find_existing_device(module: torch.nn.Module) -> Optional[torch.device]:
     return None
 
 
+def move_materialized_module_tree(
+    module: torch.nn.Module,
+    target_device: torch.device,
+    dtype_override: Optional[torch.dtype] = None,
+    non_blocking: bool = True,
+) -> int:
+    bytes_moved = 0
+    module_names = {submodule: name for name, submodule in module.named_modules()}
+    dtype_element_size = None
+    if dtype_override is not None:
+        dtype_element_size = torch.empty((), dtype=dtype_override).element_size()
+    for submodule in module.modules():
+        cpu_required_bytes = 0
+        for name, param in submodule.named_parameters(recurse=False):
+            if param is None or param.device.type == "meta":
+                continue
+            target_dtype = dtype_override or param.dtype
+            if param.device != target_device or param.dtype != target_dtype:
+                if target_device.type == "cpu":
+                    if dtype_override is not None and param.dtype != dtype_override:
+                        cpu_required_bytes += param.numel() * dtype_element_size
+                    else:
+                        cpu_required_bytes += _tensor_nbytes(param)
+        for name, buf in submodule.named_buffers(recurse=False):
+            if buf is None or buf.device.type == "meta":
+                continue
+            target_dtype = dtype_override or buf.dtype
+            if buf.device != target_device or buf.dtype != target_dtype:
+                if target_device.type == "cpu":
+                    if dtype_override is not None and buf.dtype != dtype_override:
+                        cpu_required_bytes += buf.numel() * dtype_element_size
+                    else:
+                        cpu_required_bytes += _tensor_nbytes(buf)
+        if target_device.type == "cpu" and cpu_required_bytes:
+            _ensure_free_memory(target_device, cpu_required_bytes, RAM_HEADROOM_BYTES)
+        for name, param in submodule.named_parameters(recurse=False):
+            if param is None or param.device.type == "meta":
+                continue
+            target_dtype = dtype_override or param.dtype
+            if param.device != target_device or param.dtype != target_dtype:
+                moved = param.to(device=target_device, dtype=target_dtype, non_blocking=non_blocking)
+                module_name = module_names.get(submodule, "")
+                full_name = name if not module_name else f"{module_name}.{name}"
+                _replace_tensor(module, full_name, moved, is_buffer=False, requires_grad=param.requires_grad)
+                bytes_moved += _tensor_nbytes(moved)
+        for name, buf in submodule.named_buffers(recurse=False):
+            if buf is None or buf.device.type == "meta":
+                continue
+            target_dtype = dtype_override or buf.dtype
+            if buf.device != target_device or buf.dtype != target_dtype:
+                moved = buf.to(device=target_device, dtype=target_dtype, non_blocking=non_blocking)
+                module_name = module_names.get(submodule, "")
+                full_name = name if not module_name else f"{module_name}.{name}"
+                _replace_tensor(module, full_name, moved, is_buffer=True, requires_grad=buf.requires_grad)
+                bytes_moved += _tensor_nbytes(moved)
+    return bytes_moved
+
+
 def move_module_tensors(module: torch.nn.Module, device_to: torch.device, dtype_override: Optional[torch.dtype] = None):
     ensure_module_materialized(module, device_to, dtype_override=dtype_override)
     return module

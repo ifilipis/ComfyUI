@@ -272,6 +272,15 @@ class ModelPatcher:
 
         comfy.disk_weights.attach_disk_weight_hooks(self.model)
 
+    def _disk_offload_tiers(self, device_to: torch.device) -> tuple[torch.device, torch.device | None]:
+        if not comfy.disk_weights.disk_weights_enabled():
+            return (self.offload_device, None)
+        if comfy.model_management.is_device_cpu(device_to):
+            return (torch.device("meta"), None)
+        if comfy.model_management.is_device_cuda(device_to):
+            return (torch.device("cpu"), torch.device("meta"))
+        return (self.offload_device, None)
+
     def model_size(self):
         if self.size > 0:
             return self.size
@@ -620,6 +629,20 @@ class ModelPatcher:
 
         weight, set_func, convert_func = get_key_weight(self.model, key)
         inplace_update = self.weight_inplace_update or inplace_update
+        if comfy.disk_weights.disk_weights_enabled() and weight is not None and weight.device.type == "meta":
+            op_keys = key.rsplit('.', 1)
+            if len(op_keys) < 2:
+                module = self.model
+                attr_name = key
+            else:
+                module = comfy.utils.get_attr(self.model, op_keys[0])
+                attr_name = op_keys[1]
+            if hasattr(module, "comfy_cast_weights"):
+                materialize_device = torch.device("cpu")
+            else:
+                materialize_device = device_to if device_to is not None else self.offload_device
+            comfy.disk_weights.load_module_tensor(module, attr_name, device=materialize_device)
+            weight, set_func, convert_func = get_key_weight(self.model, key)
 
         if key not in self.backup:
             self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
@@ -785,7 +808,10 @@ class ModelPatcher:
                 m.comfy_patched_weights = True
 
             for x in load_completely:
-                comfy.disk_weights.module_to(x[2], device_to)
+                if comfy.disk_weights.disk_weights_enabled():
+                    comfy.disk_weights.move_module_tensors(x[2], device_to)
+                else:
+                    x[2].to(device_to)
 
             for x in offloaded:
                 n = x[1]
@@ -800,7 +826,10 @@ class ModelPatcher:
                 logging.info("loaded completely; {:.2f} MB usable, {:.2f} MB loaded, full load: {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), full_load))
                 self.model.model_lowvram = False
                 if full_load:
-                    comfy.disk_weights.module_to(self.model, device_to)
+                    if comfy.disk_weights.disk_weights_enabled():
+                        comfy.disk_weights.move_module_tensors(self.model, device_to)
+                    else:
+                        self.model.to(device_to)
                     mem_counter = self.model_size()
 
             self.model.lowvram_patch_counter += patch_counter
@@ -857,8 +886,39 @@ class ModelPatcher:
             self.backup.clear()
 
             if device_to is not None:
-                comfy.disk_weights.module_to(self.model, device_to, allow_materialize=False)
-                self.model.device = device_to
+                if comfy.disk_weights.disk_weights_enabled():
+                    if device_to.type == "meta":
+                        comfy.disk_weights.offload_module_weights(self.model)
+                        self.model.device = device_to
+                    elif device_to.type == "cpu":
+                        unload_list = self._load_list()
+                        unload_list.sort()
+                        cpu_device = torch.device("cpu")
+                        for module_offload_mem, module_mem, n, m, params in unload_list:
+                            has_cuda = False
+                            for param in m.parameters(recurse=False):
+                                if param is not None and param.device.type == "cuda":
+                                    has_cuda = True
+                                    break
+                            if not has_cuda:
+                                for buf in m.buffers(recurse=False):
+                                    if buf is not None and buf.device.type == "cuda":
+                                        has_cuda = True
+                                        break
+                            if not has_cuda:
+                                continue
+                            comfy.model_management.free_memory(module_mem + comfy.disk_weights.ram_headroom_bytes(), cpu_device)
+                            if comfy.model_management.get_free_memory(cpu_device) < module_mem:
+                                comfy.disk_weights.offload_module_weights(m)
+                            else:
+                                comfy.disk_weights.move_materialized_module_tree(m, cpu_device)
+                        self.model.device = device_to
+                    else:
+                        comfy.disk_weights.move_materialized_module_tree(self.model, device_to)
+                        self.model.device = device_to
+                else:
+                    self.model.to(device_to)
+                    self.model.device = device_to
             self.model.model_loaded_weight_memory = 0
             self.model.model_offload_buffer_memory = 0
 
@@ -884,9 +944,10 @@ class ModelPatcher:
             if len(unload_list) > 0:
                 NS = comfy.model_management.NUM_STREAMS
                 offload_weight_factor = [ min(offload_buffer / (NS + 1), unload_list[0][1]) ] * NS
-            remaining_ram = None
-            if device_to is not None and comfy.model_management.is_device_cpu(device_to):
-                remaining_ram = comfy.model_management.get_free_memory(device_to)
+            disk_weights_enabled = comfy.disk_weights.disk_weights_enabled()
+            tier3_overflow = False
+            if disk_weights_enabled and device_to is not None and comfy.model_management.is_device_cpu(device_to):
+                tier3_overflow = comfy.model_management.is_device_cuda(self.load_device)
 
             for unload in unload_list:
                 if memory_to_free + offload_buffer - self.model.model_offload_buffer_memory < memory_freed:
@@ -921,23 +982,20 @@ class ModelPatcher:
                     if move_weight:
                         cast_weight = self.force_cast_weights
                         freed_bytes = module_mem
-                        if device_to is not None and device_to.type == "meta" and comfy.disk_weights.disk_weights_enabled():
-                            freed_bytes = comfy.disk_weights.offload_module_weights(m)
-                            if freed_bytes == 0:
-                                freed_bytes = module_mem
-                        else:
-                            if remaining_ram is not None and remaining_ram < module_mem and comfy.disk_weights.disk_weights_enabled():
-                                logging.info("Insufficient CPU RAM for %s (need %.2f MB, free %.2f MB); offloading to disk.", n, module_mem / (1024 * 1024), remaining_ram / (1024 * 1024))
+                        if disk_weights_enabled:
+                            if device_to is not None and device_to.type == "meta":
                                 freed_bytes = comfy.disk_weights.offload_module_weights(m)
-                                if freed_bytes == 0:
-                                    freed_bytes = module_mem
-                            else:
-                                if comfy.disk_weights.disk_weights_enabled():
-                                    comfy.disk_weights.move_module_tensors(m, device_to)
+                            elif device_to is not None and comfy.model_management.is_device_cpu(device_to) and tier3_overflow:
+                                comfy.model_management.free_memory(module_mem + comfy.disk_weights.ram_headroom_bytes(), torch.device("cpu"))
+                                remaining_ram = comfy.model_management.get_free_memory(torch.device("cpu"))
+                                if remaining_ram < module_mem:
+                                    freed_bytes = comfy.disk_weights.offload_module_weights(m)
                                 else:
-                                    m.to(device_to)
-                                if remaining_ram is not None:
-                                    remaining_ram = max(0, remaining_ram - module_mem)
+                                    comfy.disk_weights.move_materialized_module_tree(m, device_to)
+                            else:
+                                comfy.disk_weights.move_materialized_module_tree(m, device_to)
+                        else:
+                            m.to(device_to)
                         module_mem += move_weight_functions(m, device_to)
                         if lowvram_possible:
                             if weight_key in self.patches:
@@ -980,16 +1038,17 @@ class ModelPatcher:
 
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
         with self.use_ejected(skip_and_inject_on_exit_only=True):
+            tier2, tier3 = self._disk_offload_tiers(device_to)
             unpatch_weights = self.model.current_weight_patches_uuid is not None and (self.model.current_weight_patches_uuid != self.patches_uuid or force_patch_weights)
             # TODO: force_patch_weights should not unload + reload full model
             used = self.model.model_loaded_weight_memory
-            self.unpatch_model(self.offload_device, unpatch_weights=unpatch_weights)
+            self.unpatch_model(tier2, unpatch_weights=unpatch_weights)
             if unpatch_weights:
                 extra_memory += (used - self.model.model_loaded_weight_memory)
 
             self.patch_model(load_weights=False)
             if extra_memory < 0 and not unpatch_weights:
-                self.partially_unload(self.offload_device, -extra_memory, force_patch_weights=force_patch_weights)
+                self.partially_unload(tier2, -extra_memory, force_patch_weights=force_patch_weights)
                 return 0
             full_load = False
             if self.model.model_lowvram == False and self.model.model_loaded_weight_memory > 0:
@@ -1305,6 +1364,20 @@ class ModelPatcher:
     def patch_cached_hook_weights(self, cached_weights: dict, key: str, memory_counter: MemoryCounter):
         if key not in self.hook_backup:
             weight: torch.Tensor = comfy.utils.get_attr(self.model, key)
+            if comfy.disk_weights.disk_weights_enabled() and weight.device.type == "meta":
+                op_keys = key.rsplit('.', 1)
+                if len(op_keys) < 2:
+                    module = self.model
+                    attr_name = key
+                else:
+                    module = comfy.utils.get_attr(self.model, op_keys[0])
+                    attr_name = op_keys[1]
+                if hasattr(module, "comfy_cast_weights"):
+                    materialize_device = torch.device("cpu")
+                else:
+                    materialize_device = self.offload_device
+                comfy.disk_weights.load_module_tensor(module, attr_name, device=materialize_device)
+                weight = comfy.utils.get_attr(self.model, key)
             target_device = self.offload_device
             if self.hook_mode == comfy.hooks.EnumHookMode.MaxSpeed:
                 used = memory_counter.use(weight)
@@ -1323,6 +1396,20 @@ class ModelPatcher:
 
         weight, set_func, convert_func = get_key_weight(self.model, key)
         weight: torch.Tensor
+        if comfy.disk_weights.disk_weights_enabled() and weight.device.type == "meta":
+            op_keys = key.rsplit('.', 1)
+            if len(op_keys) < 2:
+                module = self.model
+                attr_name = key
+            else:
+                module = comfy.utils.get_attr(self.model, op_keys[0])
+                attr_name = op_keys[1]
+            if hasattr(module, "comfy_cast_weights"):
+                materialize_device = torch.device("cpu")
+            else:
+                materialize_device = self.model.device if self.model.device is not None else self.offload_device
+            comfy.disk_weights.load_module_tensor(module, attr_name, device=materialize_device)
+            weight, set_func, convert_func = get_key_weight(self.model, key)
         if key not in self.hook_backup:
             target_device = self.offload_device
             if self.hook_mode == comfy.hooks.EnumHookMode.MaxSpeed:
@@ -1365,10 +1452,30 @@ class ModelPatcher:
             if whitelist_keys_set:
                 for k in keys:
                     if k in whitelist_keys_set:
+                        if comfy.disk_weights.disk_weights_enabled() and self.hook_backup[k][0].device.type == "meta":
+                            op_keys = k.rsplit('.', 1)
+                            if len(op_keys) < 2:
+                                module = self.model
+                                attr_name = k
+                            else:
+                                module = comfy.utils.get_attr(self.model, op_keys[0])
+                                attr_name = op_keys[1]
+                            weight = comfy.disk_weights.load_module_tensor(module, attr_name, device=self.hook_backup[k][1])
+                            self.hook_backup[k] = (weight, self.hook_backup[k][1])
                         comfy.utils.copy_to_param(self.model, k, self.hook_backup[k][0].to(device=self.hook_backup[k][1]))
                         self.hook_backup.pop(k)
             else:
                 for k in keys:
+                    if comfy.disk_weights.disk_weights_enabled() and self.hook_backup[k][0].device.type == "meta":
+                        op_keys = k.rsplit('.', 1)
+                        if len(op_keys) < 2:
+                            module = self.model
+                            attr_name = k
+                        else:
+                            module = comfy.utils.get_attr(self.model, op_keys[0])
+                            attr_name = op_keys[1]
+                        weight = comfy.disk_weights.load_module_tensor(module, attr_name, device=self.hook_backup[k][1])
+                        self.hook_backup[k] = (weight, self.hook_backup[k][1])
                     comfy.utils.copy_to_param(self.model, k, self.hook_backup[k][0].to(device=self.hook_backup[k][1]))
 
                 self.hook_backup.clear()

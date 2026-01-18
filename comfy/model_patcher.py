@@ -959,11 +959,11 @@ class ModelPatcher:
                                     if freed_bytes == 0:
                                         freed_bytes = module_mem
                                 else:
-                                    comfy.disk_weights.move_module_tensors(m, device_to)
+                                    comfy.disk_weights.module_to(m, device_to, allow_materialize=False)
                                     remaining_ram = max(0, remaining_ram - required_bytes)
                             else:
                                 if comfy.disk_weights.disk_weights_enabled():
-                                    comfy.disk_weights.move_module_tensors(m, device_to)
+                                    comfy.disk_weights.module_to(m, device_to, allow_materialize=False)
                                 else:
                                     m.to(device_to)
                                 if remaining_ram is not None:

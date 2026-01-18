@@ -650,6 +650,8 @@ def register_lazy_modules(model: torch.nn.Module, state_dict):
 
 def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
     safetensors_stream._reap_pinned_inflight()
+    from . import model_management
+    model_management._reap_pinned_inflight()
     lazy_state = LAZY_MODULE_STATE.get(module)
     if lazy_state is not None:
         CACHE.remove_module(module)
@@ -914,19 +916,26 @@ def offload_module_weights(module: torch.nn.Module) -> int:
         return 0
     offloaded_bytes = 0
     if module in LAZY_MODULE_STATE:
-        ref_name = next(iter(refs.keys()), None)
-        if ref_name is not None:
-            _evict_module_weight(module, ref_name, False)
-        for disk_ref in refs.values():
-            nbytes = _meta_nbytes(disk_ref.meta)
-            if nbytes is not None:
-                offloaded_bytes += nbytes
+        state = _get_materialization_state(module)
+        offloaded_bytes = state.loaded_bytes
+        if offloaded_bytes > 0 or state.loaded_keys:
+            ref_name = next(iter(refs.keys()), None)
+            if ref_name is not None:
+                _evict_module_weight(module, ref_name, False)
         return offloaded_bytes
     for name, disk_ref in refs.items():
-        _evict_module_weight(module, name, disk_ref.is_buffer)
-        nbytes = _meta_nbytes(disk_ref.meta)
-        if nbytes is not None:
-            offloaded_bytes += nbytes
+        if name in module._parameters:
+            current = module._parameters[name]
+            is_buffer = False
+        elif name in module._buffers:
+            current = module._buffers[name]
+            is_buffer = True
+        else:
+            continue
+        if current is None or current.device.type == "meta":
+            continue
+        offloaded_bytes += _tensor_nbytes(current)
+        _evict_module_weight(module, name, is_buffer)
     return offloaded_bytes
 
 
@@ -957,8 +966,29 @@ def module_to(
         if memory_format is not None:
             to_kwargs["memory_format"] = memory_format
         for submodule in module.modules():
-            ensure_module_materialized(submodule, target_device, dtype_override=dtype_override)
             refs = REGISTRY.get(submodule) or {}
+            if allow_materialize:
+                ensure_module_materialized(submodule, target_device, dtype_override=dtype_override)
+            for name, ref in refs.items():
+                if name in submodule._parameters:
+                    current = submodule._parameters[name]
+                    is_buffer = False
+                elif name in submodule._buffers:
+                    current = submodule._buffers[name]
+                    is_buffer = True
+                else:
+                    continue
+                if current is None or current.device.type == "meta":
+                    continue
+                if current.device != target_device or (dtype_override is not None and current.dtype != dtype_override):
+                    if dtype_override is not None:
+                        tensor = current.to(device=target_device, dtype=dtype_override, **to_kwargs)
+                    else:
+                        tensor = current.to(device=target_device, **to_kwargs)
+                    if is_buffer:
+                        submodule._buffers[name] = tensor
+                    else:
+                        submodule._parameters[name] = torch.nn.Parameter(tensor, requires_grad=ref.requires_grad)
             for name, param in submodule.named_parameters(recurse=False):
                 if name in refs:
                     continue

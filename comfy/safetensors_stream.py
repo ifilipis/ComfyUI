@@ -45,10 +45,10 @@ def _reap_pinned_inflight():
         return
     pending = collections.deque()
     while _PINNED_INFLIGHT:
-        event, tensor = _PINNED_INFLIGHT.popleft()
+        event, tensors = _PINNED_INFLIGHT.popleft()
         if event.query():
             continue
-        pending.append((event, tensor))
+        pending.append((event, tensors))
     _PINNED_INFLIGHT.extend(pending)
 
 
@@ -230,7 +230,7 @@ class _SafeTensorFile:
             if pin_if_cpu:
                 event = torch.cuda.Event()
                 event.record(torch.cuda.current_stream(device))
-                _PINNED_INFLIGHT.append((event, cpu_tensor))
+                _PINNED_INFLIGHT.append((event, (cpu_tensor, gpu_tensor)))
             if dtype is not None and dtype != gpu_tensor.dtype:
                 gpu_tensor = gpu_tensor.to(dtype=dtype)
             return gpu_tensor

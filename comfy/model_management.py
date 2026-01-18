@@ -618,7 +618,10 @@ def free_memory(memory_required, device, keep_loaded=[]):
         shift_model = current_loaded_models[i]
         if shift_model.device == device:
             if shift_model not in keep_loaded and not shift_model.is_dead():
-                can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
+                if comfy.disk_weights.disk_weights_enabled():
+                    can_unload.append((-shift_model.model.loaded_size(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
+                else:
+                    can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
                 shift_model.currently_used = False
 
     for x in sorted(can_unload):
@@ -1190,7 +1193,7 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
     ):
         record_stream = stream if stream is not None else current_stream(device)
         if record_stream is not None:
-            _track_pinned_inflight(record_stream, weight)
+            _track_pinned_inflight(record_stream, weight, r)
     return r
 
 def cast_to_device(tensor, device, dtype, copy=False):
@@ -1270,16 +1273,17 @@ def pin_memory(tensor):
 
     return False
 
-def _track_pinned_inflight(stream, tensor):
+def _track_pinned_inflight(stream, *tensors):
     event = torch.cuda.Event()
     event.record(stream)
-    PINNED_INFLIGHT.append((event, tensor))
+    PINNED_INFLIGHT.append((event, tensors))
 
 def _tensor_inflight(tensor):
     ptr = tensor.data_ptr()
-    for _, inflight_tensor in PINNED_INFLIGHT:
-        if inflight_tensor.data_ptr() == ptr:
-            return True
+    for _, inflight_tensors in PINNED_INFLIGHT:
+        for inflight_tensor in inflight_tensors:
+            if inflight_tensor.data_ptr() == ptr:
+                return True
     return False
 
 def _unpin_memory_now(tensor):
@@ -1332,10 +1336,10 @@ def _reap_pinned_inflight():
         return
     remaining = collections.deque()
     while PINNED_INFLIGHT:
-        event, tensor = PINNED_INFLIGHT.popleft()
+        event, tensors = PINNED_INFLIGHT.popleft()
         if event.query():
             continue
-        remaining.append((event, tensor))
+        remaining.append((event, tensors))
     PINNED_INFLIGHT.extend(remaining)
     _retry_deferred_unpins()
 

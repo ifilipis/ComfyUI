@@ -370,6 +370,15 @@ def _state_dict_meta(state_dict: MutableMapping, key: str):
     )
 
 
+def _wait_for_pinned_tensor(tensor: Optional[torch.Tensor]):
+    if tensor is None:
+        return
+    if tensor.device.type != "cpu" or not tensor.is_pinned():
+        return
+    from . import model_management
+    model_management.wait_for_pinned_tensor(tensor)
+
+
 def _rebuild_materialization_state(module: torch.nn.Module, refs: Dict[str, DiskTensorRef], state: DiskMaterializationState):
     state.loaded_keys.clear()
     state.deferred_keys.clear()
@@ -452,33 +461,6 @@ def _log_materialization(
 def _device_free_memory(device: torch.device) -> int:
     from . import model_management
     return int(model_management.get_free_memory(device))
-
-
-def _ensure_free_memory(device: torch.device, required_bytes: int, headroom_bytes: int) -> int:
-    free_before = _device_free_memory(device)
-    if free_before < required_bytes + headroom_bytes:
-        LOGGER.debug(
-            "Disk weight memory pressure: required=%d free=%d headroom=%d device=%s",
-            required_bytes,
-            free_before,
-            headroom_bytes,
-            device,
-        )
-        safetensors_stream._reap_pinned_inflight()
-        from . import model_management
-        model_management._reap_pinned_inflight()
-        model_management.free_memory(required_bytes + headroom_bytes, device)
-        free_after = _device_free_memory(device)
-        freed = max(0, free_after - free_before)
-        LOGGER.debug(
-            "Disk weight memory freed: freed=%d free_before=%d free_after=%d device=%s",
-            freed,
-            free_before,
-            free_after,
-            device,
-        )
-        return free_after
-    return free_before
 
 
 class _BudgetedStateDict(MutableMapping):
@@ -657,6 +639,12 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
         if refs:
             state = _get_materialization_state(module)
             for ref_name, disk_ref in refs.items():
+                current = None
+                if ref_name in module._parameters:
+                    current = module._parameters.get(ref_name)
+                elif ref_name in module._buffers:
+                    current = module._buffers.get(ref_name)
+                _wait_for_pinned_tensor(current)
                 shape = getattr(disk_ref.meta, "shape", None)
                 dtype = _get_future_dtype(module, ref_name) or getattr(disk_ref.meta, "dtype", None)
                 if shape is None or dtype is None:
@@ -680,6 +668,12 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
     if not ref or name not in ref:
         return
     disk_ref = ref[name]
+    current = None
+    if name in module._parameters:
+        current = module._parameters.get(name)
+    elif name in module._buffers:
+        current = module._buffers.get(name)
+    _wait_for_pinned_tensor(current)
     shape = getattr(disk_ref.meta, "shape", None)
     dtype = _get_future_dtype(module, name) or getattr(disk_ref.meta, "dtype", None)
     if shape is None or dtype is None:
@@ -790,34 +784,25 @@ def ensure_module_materialized(
         if current is None:
             continue
         target_dtype = dtype_override or _get_future_dtype(module, name)
-        if current.device.type != "meta" and current.device == target_device and (
-            target_dtype is None or current.dtype == target_dtype
-        ):
-            if current.device.type == "cpu":
+        if current.device.type != "meta":
+            if current.device == target_device and target_dtype is not None and current.dtype != target_dtype:
+                _wait_for_pinned_tensor(current)
+                tensor = current.to(dtype=target_dtype)
+                if is_buffer:
+                    module._buffers[name] = tensor
+                else:
+                    module._parameters[name] = torch.nn.Parameter(tensor, requires_grad=disk_ref.requires_grad)
+                if tensor.device.type == "cpu":
+                    CACHE.record(module, name, tensor, is_buffer=is_buffer)
+            elif current.device.type == "cpu":
                 CACHE.touch(module, name)
             continue
-        meta_nbytes = _meta_nbytes(disk_ref.meta)
-        if meta_nbytes is None:
-            continue
-        required_bytes = meta_nbytes
-        if target_device.type == "cpu":
-            _ensure_free_memory(target_device, required_bytes, RAM_HEADROOM_BYTES)
-        else:
-            from . import model_management
-            _ensure_free_memory(target_device, required_bytes, model_management.extra_reserved_memory())
-        target_for_load = target_device
-        if current.device.type == "meta":
-            tensor = disk_ref.load(
-                target_for_load,
-                ALLOW_GDS,
-                PIN_IF_CPU,
-                dtype_override=target_dtype,
-            )
-        else:
-            if target_dtype is not None and current.dtype != target_dtype:
-                tensor = current.to(device=target_for_load, dtype=target_dtype)
-            else:
-                tensor = current.to(device=target_for_load)
+        tensor = disk_ref.load(
+            target_device,
+            ALLOW_GDS,
+            PIN_IF_CPU,
+            dtype_override=target_dtype,
+        )
         if is_buffer:
             module._buffers[name] = tensor
         else:
@@ -859,16 +844,18 @@ def evict_ram_cache(bytes_to_free: int):
     if bytes_to_free <= 0:
         return 0
     safetensors_stream._reap_pinned_inflight()
-    from . import model_management
-    model_management._reap_pinned_inflight()
     return CACHE.evict_bytes(bytes_to_free)
 
 
-def materialize_module_tree(module: torch.nn.Module, target_device: torch.device):
+def materialize_module_tree(
+    module: torch.nn.Module,
+    target_device: torch.device,
+    dtype_override: Optional[torch.dtype] = None,
+):
     if not disk_weights_enabled():
         return
     for submodule in module.modules():
-        ensure_module_materialized(submodule, target_device)
+        ensure_module_materialized(submodule, target_device, dtype_override=dtype_override)
 
 
 def _extract_to_device(args, kwargs) -> Optional[torch.device]:
@@ -902,7 +889,17 @@ def _find_existing_device(module: torch.nn.Module) -> Optional[torch.device]:
 
 
 def move_module_tensors(module: torch.nn.Module, device_to: torch.device, dtype_override: Optional[torch.dtype] = None):
-    ensure_module_materialized(module, device_to, dtype_override=dtype_override)
+    def _move(tensor):
+        if tensor is None:
+            return None
+        if tensor.device.type == "meta":
+            return tensor
+        _wait_for_pinned_tensor(tensor)
+        if dtype_override is not None and tensor.dtype != dtype_override:
+            return tensor.to(device=device_to, dtype=dtype_override)
+        return tensor.to(device=device_to)
+
+    module._apply(_move)
     return module
 
 
@@ -951,37 +948,19 @@ def module_to(
                 offload_module_weights(submodule)
             return module
         dtype_override = dtype or arg_dtype
-        to_kwargs = {}
-        if non_blocking:
-            to_kwargs["non_blocking"] = non_blocking
-        if memory_format is not None:
-            to_kwargs["memory_format"] = memory_format
-        for submodule in module.modules():
-            ensure_module_materialized(submodule, target_device, dtype_override=dtype_override)
-            refs = REGISTRY.get(submodule) or {}
-            for name, param in submodule.named_parameters(recurse=False):
-                if name in refs:
-                    continue
-                if param is None or param.device.type == "meta":
-                    continue
-                if param.device != target_device or (dtype_override is not None and param.dtype != dtype_override):
-                    if dtype_override is not None:
-                        tensor = param.to(device=target_device, dtype=dtype_override, **to_kwargs)
-                    else:
-                        tensor = param.to(device=target_device, **to_kwargs)
-                    submodule._parameters[name] = torch.nn.Parameter(tensor, requires_grad=param.requires_grad)
-            for name, buf in submodule.named_buffers(recurse=False):
-                if name in refs:
-                    continue
-                if buf is None or buf.device.type == "meta":
-                    continue
-                if buf.device != target_device or (dtype_override is not None and buf.dtype != dtype_override):
-                    if dtype_override is not None:
-                        tensor = buf.to(device=target_device, dtype=dtype_override, **to_kwargs)
-                    else:
-                        tensor = buf.to(device=target_device, **to_kwargs)
-                    submodule._buffers[name] = tensor
-        return module
+        if allow_materialize:
+            materialize_module_tree(module, target_device, dtype_override=dtype_override)
+            base_kwargs = dict(kwargs)
+            if device is not None and arg_device is None:
+                base_kwargs["device"] = device
+            if dtype is not None and arg_dtype is None:
+                base_kwargs["dtype"] = dtype
+            if non_blocking:
+                base_kwargs["non_blocking"] = non_blocking
+            if memory_format is not None:
+                base_kwargs["memory_format"] = memory_format
+            return BASE_MODULE_TO(module, *args, **base_kwargs)
+        return move_module_tensors(module, target_device, dtype_override=dtype_override)
     base_kwargs = dict(kwargs)
     if device is not None and arg_device is None:
         base_kwargs["device"] = device
@@ -1021,9 +1000,7 @@ def load_module_tensor(
         _set_future_dtype(module, name, dtype_override)
     if current.device.type != "meta":
         if current.device != device or (target_dtype is not None and current.dtype != target_dtype):
-            from . import model_management
-            headroom = RAM_HEADROOM_BYTES if device.type == "cpu" else model_management.extra_reserved_memory()
-            _ensure_free_memory(device, _tensor_nbytes(current), headroom)
+            _wait_for_pinned_tensor(current)
             if target_dtype is not None and current.dtype != target_dtype:
                 tensor = current.to(device=device, dtype=target_dtype)
             else:
@@ -1041,9 +1018,6 @@ def load_module_tensor(
     required_bytes = _meta_nbytes(disk_ref.meta)
     if required_bytes is None:
         return current
-    from . import model_management
-    headroom = RAM_HEADROOM_BYTES if device.type == "cpu" else model_management.extra_reserved_memory()
-    _ensure_free_memory(device, required_bytes, headroom)
 
     tensor = disk_ref.load(device, ALLOW_GDS, PIN_IF_CPU, dtype_override=target_dtype)
     if temporary:
@@ -1066,6 +1040,12 @@ def _replace_tensor(model: torch.nn.Module, name: str, tensor: torch.Tensor, is_
     for part in parts[:-1]:
         module = getattr(module, part)
     attr = parts[-1]
+    existing = None
+    if is_buffer:
+        existing = module._buffers.get(attr)
+    else:
+        existing = module._parameters.get(attr)
+    _wait_for_pinned_tensor(existing)
     if is_buffer:
         module._buffers[attr] = tensor
     else:
@@ -1101,14 +1081,6 @@ def _materialize_module_from_state_dict(
             existing[key] = buf
     free_mem_start = _device_free_memory(target_device)
     allowed = set(keys)
-    from . import model_management
-    headroom = RAM_HEADROOM_BYTES if target_device.type == "cpu" else model_management.extra_reserved_memory()
-    for key in keys:
-        meta = _state_dict_meta(lazy_state.state_dict, key)
-        required = _meta_nbytes(meta)
-        if required is None:
-            continue
-        _ensure_free_memory(target_device, required, headroom)
     state_dict = _BudgetedStateDict(
         lazy_state.state_dict,
         allowed_keys=allowed,

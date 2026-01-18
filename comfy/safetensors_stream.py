@@ -37,21 +37,6 @@ _FST_LOADED = False
 _GDS_INITIALIZED = False
 _MISSING = object()
 _NOGDS_CHUNK_BYTES_DEFAULT = 64 * 1024 * 1024
-_PINNED_INFLIGHT = collections.deque()
-
-
-def _reap_pinned_inflight():
-    if not _PINNED_INFLIGHT:
-        return
-    pending = collections.deque()
-    while _PINNED_INFLIGHT:
-        event, tensor = _PINNED_INFLIGHT.popleft()
-        if event.query():
-            continue
-        pending.append((event, tensor))
-    _PINNED_INFLIGHT.extend(pending)
-
-
 def _require_fastsafetensors():
     global _FST_MODULE
     with _FST_LOCK:
@@ -219,7 +204,6 @@ class _SafeTensorFile:
 
         target_dtype = dtype
         if device_is_cuda and pin_if_cpu:
-            _reap_pinned_inflight()
             target_dtype = None
         cpu_tensor = self._read_tensor_nogds(
             fst, framework, meta, torch.device("cpu"), target_dtype, pin_memory=bool(device_is_cuda and pin_if_cpu)
@@ -228,9 +212,8 @@ class _SafeTensorFile:
             gpu_tensor = torch.empty_like(cpu_tensor, device=device)
             gpu_tensor.copy_(cpu_tensor, non_blocking=pin_if_cpu)
             if pin_if_cpu:
-                event = torch.cuda.Event()
-                event.record(torch.cuda.current_stream(device))
-                _PINNED_INFLIGHT.append((event, cpu_tensor))
+                from . import model_management
+                model_management._record_pinned_event(cpu_tensor.data_ptr(), torch.cuda.current_stream(device))
             if dtype is not None and dtype != gpu_tensor.dtype:
                 gpu_tensor = gpu_tensor.to(dtype=dtype)
             return gpu_tensor

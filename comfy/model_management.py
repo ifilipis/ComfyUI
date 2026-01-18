@@ -1172,6 +1172,12 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
         return weight.to(dtype=dtype, copy=copy)
 
 
+    if comfy.disk_weights.disk_weights_enabled():
+        target_device = device if device is not None else weight.device
+        target_dtype = dtype if dtype is not None else weight.dtype
+        required_bytes = weight.numel() * torch.tensor([], dtype=target_dtype).element_size()
+        comfy.disk_weights.evict_for_budget(target_device, required_bytes)
+
     if stream is not None:
         wf_context = stream
         if hasattr(wf_context, "as_context"):
@@ -1182,15 +1188,17 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
     else:
         r = torch.empty_like(weight, dtype=dtype, device=device)
         r.copy_(weight, non_blocking=non_blocking)
-    if (
-        non_blocking
-        and is_device_cuda(device)
-        and is_device_cpu(weight.device)
-        and weight.is_pinned()
-    ):
-        record_stream = stream if stream is not None else current_stream(device)
-        if record_stream is not None:
-            _track_pinned_inflight(record_stream, weight)
+    if non_blocking and torch.cuda.is_available():
+        event_stream = None
+        if device is not None and hasattr(device, "type") and device.type == "cuda":
+            event_stream = stream or current_stream(device)
+        elif weight.device.type == "cuda":
+            event_stream = stream or current_stream(weight.device)
+        if event_stream is not None:
+            if weight.device.type == "cpu" and weight.is_pinned():
+                _record_pinned_event(weight.data_ptr(), event_stream)
+            if r.device.type == "cpu" and r.is_pinned():
+                _record_pinned_event(r.data_ptr(), event_stream)
     return r
 
 def cast_to_device(tensor, device, dtype, copy=False):
@@ -1201,8 +1209,7 @@ def cast_to_device(tensor, device, dtype, copy=False):
 PINNED_MEMORY = {}
 TOTAL_PINNED_MEMORY = 0
 MAX_PINNED_MEMORY = -1
-PINNED_INFLIGHT = collections.deque()
-DEFERRED_UNPIN = collections.deque()
+PINNED_IN_FLIGHT = {}
 if not args.disable_pinned_memory:
     if is_nvidia() or is_amd():
         if WINDOWS:
@@ -1270,17 +1277,20 @@ def pin_memory(tensor):
 
     return False
 
-def _track_pinned_inflight(stream, tensor):
+def _record_pinned_event(ptr, stream):
+    if ptr == 0 or stream is None:
+        return
     event = torch.cuda.Event()
     event.record(stream)
-    PINNED_INFLIGHT.append((event, tensor))
+    PINNED_IN_FLIGHT.setdefault(ptr, []).append(event)
 
-def _tensor_inflight(tensor):
+
+def wait_for_pinned_tensor(tensor):
     ptr = tensor.data_ptr()
-    for _, inflight_tensor in PINNED_INFLIGHT:
-        if inflight_tensor.data_ptr() == ptr:
-            return True
-    return False
+    events = PINNED_IN_FLIGHT.pop(ptr, [])
+    for event in events:
+        event.synchronize()
+
 
 def _unpin_memory_now(tensor):
     global TOTAL_PINNED_MEMORY
@@ -1313,31 +1323,21 @@ def _unpin_memory_now(tensor):
 
     return False
 
-def _retry_deferred_unpins():
-    if not DEFERRED_UNPIN:
-        return
-    remaining = collections.deque()
-    while DEFERRED_UNPIN:
-        tensor = DEFERRED_UNPIN.popleft()
-        if _tensor_inflight(tensor):
-            remaining.append(tensor)
-            continue
-        if not _unpin_memory_now(tensor):
-            remaining.append(tensor)
-    DEFERRED_UNPIN.extend(remaining)
-
 def _reap_pinned_inflight():
-    if not PINNED_INFLIGHT:
-        _retry_deferred_unpins()
+    if not PINNED_IN_FLIGHT:
         return
-    remaining = collections.deque()
-    while PINNED_INFLIGHT:
-        event, tensor = PINNED_INFLIGHT.popleft()
-        if event.query():
-            continue
-        remaining.append((event, tensor))
-    PINNED_INFLIGHT.extend(remaining)
-    _retry_deferred_unpins()
+    completed = []
+    for ptr, events in PINNED_IN_FLIGHT.items():
+        pending = []
+        for event in events:
+            if not event.query():
+                pending.append(event)
+        if pending:
+            PINNED_IN_FLIGHT[ptr] = pending
+        else:
+            completed.append(ptr)
+    for ptr in completed:
+        PINNED_IN_FLIGHT.pop(ptr, None)
 
 def unpin_memory(tensor):
     global TOTAL_PINNED_MEMORY
@@ -1347,10 +1347,7 @@ def unpin_memory(tensor):
     if not is_device_cpu(tensor.device):
         return False
 
-    _reap_pinned_inflight()
-    if _tensor_inflight(tensor):
-        DEFERRED_UNPIN.append(tensor)
-        return False
+    wait_for_pinned_tensor(tensor)
     return _unpin_memory_now(tensor)
 
 def sage_attention_enabled():

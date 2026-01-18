@@ -282,6 +282,8 @@ class ModelPatcher:
         return self.model_size()
 
     def loaded_size(self):
+        if comfy.disk_weights.disk_weights_enabled():
+            return comfy.disk_weights.module_loaded_bytes_on_device(self.model, self.model.device)
         return self.model.model_loaded_weight_memory
 
     def lowvram_patch_counter(self):

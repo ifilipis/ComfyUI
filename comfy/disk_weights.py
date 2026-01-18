@@ -41,6 +41,31 @@ _MONKEYPATCHED = False
 LAZY_MODULE_STATE = weakref.WeakKeyDictionary()
 DISK_MATERIALIZATION_STATE = weakref.WeakKeyDictionary()
 _MISSING = object()
+META_TENSOR_REGISTRY = weakref.WeakKeyDictionary()
+
+
+def _register_meta_tensor(tensor: torch.Tensor, module: torch.nn.Module, name: str, is_buffer: bool) -> None:
+    if tensor is None or tensor.device.type != "meta":
+        return
+    META_TENSOR_REGISTRY[tensor] = (module, name, is_buffer)
+
+
+def _unregister_meta_tensor(tensor: torch.Tensor) -> None:
+    if tensor is None:
+        return
+    META_TENSOR_REGISTRY.pop(tensor, None)
+
+
+def materialize_meta_tensor(
+    tensor: torch.Tensor,
+    device: torch.device,
+    dtype_override: Optional[torch.dtype] = None,
+) -> Optional[torch.Tensor]:
+    entry = META_TENSOR_REGISTRY.get(tensor)
+    if entry is None:
+        return None
+    module, name, is_buffer = entry
+    return load_module_tensor(module, name, device, dtype_override=dtype_override)
 
 
 @dataclass
@@ -647,8 +672,10 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
                 meta_tensor = torch.empty(shape, dtype=dtype, device="meta")
                 if disk_ref.is_buffer:
                     module._buffers[ref_name] = meta_tensor
+                    _register_meta_tensor(meta_tensor, module, ref_name, True)
                 else:
                     module._parameters[ref_name] = torch.nn.Parameter(meta_tensor, requires_grad=disk_ref.requires_grad)
+                    _register_meta_tensor(meta_tensor, module, ref_name, False)
                 nbytes = _meta_nbytes(disk_ref.meta)
                 if nbytes is not None:
                     state.loaded_keys.discard(ref_name)
@@ -670,8 +697,10 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
     meta_tensor = torch.empty(shape, dtype=dtype, device="meta")
     if is_buffer:
         module._buffers[name] = meta_tensor
+        _register_meta_tensor(meta_tensor, module, name, True)
     else:
         module._parameters[name] = torch.nn.Parameter(meta_tensor, requires_grad=disk_ref.requires_grad)
+        _register_meta_tensor(meta_tensor, module, name, False)
     state = _get_materialization_state(module)
     nbytes = _meta_nbytes(disk_ref.meta)
     if nbytes is not None:
@@ -790,6 +819,7 @@ def ensure_module_materialized(
             _ensure_free_memory(target_device, required_bytes, model_management.extra_reserved_memory())
         target_for_load = target_device
         if current.device.type == "meta":
+            _unregister_meta_tensor(current)
             tensor = disk_ref.load(
                 target_for_load,
                 ALLOW_GDS,
@@ -997,6 +1027,7 @@ def load_module_tensor(
     headroom = RAM_HEADROOM_BYTES if device.type == "cpu" else model_management.extra_reserved_memory()
     _ensure_free_memory(device, required_bytes, headroom)
 
+    _unregister_meta_tensor(current)
     tensor = disk_ref.load(device, ALLOW_GDS, PIN_IF_CPU, dtype_override=target_dtype)
     if temporary:
         return tensor
@@ -1131,6 +1162,11 @@ def lazy_load_state_dict(model: torch.nn.Module, state_dict, strict: bool = Fals
         meta = state_dict.meta(name)
         meta_tensor = torch.empty(meta.shape, dtype=meta.dtype, device="meta")
         _replace_tensor(model, name, meta_tensor, is_buffer=False, requires_grad=param.requires_grad)
+        parts = name.split(".")
+        target_module = model
+        for part in parts[:-1]:
+            target_module = getattr(target_module, part)
+        _register_meta_tensor(meta_tensor, target_module, parts[-1], False)
 
     for name, buf in model.named_buffers(recurse=True):
         if buf is None or name not in state_keys:
@@ -1138,6 +1174,11 @@ def lazy_load_state_dict(model: torch.nn.Module, state_dict, strict: bool = Fals
         meta = state_dict.meta(name)
         meta_tensor = torch.empty(meta.shape, dtype=meta.dtype, device="meta")
         _replace_tensor(model, name, meta_tensor, is_buffer=True, requires_grad=False)
+        parts = name.split(".")
+        target_module = model
+        for part in parts[:-1]:
+            target_module = getattr(target_module, part)
+        _register_meta_tensor(meta_tensor, target_module, parts[-1], True)
 
     register_module_weights(model, state_dict)
     register_lazy_modules(model, state_dict)

@@ -1164,6 +1164,15 @@ def sync_stream(device, stream):
     current_stream(device).wait_stream(stream)
 
 def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, stream=None):
+    if (
+        weight.device.type == "meta"
+        and device is not None
+        and device.type != "meta"
+        and comfy.disk_weights.disk_weights_enabled()
+    ):
+        materialized = comfy.disk_weights.materialize_meta_tensor(weight, device, dtype_override=dtype)
+        if materialized is not None:
+            weight = materialized
     if device is None or weight.device == device:
         if not copy:
             if dtype is None or weight.dtype == dtype:

@@ -631,6 +631,8 @@ def register_lazy_modules(model: torch.nn.Module, state_dict):
 
 def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
     safetensors_stream._reap_pinned_inflight()
+    from . import model_management
+    model_management._reap_pinned_inflight()
     lazy_state = LAZY_MODULE_STATE.get(module)
     if lazy_state is not None:
         CACHE.remove_module(module)
@@ -840,6 +842,8 @@ def evict_ram_cache(bytes_to_free: int):
     if bytes_to_free <= 0:
         return 0
     safetensors_stream._reap_pinned_inflight()
+    from . import model_management
+    model_management._reap_pinned_inflight()
     return CACHE.evict_bytes(bytes_to_free)
 
 
@@ -918,7 +922,7 @@ def module_to(
     memory_format=None,
     **kwargs,
 ):
-    allow_materialize = kwargs.pop("allow_materialize", True)
+    kwargs.pop("allow_materialize", None)
     arg_device = _extract_to_device(args, kwargs)
     arg_dtype = _extract_to_dtype(args, kwargs)
     if disk_weights_enabled():
@@ -928,18 +932,6 @@ def module_to(
         if target_device.type == "meta":
             offload_module_weights(module)
             return module
-        if allow_materialize:
-            materialize_module_tree(module, target_device)
-            base_kwargs = dict(kwargs)
-            if device is not None and arg_device is None:
-                base_kwargs["device"] = device
-            if dtype is not None and arg_dtype is None:
-                base_kwargs["dtype"] = dtype
-            if non_blocking:
-                base_kwargs["non_blocking"] = non_blocking
-            if memory_format is not None:
-                base_kwargs["memory_format"] = memory_format
-            return BASE_MODULE_TO(module, *args, **base_kwargs)
         dtype_override = dtype or arg_dtype
         return move_module_tensors(module, target_device, dtype_override=dtype_override)
     base_kwargs = dict(kwargs)

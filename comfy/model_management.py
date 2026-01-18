@@ -827,7 +827,11 @@ def dtype_size(dtype):
 
 def unet_offload_device():
     if comfy.disk_weights.disk_weights_enabled():
-        return torch.device("meta")
+        tier1_device = get_torch_device()
+        if tier1_device.type == "cuda":
+            return torch.device("cpu")
+        if tier1_device.type == "cpu":
+            return torch.device("meta")
     if vram_state == VRAMState.HIGH_VRAM:
         return get_torch_device()
     else:
@@ -933,7 +937,11 @@ def unet_manual_cast(weight_dtype, inference_device, supported_dtypes=[torch.flo
 
 def text_encoder_offload_device():
     if comfy.disk_weights.disk_weights_enabled():
-        return torch.device("meta")
+        tier1_device = text_encoder_device()
+        if tier1_device.type == "cuda":
+            return torch.device("cpu")
+        if tier1_device.type == "cpu":
+            return torch.device("meta")
     if args.gpu_only:
         return get_torch_device()
     else:
@@ -995,7 +1003,11 @@ def vae_device():
 
 def vae_offload_device():
     if comfy.disk_weights.disk_weights_enabled():
-        return torch.device("meta")
+        tier1_device = vae_device()
+        if tier1_device.type == "cuda":
+            return torch.device("cpu")
+        if tier1_device.type == "cpu":
+            return torch.device("meta")
     if args.gpu_only:
         return get_torch_device()
     else:
@@ -1165,6 +1177,9 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
         return weight.to(dtype=dtype, copy=copy)
 
 
+    stream_used = None
+    if is_device_cuda(device):
+        stream_used = stream if stream is not None else current_stream(device)
     if stream is not None:
         wf_context = stream
         if hasattr(wf_context, "as_context"):
@@ -1175,6 +1190,15 @@ def cast_to(weight, dtype=None, device=None, non_blocking=False, copy=False, str
     else:
         r = torch.empty_like(weight, dtype=dtype, device=device)
         r.copy_(weight, non_blocking=non_blocking)
+    if (
+        non_blocking
+        and stream_used is not None
+        and weight.device.type == "cpu"
+        and weight.is_pinned()
+    ):
+        event = torch.cuda.Event()
+        event.record(stream_used)
+        PINNED_INFLIGHT[weight.data_ptr()] = (event, weight)
     return r
 
 def cast_to_device(tensor, device, dtype, copy=False):
@@ -1183,6 +1207,7 @@ def cast_to_device(tensor, device, dtype, copy=False):
 
 
 PINNED_MEMORY = {}
+PINNED_INFLIGHT = {}
 TOTAL_PINNED_MEMORY = 0
 MAX_PINNED_MEMORY = -1
 if not args.disable_pinned_memory:
@@ -1203,6 +1228,16 @@ if args.low_ram:
     )
 
 PINNING_ALLOWED_TYPES = set(["Parameter", "QuantizedTensor"])
+
+def _reap_pinned_inflight():
+    if not PINNED_INFLIGHT:
+        return
+    stale = []
+    for ptr, (event, tensor) in PINNED_INFLIGHT.items():
+        if event.query():
+            stale.append(ptr)
+    for ptr in stale:
+        PINNED_INFLIGHT.pop(ptr, None)
 
 def discard_cuda_async_error():
     try:
@@ -1260,8 +1295,15 @@ def unpin_memory(tensor):
     if not is_device_cpu(tensor.device):
         return False
 
+    _reap_pinned_inflight()
     ptr = tensor.data_ptr()
     size = tensor.nbytes
+    inflight = PINNED_INFLIGHT.get(ptr, None)
+    if inflight is not None:
+        event, ref = inflight
+        if not event.query():
+            event.synchronize()
+        PINNED_INFLIGHT.pop(ptr, None)
 
     size_stored = PINNED_MEMORY.get(ptr, None)
     if size_stored is None:

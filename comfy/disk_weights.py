@@ -650,6 +650,8 @@ def register_lazy_modules(model: torch.nn.Module, state_dict):
 
 def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
     safetensors_stream._reap_pinned_inflight()
+    from . import model_management
+    model_management._reap_pinned_inflight()
     lazy_state = LAZY_MODULE_STATE.get(module)
     if lazy_state is not None:
         CACHE.remove_module(module)
@@ -657,6 +659,13 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
         if refs:
             state = _get_materialization_state(module)
             for ref_name, disk_ref in refs.items():
+                current = None
+                if ref_name in module._parameters:
+                    current = module._parameters[ref_name]
+                elif ref_name in module._buffers:
+                    current = module._buffers[ref_name]
+                if current is not None and current.device.type != "meta":
+                    _wait_for_pinned_tensor(current)
                 shape = getattr(disk_ref.meta, "shape", None)
                 dtype = _get_future_dtype(module, ref_name) or getattr(disk_ref.meta, "dtype", None)
                 if shape is None or dtype is None:
@@ -680,6 +689,13 @@ def _evict_module_weight(module: torch.nn.Module, name: str, is_buffer: bool):
     if not ref or name not in ref:
         return
     disk_ref = ref[name]
+    current = None
+    if name in module._parameters:
+        current = module._parameters[name]
+    elif name in module._buffers:
+        current = module._buffers[name]
+    if current is not None and current.device.type != "meta":
+        _wait_for_pinned_tensor(current)
     shape = getattr(disk_ref.meta, "shape", None)
     dtype = _get_future_dtype(module, name) or getattr(disk_ref.meta, "dtype", None)
     if shape is None or dtype is None:
@@ -814,10 +830,18 @@ def ensure_module_materialized(
                 dtype_override=target_dtype,
             )
         else:
-            if target_dtype is not None and current.dtype != target_dtype:
-                tensor = current.to(device=target_for_load, dtype=target_dtype)
-            else:
-                tensor = current.to(device=target_for_load)
+            from . import model_management
+            stream = model_management.get_offload_stream(target_for_load)
+            non_blocking = model_management.device_supports_non_blocking(target_for_load)
+            tensor = model_management.cast_to(
+                current,
+                dtype=target_dtype,
+                device=target_for_load,
+                non_blocking=non_blocking,
+                stream=stream,
+            )
+            model_management.sync_stream(target_for_load, stream)
+            _wait_for_pinned_tensor(current)
         if is_buffer:
             module._buffers[name] = tensor
         else:
@@ -834,10 +858,9 @@ def disk_weight_pre_hook(module: torch.nn.Module, args, kwargs={}):
     input_dtype = _find_tensor_dtype(args, kwargs)
     manual_cast_dtype = getattr(module, "manual_cast_dtype", None)
     dtype_override = _select_weight_dtype(input_dtype, manual_cast_dtype)
-    if getattr(module, "comfy_cast_weights", False):
-        target_device = torch.device("cpu")
-    else:
-        target_device = _find_tensor_device(args, kwargs) or torch.device("cpu")
+    existing_device = _find_existing_device(module)
+    input_device = _find_tensor_device(args, kwargs) or torch.device("cpu")
+    target_device = existing_device if existing_device is not None else input_device
     ensure_module_materialized(
         module,
         target_device,
@@ -901,8 +924,70 @@ def _find_existing_device(module: torch.nn.Module) -> Optional[torch.device]:
     return None
 
 
-def move_module_tensors(module: torch.nn.Module, device_to: torch.device, dtype_override: Optional[torch.dtype] = None):
-    ensure_module_materialized(module, device_to, dtype_override=dtype_override)
+def _wait_for_pinned_tensor(tensor: torch.Tensor):
+    from . import model_management
+    model_management._reap_pinned_inflight()
+    if not model_management._tensor_inflight(tensor):
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    model_management._reap_pinned_inflight()
+
+
+def move_module_tensors(
+    module: torch.nn.Module,
+    device_to: torch.device,
+    dtype_override: Optional[torch.dtype] = None,
+    non_blocking: Optional[bool] = None,
+):
+    from . import model_management
+    target_device = device_to
+    stream = model_management.get_offload_stream(target_device)
+    if non_blocking is None:
+        non_blocking = model_management.device_supports_non_blocking(target_device)
+
+    def move_single_module(submodule: torch.nn.Module):
+        refs = REGISTRY.get(submodule) or {}
+        for name, param in submodule.named_parameters(recurse=False):
+            if param is None or param.device.type == "meta":
+                continue
+            target_dtype = dtype_override if dtype_override is not None else param.dtype
+            if param.device == target_device and (dtype_override is None or param.dtype == target_dtype):
+                continue
+            moved = model_management.cast_to(
+                param,
+                dtype=target_dtype if dtype_override is not None else None,
+                device=target_device,
+                non_blocking=non_blocking,
+                stream=stream,
+            )
+            model_management.sync_stream(target_device, stream)
+            _wait_for_pinned_tensor(param)
+            submodule._parameters[name] = torch.nn.Parameter(moved, requires_grad=param.requires_grad)
+            if name in refs and moved.device.type == "cpu":
+                CACHE.record(submodule, name, moved, is_buffer=False)
+        for name, buf in submodule.named_buffers(recurse=False):
+            if buf is None or buf.device.type == "meta":
+                continue
+            target_dtype = dtype_override if dtype_override is not None else buf.dtype
+            if buf.device == target_device and (dtype_override is None or buf.dtype == target_dtype):
+                continue
+            moved = model_management.cast_to(
+                buf,
+                dtype=target_dtype if dtype_override is not None else None,
+                device=target_device,
+                non_blocking=non_blocking,
+                stream=stream,
+            )
+            model_management.sync_stream(target_device, stream)
+            _wait_for_pinned_tensor(buf)
+            submodule._buffers[name] = moved
+            if name in refs and moved.device.type == "cpu":
+                CACHE.record(submodule, name, moved, is_buffer=True)
+        for child in submodule.children():
+            move_single_module(child)
+
+    move_single_module(module)
     return module
 
 
@@ -951,36 +1036,10 @@ def module_to(
                 offload_module_weights(submodule)
             return module
         dtype_override = dtype or arg_dtype
-        to_kwargs = {}
-        if non_blocking:
-            to_kwargs["non_blocking"] = non_blocking
-        if memory_format is not None:
-            to_kwargs["memory_format"] = memory_format
-        for submodule in module.modules():
-            ensure_module_materialized(submodule, target_device, dtype_override=dtype_override)
-            refs = REGISTRY.get(submodule) or {}
-            for name, param in submodule.named_parameters(recurse=False):
-                if name in refs:
-                    continue
-                if param is None or param.device.type == "meta":
-                    continue
-                if param.device != target_device or (dtype_override is not None and param.dtype != dtype_override):
-                    if dtype_override is not None:
-                        tensor = param.to(device=target_device, dtype=dtype_override, **to_kwargs)
-                    else:
-                        tensor = param.to(device=target_device, **to_kwargs)
-                    submodule._parameters[name] = torch.nn.Parameter(tensor, requires_grad=param.requires_grad)
-            for name, buf in submodule.named_buffers(recurse=False):
-                if name in refs:
-                    continue
-                if buf is None or buf.device.type == "meta":
-                    continue
-                if buf.device != target_device or (dtype_override is not None and buf.dtype != dtype_override):
-                    if dtype_override is not None:
-                        tensor = buf.to(device=target_device, dtype=dtype_override, **to_kwargs)
-                    else:
-                        tensor = buf.to(device=target_device, **to_kwargs)
-                    submodule._buffers[name] = tensor
+        if allow_materialize:
+            for submodule in module.modules():
+                ensure_module_materialized(submodule, target_device, dtype_override=dtype_override)
+        move_module_tensors(module, target_device, dtype_override=dtype_override, non_blocking=non_blocking)
         return module
     base_kwargs = dict(kwargs)
     if device is not None and arg_device is None:
@@ -1024,11 +1083,18 @@ def load_module_tensor(
             from . import model_management
             headroom = RAM_HEADROOM_BYTES if device.type == "cpu" else model_management.extra_reserved_memory()
             _ensure_free_memory(device, _tensor_nbytes(current), headroom)
-            if target_dtype is not None and current.dtype != target_dtype:
-                tensor = current.to(device=device, dtype=target_dtype)
-            else:
-                tensor = current.to(device=device)
+            stream = model_management.get_offload_stream(device)
+            non_blocking = model_management.device_supports_non_blocking(device)
+            tensor = model_management.cast_to(
+                current,
+                dtype=target_dtype,
+                device=device,
+                non_blocking=non_blocking,
+                stream=stream,
+            )
+            model_management.sync_stream(device, stream)
             if not temporary:
+                _wait_for_pinned_tensor(current)
                 if is_buffer:
                     module._buffers[name] = tensor
                 else:

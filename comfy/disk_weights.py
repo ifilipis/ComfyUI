@@ -739,6 +739,7 @@ def ensure_module_materialized(
     module: torch.nn.Module,
     target_device: torch.device,
     dtype_override: Optional[torch.dtype] = None,
+    materialize_meta: bool = True,
 ):
     lazy_state = LAZY_MODULE_STATE.get(module)
     if lazy_state is not None:
@@ -776,6 +777,8 @@ def ensure_module_materialized(
         ):
             if current.device.type == "cpu":
                 CACHE.touch(module, name)
+            continue
+        if current.device.type == "meta" and not materialize_meta:
             continue
         meta_nbytes = _meta_nbytes(disk_ref.meta)
         if meta_nbytes is None:
@@ -880,8 +883,50 @@ def _find_existing_device(module: torch.nn.Module) -> Optional[torch.device]:
     return None
 
 
-def move_module_tensors(module: torch.nn.Module, device_to: torch.device, dtype_override: Optional[torch.dtype] = None):
-    ensure_module_materialized(module, device_to, dtype_override=dtype_override)
+def move_module_tensors(
+    module: torch.nn.Module,
+    device_to: torch.device,
+    dtype_override: Optional[torch.dtype] = None,
+    materialize_meta: bool = True,
+):
+    if materialize_meta:
+        ensure_module_materialized(module, device_to, dtype_override=dtype_override, materialize_meta=True)
+        return module
+    refs = REGISTRY.get(module)
+    if not refs:
+        return module
+    if dtype_override is not None:
+        for name in refs.keys():
+            _set_future_dtype(module, name, dtype_override)
+    state = _get_materialization_state(module)
+    _rebuild_materialization_state(module, refs, state)
+    for name in sorted(refs.keys()):
+        disk_ref = refs[name]
+        if name in module._parameters:
+            current = module._parameters[name]
+            is_buffer = False
+        elif name in module._buffers:
+            current = module._buffers[name]
+            is_buffer = True
+        else:
+            continue
+        if current is None:
+            continue
+        if current.device.type == "meta":
+            continue
+        target_dtype = dtype_override or _get_future_dtype(module, name)
+        if current.device != device_to or (target_dtype is not None and current.dtype != target_dtype):
+            if target_dtype is not None and current.dtype != target_dtype:
+                tensor = current.to(device=device_to, dtype=target_dtype)
+            else:
+                tensor = current.to(device=device_to)
+            if is_buffer:
+                module._buffers[name] = tensor
+            else:
+                module._parameters[name] = torch.nn.Parameter(tensor, requires_grad=disk_ref.requires_grad)
+            if tensor.device.type == "cpu":
+                CACHE.record(module, name, tensor, is_buffer=is_buffer)
+    _rebuild_materialization_state(module, refs, state)
     return module
 
 
@@ -941,7 +986,12 @@ def module_to(
                 base_kwargs["memory_format"] = memory_format
             return BASE_MODULE_TO(module, *args, **base_kwargs)
         dtype_override = dtype or arg_dtype
-        return move_module_tensors(module, target_device, dtype_override=dtype_override)
+        return move_module_tensors(
+            module,
+            target_device,
+            dtype_override=dtype_override,
+            materialize_meta=allow_materialize,
+        )
     base_kwargs = dict(kwargs)
     if device is not None and arg_device is None:
         base_kwargs["device"] = device

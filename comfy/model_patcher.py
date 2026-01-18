@@ -231,6 +231,11 @@ class ModelPatcher:
         self.model_options = {"transformer_options":{}}
         self.load_device = load_device
         self.offload_device = offload_device
+        if comfy.disk_weights.disk_weights_enabled() and comfy.model_management.is_device_cpu(self.load_device):
+            previous_offload_device = self.offload_device
+            self.offload_device = torch.device("meta")
+            if getattr(self.model, "device", None) == previous_offload_device or self.model.device is None:
+                self.model.device = self.offload_device
         self.weight_inplace_update = weight_inplace_update
         self.force_cast_weights = False
         self.patches_uuid = uuid.uuid4()
@@ -620,9 +625,30 @@ class ModelPatcher:
 
         weight, set_func, convert_func = get_key_weight(self.model, key)
         inplace_update = self.weight_inplace_update or inplace_update
+        if comfy.disk_weights.disk_weights_enabled():
+            module_name, param_name = key.rsplit(".", 1) if "." in key else ("", key)
+            owner_module = comfy.utils.get_attr(self.model, module_name) if module_name else self.model
+            current = None
+            if param_name in owner_module._parameters:
+                current = owner_module._parameters[param_name]
+            elif param_name in owner_module._buffers:
+                current = owner_module._buffers[param_name]
+            if current is not None and current.device.type == "meta":
+                target_device = device_to if device_to is not None else torch.device("cpu")
+                comfy.disk_weights.load_module_tensor(
+                    owner_module,
+                    param_name,
+                    device=target_device,
+                    record_cache=True,
+                    temporary=False,
+                )
+                weight, set_func, convert_func = get_key_weight(self.model, key)
 
         if key not in self.backup:
-            self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
+            backup_device = self.offload_device
+            if comfy.disk_weights.disk_weights_enabled() and backup_device.type == "meta":
+                backup_device = torch.device("cpu")
+            self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight.to(device=backup_device, copy=inplace_update), inplace_update)
 
         temp_dtype = comfy.model_management.lora_compute_dtype(device_to)
         if device_to is not None:
@@ -785,7 +811,10 @@ class ModelPatcher:
                 m.comfy_patched_weights = True
 
             for x in load_completely:
-                comfy.disk_weights.module_to(x[2], device_to)
+                if comfy.disk_weights.disk_weights_enabled():
+                    comfy.disk_weights.move_module_tensors(x[2], device_to, dtype_override=None, materialize_meta=True)
+                else:
+                    x[2].to(device_to)
 
             for x in offloaded:
                 n = x[1]
@@ -800,7 +829,11 @@ class ModelPatcher:
                 logging.info("loaded completely; {:.2f} MB usable, {:.2f} MB loaded, full load: {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), full_load))
                 self.model.model_lowvram = False
                 if full_load:
-                    comfy.disk_weights.module_to(self.model, device_to)
+                    if comfy.disk_weights.disk_weights_enabled():
+                        for _, _, _, module, _ in self._load_list():
+                            comfy.disk_weights.move_module_tensors(module, device_to, dtype_override=None, materialize_meta=True)
+                    else:
+                        self.model.to(device_to)
                     mem_counter = self.model_size()
 
             self.model.lowvram_patch_counter += patch_counter
@@ -857,7 +890,14 @@ class ModelPatcher:
             self.backup.clear()
 
             if device_to is not None:
-                comfy.disk_weights.module_to(self.model, device_to, allow_materialize=False)
+                if comfy.disk_weights.disk_weights_enabled():
+                    for _, _, _, module, _ in self._load_list():
+                        if device_to.type == "meta":
+                            comfy.disk_weights.offload_module_weights(module)
+                        else:
+                            comfy.disk_weights.module_to(module, device_to, allow_materialize=False)
+                else:
+                    self.model.to(device_to)
                 self.model.device = device_to
             self.model.model_loaded_weight_memory = 0
             self.model.model_offload_buffer_memory = 0
@@ -926,18 +966,32 @@ class ModelPatcher:
                             if freed_bytes == 0:
                                 freed_bytes = module_mem
                         else:
-                            if remaining_ram is not None and remaining_ram < module_mem and comfy.disk_weights.disk_weights_enabled():
-                                logging.info("Insufficient CPU RAM for %s (need %.2f MB, free %.2f MB); offloading to disk.", n, module_mem / (1024 * 1024), remaining_ram / (1024 * 1024))
-                                freed_bytes = comfy.disk_weights.offload_module_weights(m)
-                                if freed_bytes == 0:
-                                    freed_bytes = module_mem
+                            if device_to is not None and comfy.model_management.is_device_cpu(device_to) and comfy.disk_weights.disk_weights_enabled():
+                                if remaining_ram is not None and remaining_ram < module_mem:
+                                    comfy.model_management.free_memory(
+                                        module_mem + comfy.disk_weights.ram_headroom_bytes(),
+                                        torch.device("cpu"),
+                                    )
+                                    remaining_ram = comfy.model_management.get_free_memory(torch.device("cpu"))
+                                if remaining_ram is not None and remaining_ram < module_mem:
+                                    logging.info(
+                                        "Insufficient CPU RAM for %s (need %.2f MB, free %.2f MB); offloading to disk.",
+                                        n,
+                                        module_mem / (1024 * 1024),
+                                        remaining_ram / (1024 * 1024),
+                                    )
+                                    freed_bytes = comfy.disk_weights.offload_module_weights(m)
+                                    if freed_bytes == 0:
+                                        freed_bytes = module_mem
+                                else:
+                                    comfy.disk_weights.module_to(m, device_to, allow_materialize=False)
+                                    if remaining_ram is not None:
+                                        remaining_ram = max(0, remaining_ram - module_mem)
                             else:
                                 if comfy.disk_weights.disk_weights_enabled():
-                                    comfy.disk_weights.move_module_tensors(m, device_to)
+                                    comfy.disk_weights.module_to(m, device_to, allow_materialize=False)
                                 else:
                                     m.to(device_to)
-                                if remaining_ram is not None:
-                                    remaining_ram = max(0, remaining_ram - module_mem)
                         module_mem += move_weight_functions(m, device_to)
                         if lowvram_possible:
                             if weight_key in self.patches:

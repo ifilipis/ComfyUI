@@ -399,6 +399,25 @@ def materialize_meta_tensor(tensor: torch.Tensor, target_device: torch.device, d
     module = module_ref()
     if module is None:
         raise RuntimeError("Disk weight module reference expired")
+    if getattr(module, "comfy_cast_weights", False):
+        stored = load_module_tensor(module, name, target_device, dtype_override=None, temporary=False)
+        if stored is None:
+            return None
+        if dtype_override is None or stored.dtype == dtype_override:
+            return stored
+        from . import model_management
+        non_blocking = model_management.device_supports_non_blocking(target_device)
+        offload_stream = model_management.get_offload_stream(target_device) if non_blocking else None
+        out = model_management.cast_to(
+            stored,
+            device=target_device,
+            dtype=dtype_override,
+            non_blocking=non_blocking,
+            stream=offload_stream,
+        )
+        if non_blocking and offload_stream is not None:
+            model_management.sync_stream(target_device, offload_stream)
+        return out
     return load_module_tensor(module, name, target_device, dtype_override=dtype_override, temporary=False)
 
 
@@ -468,6 +487,49 @@ def _summarize_module_bytes(module: torch.nn.Module, refs: Dict[str, DiskTensorR
     return total_bytes, cpu_bytes, gpu_bytes, meta_bytes
 
 
+def _summarize_module_device_dtype(module: torch.nn.Module, refs: Dict[str, DiskTensorRef]):
+    devices = set()
+    dtypes = set()
+    for name in refs:
+        tensor = None
+        if name in module._parameters:
+            tensor = module._parameters[name]
+        elif name in module._buffers:
+            tensor = module._buffers[name]
+        if tensor is None:
+            continue
+        devices.add(str(tensor.device))
+        dtypes.add(str(tensor.dtype))
+    if len(devices) == 1:
+        source_device = next(iter(devices))
+    elif len(devices) == 0:
+        source_device = "unknown"
+    else:
+        source_device = "mixed"
+    if len(dtypes) == 1:
+        source_dtype = next(iter(dtypes))
+    elif len(dtypes) == 0:
+        source_dtype = "unknown"
+    else:
+        source_dtype = "mixed"
+    return source_device, source_dtype
+
+
+def _summarize_target_dtype(module: torch.nn.Module, refs: Dict[str, DiskTensorRef], dtype_override: Optional[torch.dtype]):
+    if dtype_override is not None:
+        return str(dtype_override)
+    future_dtypes = set()
+    for name in refs:
+        future = _get_future_dtype(module, name)
+        if future is not None:
+            future_dtypes.add(str(future))
+    if len(future_dtypes) == 1:
+        return next(iter(future_dtypes))
+    if len(future_dtypes) == 0:
+        return "unchanged"
+    return "mixed"
+
+
 def _log_materialization(
     module: torch.nn.Module,
     target_device: torch.device,
@@ -475,16 +537,22 @@ def _log_materialization(
     refs: Dict[str, DiskTensorRef],
     state: DiskMaterializationState,
     context: str,
+    source_device: str,
+    source_dtype: str,
+    target_dtype: str,
 ):
     total_bytes, cpu_bytes, gpu_bytes, meta_bytes = _summarize_module_bytes(module, refs)
     if total_bytes == 0:
         return
     partial = meta_bytes > 0
     LOGGER.info(
-        "%s: module=%s dest=%s load=%0.2fMB free=%0.2fMB partial=%s "
-        "loaded=%0.2fMB meta=%0.2fMB cpu=%0.2fMB gpu=%0.2fMB full_load=%s",
+        "%s: module=%s src_device=%s src_dtype=%s target_dtype=%s dest=%s load=%0.2fMB "
+        "free=%0.2fMB partial=%s loaded=%0.2fMB meta=%0.2fMB cpu=%0.2fMB gpu=%0.2fMB full_load=%s",
         context,
         module.__class__.__name__,
+        source_device,
+        source_dtype,
+        target_dtype,
         target_device,
         total_bytes / (1024 * 1024),
         free_mem / (1024 * 1024),
@@ -840,17 +908,22 @@ def ensure_module_materialized(
 ):
     lazy_state = LAZY_MODULE_STATE.get(module)
     if lazy_state is not None:
+        storage_dtype_override = dtype_override
+        if getattr(module, "comfy_cast_weights", False):
+            storage_dtype_override = None
         _materialize_module_from_state_dict(
             module,
             lazy_state,
             target_device,
-            dtype_override=dtype_override,
+            dtype_override=storage_dtype_override,
         )
         return
     refs = REGISTRY.get(module)
     if not refs:
         return
     state = _get_materialization_state(module)
+    source_device, source_dtype = _summarize_module_device_dtype(module, refs)
+    target_dtype = _summarize_target_dtype(module, refs, dtype_override)
     if dtype_override is not None:
         for name in refs.keys():
             _set_future_dtype(module, name, dtype_override)
@@ -871,7 +944,10 @@ def ensure_module_materialized(
             continue
         if current is None:
             continue
-        target_dtype = dtype_override or _get_future_dtype(module, name)
+        storage_dtype_override = dtype_override
+        if getattr(module, "comfy_cast_weights", False):
+            storage_dtype_override = None
+        target_dtype = storage_dtype_override or _get_future_dtype(module, name)
         if current.device.type != "meta" and current.device == target_device and (
             target_dtype is None or current.dtype == target_dtype
         ):
@@ -926,7 +1002,17 @@ def ensure_module_materialized(
         if tensor.device.type != "meta":
             CACHE.record(module, name, tensor, is_buffer=is_buffer)
     _rebuild_materialization_state(module, refs, state)
-    _log_materialization(module, target_device, free_mem_start, refs, state, "Disk weight materialized")
+    _log_materialization(
+        module,
+        target_device,
+        free_mem_start,
+        refs,
+        state,
+        "Disk weight materialized",
+        source_device,
+        source_dtype,
+        target_dtype,
+    )
 
 
 def disk_weight_pre_hook(module: torch.nn.Module, args, kwargs={}):
@@ -1211,6 +1297,8 @@ def load_module_tensor(
     refs = REGISTRY.get(module)
     if not refs or name not in refs:
         return None
+    source_device, source_dtype = _summarize_module_device_dtype(module, refs)
+    target_dtype_summary = _summarize_target_dtype(module, refs, dtype_override)
     if name in module._parameters:
         current = module._parameters[name]
         is_buffer = False
@@ -1285,7 +1373,17 @@ def load_module_tensor(
         CACHE.record(module, name, tensor, is_buffer=is_buffer)
     state = _get_materialization_state(module)
     _rebuild_materialization_state(module, refs, state)
-    _log_materialization(module, device, _device_free_memory(device), refs, state, "Disk weight loaded")
+    _log_materialization(
+        module,
+        device,
+        _device_free_memory(device),
+        refs,
+        state,
+        "Disk weight loaded",
+        source_device,
+        source_dtype,
+        target_dtype_summary,
+    )
     return tensor
 
 
@@ -1316,6 +1414,8 @@ def _materialize_module_from_state_dict(
     metadata = getattr(lazy_state.state_dict, "_metadata", None)
     local_metadata = {} if metadata is None else metadata.get(lazy_state.prefix[:-1], {})
     refs = REGISTRY.get(module) or {}
+    source_device, source_dtype = _summarize_module_device_dtype(module, refs)
+    target_dtype_summary = _summarize_target_dtype(module, refs, dtype_override)
     if dtype_override is not None:
         for name in refs.keys():
             _set_future_dtype(module, name, dtype_override)
@@ -1387,7 +1487,17 @@ def _materialize_module_from_state_dict(
             _attach_disk_identity(tensor, module, name, is_buffer)
     _rebuild_materialization_state(module, refs, state)
     lazy_state.loaded = True
-    _log_materialization(module, target_device, free_mem_start, refs, state, "Disk weight streamed")
+    _log_materialization(
+        module,
+        target_device,
+        free_mem_start,
+        refs,
+        state,
+        "Disk weight streamed",
+        source_device,
+        source_dtype,
+        target_dtype_summary,
+    )
     for name, param in module.named_parameters(recurse=False):
         if param.device.type != "meta":
             CACHE.record(module, name, param, is_buffer=False)

@@ -399,6 +399,25 @@ def materialize_meta_tensor(tensor: torch.Tensor, target_device: torch.device, d
     module = module_ref()
     if module is None:
         raise RuntimeError("Disk weight module reference expired")
+    if getattr(module, "comfy_cast_weights", False):
+        stored = load_module_tensor(module, name, target_device, dtype_override=None, temporary=False)
+        if stored is None:
+            return None
+        if dtype_override is None or stored.dtype == dtype_override:
+            return stored
+        from . import model_management
+        non_blocking = model_management.device_supports_non_blocking(target_device)
+        offload_stream = model_management.get_offload_stream(target_device) if non_blocking else None
+        out = model_management.cast_to(
+            stored,
+            device=target_device,
+            dtype=dtype_override,
+            non_blocking=non_blocking,
+            stream=offload_stream,
+        )
+        if non_blocking and offload_stream is not None:
+            model_management.sync_stream(target_device, offload_stream)
+        return out
     return load_module_tensor(module, name, target_device, dtype_override=dtype_override, temporary=False)
 
 
@@ -840,11 +859,14 @@ def ensure_module_materialized(
 ):
     lazy_state = LAZY_MODULE_STATE.get(module)
     if lazy_state is not None:
+        storage_dtype_override = dtype_override
+        if getattr(module, "comfy_cast_weights", False):
+            storage_dtype_override = None
         _materialize_module_from_state_dict(
             module,
             lazy_state,
             target_device,
-            dtype_override=dtype_override,
+            dtype_override=storage_dtype_override,
         )
         return
     refs = REGISTRY.get(module)
@@ -871,7 +893,10 @@ def ensure_module_materialized(
             continue
         if current is None:
             continue
-        target_dtype = dtype_override or _get_future_dtype(module, name)
+        storage_dtype_override = dtype_override
+        if getattr(module, "comfy_cast_weights", False):
+            storage_dtype_override = None
+        target_dtype = storage_dtype_override or _get_future_dtype(module, name)
         if current.device.type != "meta" and current.device == target_device and (
             target_dtype is None or current.dtype == target_dtype
         ):

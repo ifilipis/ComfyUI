@@ -86,6 +86,12 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
             bias_dtype = dtype
         if device is None:
             device = input.device
+        if comfy.disk_weights.disk_weights_enabled() and getattr(s, "comfy_cast_weights", False):
+            manual = getattr(s, "manual_cast_dtype", None)
+            if manual is not None:
+                dtype = manual
+                if bias_dtype is None:
+                    bias_dtype = manual
 
     if offloadable and (device != s.weight.device or
                         (s.bias is not None and device != s.bias.device)):

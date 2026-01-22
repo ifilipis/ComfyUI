@@ -700,6 +700,156 @@ class ModelPatcher:
     def load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
         with self.use_ejected():
             self.unpatch_hooks()
+
+            if comfy.disk_weights.disk_weights_enabled():
+                if device_to is None:
+                    device_to = self.load_device
+                if device_to is None:
+                    device_to = torch.device("cpu")
+
+                mem_counter = 0
+                patch_counter = 0
+
+                cpu_device = torch.device("cpu")
+                ram_headroom = comfy.disk_weights.ram_headroom_bytes()
+                cpu_budget = max(0, int(comfy.model_management.get_free_memory(cpu_device) - ram_headroom))
+
+                target_is_cpu = comfy.model_management.is_device_cpu(device_to)
+                target_budget = 0
+                if not target_is_cpu and device_to.type != "meta":
+                    if (not full_load) and lowvram_model_memory > 0 and lowvram_model_memory < 1e32:
+                        target_budget = int(lowvram_model_memory)
+                    else:
+                        target_budget = int(comfy.model_management.get_free_memory(device_to))
+
+                target_loaded_bytes = 0
+                cpu_loaded_bytes = 0
+                deferred_bytes = 0
+
+                loading = self._load_list()
+                loading.sort(reverse=True)
+                for _, module_mem, n, m, params in loading:
+                    weight_key = "{}.weight".format(n)
+                    bias_key = "{}.bias".format(n)
+
+                    placement_device = None
+                    if target_is_cpu:
+                        if module_mem <= cpu_budget:
+                            placement_device = cpu_device
+                            cpu_budget -= module_mem
+                        else:
+                            deferred_bytes += module_mem
+                    else:
+                        if module_mem <= target_budget:
+                            placement_device = device_to
+                            target_budget -= module_mem
+                        elif module_mem <= cpu_budget:
+                            placement_device = cpu_device
+                            cpu_budget -= module_mem
+                        else:
+                            deferred_bytes += module_mem
+
+                    cast_weight = self.force_cast_weights
+                    m.comfy_force_cast_weights = self.force_cast_weights
+
+                    if hasattr(m, "comfy_cast_weights"):
+                        wipe_lowvram_weight(m)
+
+                    # Ensure function lists exist for wrapper patches / disk-weight lowvram patches.
+                    if not hasattr(m, "weight_function"):
+                        m.weight_function = []
+                    if not hasattr(m, "bias_function"):
+                        m.bias_function = []
+
+                    if placement_device is None:
+                        # Keep weights on meta. Apply patches lazily via LowVramPatch when used.
+                        if weight_key in self.patches:
+                            _, set_func, convert_func = get_key_weight(self.model, weight_key)
+                            m.weight_function = [LowVramPatch(weight_key, self.patches, convert_func, set_func)]
+                            patch_counter += 1
+                        if bias_key in self.patches:
+                            _, set_func, convert_func = get_key_weight(self.model, bias_key)
+                            m.bias_function = [LowVramPatch(bias_key, self.patches, convert_func, set_func)]
+                            patch_counter += 1
+                    else:
+                        # Materialize this module only onto the selected device.
+                        refs = comfy.disk_weights.REGISTRY.get(m)
+                        if refs:
+                            for local_name in sorted(refs.keys()):
+                                comfy.disk_weights.load_module_tensor(m, local_name, device=placement_device)
+                        else:
+                            comfy.disk_weights.module_to(m, placement_device, allow_materialize=False)
+
+                        if hasattr(m, "comfy_patched_weights") and m.comfy_patched_weights is True:
+                            pass
+                        else:
+                            for param in params:
+                                key = "{}.{}".format(n, param)
+                                self.unpin_weight(key)
+                                self.patch_weight_to_device(key, device_to=placement_device)
+                            if comfy.model_management.is_device_cuda(placement_device):
+                                torch.cuda.synchronize()
+                            m.comfy_patched_weights = True
+
+                        if placement_device == device_to:
+                            target_loaded_bytes += module_mem
+                        else:
+                            cpu_loaded_bytes += module_mem
+
+                    if cast_weight and hasattr(m, "comfy_cast_weights"):
+                        m.prev_comfy_cast_weights = m.comfy_cast_weights
+                        m.comfy_cast_weights = True
+
+                    if weight_key in self.weight_wrapper_patches:
+                        m.weight_function.extend(self.weight_wrapper_patches[weight_key])
+
+                    if bias_key in self.weight_wrapper_patches:
+                        m.bias_function.extend(self.weight_wrapper_patches[bias_key])
+
+                    mem_counter += move_weight_functions(m, device_to)
+
+                # Determine whether everything fit on the target device.
+                target_fully_loaded = True
+                for v in self.model.state_dict().values():
+                    if not hasattr(v, "device"):
+                        continue
+                    if v.device != device_to:
+                        target_fully_loaded = False
+                        break
+
+                usable_stat = "{:.2f} MB usable,".format(lowvram_model_memory / (1024 * 1024)) if lowvram_model_memory < 1e32 else ""
+                if not target_fully_loaded:
+                    logging.info(
+                        "loaded partially; {} {:.2f} MB loaded (target), {:.2f} MB staged (cpu), {:.2f} MB deferred (meta), lowvram patches: {}".format(
+                            usable_stat,
+                            (target_loaded_bytes + mem_counter) / (1024 * 1024),
+                            cpu_loaded_bytes / (1024 * 1024),
+                            deferred_bytes / (1024 * 1024),
+                            patch_counter,
+                        )
+                    )
+                    self.model.model_lowvram = True
+                else:
+                    logging.info(
+                        "loaded completely; {} {:.2f} MB loaded, full load: {}".format(
+                            usable_stat,
+                            (target_loaded_bytes + mem_counter) / (1024 * 1024),
+                            full_load,
+                        )
+                    )
+                    self.model.model_lowvram = False
+
+                self.model.lowvram_patch_counter += patch_counter
+                self.model.device = device_to
+                self.model.model_loaded_weight_memory = target_loaded_bytes + mem_counter
+                self.model.model_offload_buffer_memory = 0
+                self.model.current_weight_patches_uuid = self.patches_uuid
+
+                for callback in self.get_all_callbacks(CallbacksMP.ON_LOAD):
+                    callback(self, device_to, lowvram_model_memory, force_patch_weights, full_load)
+
+                self.apply_hooks(self.forced_hooks, force_apply=True)
+                return
             mem_counter = 0
             patch_counter = 0
             lowvram_counter = 0

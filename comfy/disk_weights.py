@@ -922,6 +922,7 @@ def ensure_module_materialized(
             module._parameters[name] = torch.nn.Parameter(tensor, requires_grad=disk_ref.requires_grad)
         if tensor.device.type != "meta":
             CACHE.record(module, name, tensor, is_buffer=is_buffer)
+    free_mem_start = _device_free_memory(target_device)
     _rebuild_materialization_state(module, refs, state)
     _log_materialization(module, target_device, free_mem_start, refs, state, "Disk weight materialized")
 
@@ -1013,9 +1014,18 @@ def evict_for_budget(target_device: torch.device, required_bytes: int):
             entry = CACHE.pop_lru(target_device)
             if entry is None:
                 break
+            required_cpu = entry.size_bytes + RAM_HEADROOM_BYTES
             free_cpu = model_management.get_free_memory(cpu_device)
-            if free_cpu < RAM_HEADROOM_BYTES:
-                CACHE.evict_bytes(RAM_HEADROOM_BYTES - free_cpu)
+            if free_cpu < required_cpu:
+                evict_ram_cache(required_cpu - free_cpu)
+                free_cpu = model_management.get_free_memory(cpu_device)
+            if free_cpu < required_cpu:
+                # Not enough CPU capacity to stage this tensor. Evict it to meta instead.
+                module = entry.module_ref()
+                if module is not None:
+                    _evict_module_weight(module, entry.name, entry.is_buffer)
+                free = model_management.get_free_memory(target_device)
+                continue
             _move_cache_entry_to_cpu(entry)
             free = model_management.get_free_memory(target_device)
     else:

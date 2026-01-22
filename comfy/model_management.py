@@ -1380,6 +1380,7 @@ def force_upcast_attention_dtype():
         return None
 
 def get_free_memory(dev=None, torch_free_too=False):
+    soft_empty_cache()
     global directml_enabled
     if dev is None:
         dev = get_torch_device()
@@ -1400,28 +1401,28 @@ def get_free_memory(dev=None, torch_free_too=False):
             mem_reserved = stats['reserved_bytes.all.current']
             mem_free_xpu = torch.xpu.get_device_properties(dev).total_memory - mem_reserved
             mem_free_torch = mem_reserved - mem_active
-            mem_free_total = mem_free_xpu + mem_free_torch
+            mem_free_total = mem_free_xpu #+ mem_free_torch #Causes false readings
         elif is_ascend_npu():
             stats = torch.npu.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
             mem_reserved = stats['reserved_bytes.all.current']
             mem_free_npu, _ = torch.npu.mem_get_info(dev)
             mem_free_torch = mem_reserved - mem_active
-            mem_free_total = mem_free_npu + mem_free_torch
+            mem_free_total = mem_free_npu #+ mem_free_torch #Causes false readings
         elif is_mlu():
             stats = torch.mlu.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
             mem_reserved = stats['reserved_bytes.all.current']
             mem_free_mlu, _ = torch.mlu.mem_get_info(dev)
             mem_free_torch = mem_reserved - mem_active
-            mem_free_total = mem_free_mlu + mem_free_torch
+            mem_free_total = mem_free_mlu #+ mem_free_torch #Causes false readings
         else:
             stats = torch.cuda.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
             mem_reserved = stats['reserved_bytes.all.current']
             mem_free_cuda, _ = torch.cuda.mem_get_info(dev)
             mem_free_torch = mem_reserved - mem_active
-            mem_free_total = mem_free_cuda + mem_free_torch
+            mem_free_total = mem_free_cuda #+ mem_free_torch #Causes false readings
 
     if torch_free_too:
         return (mem_free_total, mem_free_torch)

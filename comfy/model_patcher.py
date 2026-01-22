@@ -164,8 +164,22 @@ def get_key_weight(model, key):
         except AttributeError:
             pass
 
-        weight = getattr(op, op_keys[1])
-        if convert_func is not None:
+        resolved_from_dw_meta = False
+        try:
+            weight = getattr(op, op_keys[1])
+        except AttributeError:
+            if not comfy.disk_weights.disk_weights_enabled():
+                raise
+            lazy_state = comfy.disk_weights.LAZY_MODULE_STATE.get(op)
+            if lazy_state is None:
+                raise
+            full_key = f"{lazy_state.prefix}{op_keys[1]}"
+            if full_key not in lazy_state.state_dict:
+                raise
+            meta = lazy_state.state_dict.meta(full_key)
+            weight = torch.empty(meta.shape, dtype=meta.dtype, device="meta")
+            resolved_from_dw_meta = True
+        if convert_func is not None and not resolved_from_dw_meta:
             weight = comfy.utils.get_attr(model, key)
 
     return weight, set_func, convert_func

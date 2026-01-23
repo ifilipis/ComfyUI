@@ -137,14 +137,60 @@ class LowVramPatch:
 LOWVRAM_PATCH_ESTIMATE_MATH_FACTOR = 2
 
 def low_vram_patch_estimate_vram(model, key):
-    weight, set_func, convert_func = get_key_weight(model, key)
-    if weight is None:
-        return 0
-    model_dtype = getattr(model, "manual_cast_dtype", torch.float32)
-    if model_dtype is None:
-        model_dtype = weight.dtype
+    if not comfy.disk_weights.disk_weights_enabled():
+        weight, set_func, convert_func = get_key_weight(model, key)
+        if weight is None:
+            return 0
+        model_dtype = getattr(model, "manual_cast_dtype", torch.float32)
+        if model_dtype is None:
+            model_dtype = weight.dtype
+        return weight.numel() * model_dtype.itemsize * LOWVRAM_PATCH_ESTIMATE_MATH_FACTOR
 
-    return weight.numel() * model_dtype.itemsize * LOWVRAM_PATCH_ESTIMATE_MATH_FACTOR
+    model_dtype = getattr(model, "manual_cast_dtype", None)
+    if model_dtype is None:
+        return 0
+    parts = key.rsplit(".", 1)
+    if len(parts) == 2:
+        module = comfy.utils.get_attr(model, parts[0])
+        local_name = parts[1]
+    else:
+        module = model
+        local_name = parts[0]
+
+    def _meta_dtype_numel(module, full_key, local_name):
+        refs = comfy.disk_weights.REGISTRY.get(module)
+        if refs and local_name in refs:
+            meta = refs[local_name].meta
+            dtype = getattr(meta, "dtype", None)
+            numel = getattr(meta, "numel", None)
+            if numel is None:
+                shape = getattr(meta, "shape", None)
+                if shape is not None:
+                    numel = 1
+                    for dim in shape:
+                        numel *= int(dim)
+            return dtype, numel
+        lazy_state = comfy.disk_weights.LAZY_MODULE_STATE.get(module)
+        if lazy_state is not None:
+            sd = lazy_state.state_dict
+            if hasattr(sd, "keys") and full_key in sd:
+                meta = sd.meta(full_key)
+                dtype = getattr(meta, "dtype", None)
+                numel = getattr(meta, "numel", None)
+                if numel is None:
+                    shape = getattr(meta, "shape", None)
+                    if shape is not None:
+                        numel = 1
+                        for dim in shape:
+                            numel *= int(dim)
+                return dtype, numel
+        return None, None
+
+    full_key = key
+    stored_dtype, numel = _meta_dtype_numel(module, full_key, local_name)
+    if stored_dtype is None or numel is None:
+        return 0
+    return numel * model_dtype.itemsize * LOWVRAM_PATCH_ESTIMATE_MATH_FACTOR
 
 def get_key_weight(model, key):
     set_func = None
@@ -682,7 +728,50 @@ class ModelPatcher:
                 module_mem = comfy.model_management.module_size(m)
                 module_offload_mem = module_mem
                 if hasattr(m, "comfy_cast_weights"):
+                    def meta_dtype_numel(local_name):
+                        full_key = "{}.{}".format(n, local_name) if n else local_name
+                        refs = comfy.disk_weights.REGISTRY.get(m)
+                        if refs and local_name in refs:
+                            meta = refs[local_name].meta
+                            dtype = getattr(meta, "dtype", None)
+                            numel = getattr(meta, "numel", None)
+                            if numel is None:
+                                shape = getattr(meta, "shape", None)
+                                if shape is not None:
+                                    numel = 1
+                                    for dim in shape:
+                                        numel *= int(dim)
+                            return dtype, numel
+                        lazy_state = comfy.disk_weights.LAZY_MODULE_STATE.get(m)
+                        if lazy_state is not None:
+                            sd = lazy_state.state_dict
+                            if hasattr(sd, "keys") and full_key in sd:
+                                meta = sd.meta(full_key)
+                                dtype = getattr(meta, "dtype", None)
+                                numel = getattr(meta, "numel", None)
+                                if numel is None:
+                                    shape = getattr(meta, "shape", None)
+                                    if shape is not None:
+                                        numel = 1
+                                        for dim in shape:
+                                            numel *= int(dim)
+                                return dtype, numel
+                        return None, None
+
                     def check_module_offload_mem(key):
+                        if comfy.disk_weights.disk_weights_enabled():
+                            model_dtype = getattr(self.model, "manual_cast_dtype", None)
+                            if model_dtype is None:
+                                return 0
+                            local_name = key.rsplit(".", 1)[-1]
+                            stored_dtype, numel = meta_dtype_numel(local_name)
+                            if stored_dtype is None or numel is None:
+                                return 0
+                            if key in self.patches:
+                                return numel * model_dtype.itemsize * LOWVRAM_PATCH_ESTIMATE_MATH_FACTOR
+                            if stored_dtype != model_dtype:
+                                return numel * model_dtype.itemsize
+                            return 0
                         if key in self.patches:
                             return low_vram_patch_estimate_vram(self.model, key)
                         model_dtype = getattr(self.model, "manual_cast_dtype", None)
@@ -728,9 +817,22 @@ class ModelPatcher:
 
                 loading = self._load_list()
                 loading.sort(reverse=True)
+                def _patch_funcs_for_key(key):
+                    op_keys = key.rsplit(".", 1)
+                    if len(op_keys) < 2:
+                        op = self.model
+                        local_name = op_keys[0]
+                    else:
+                        op = comfy.utils.get_attr(self.model, op_keys[0])
+                        local_name = op_keys[1]
+                    set_func = getattr(op, "set_{}".format(local_name), None)
+                    convert_func = getattr(op, "convert_{}".format(local_name), None)
+                    return set_func, convert_func
+
                 for _, module_mem, n, m, params in loading:
                     weight_key = "{}.weight".format(n)
                     bias_key = "{}.bias".format(n)
+                    is_lazy_module = m in comfy.disk_weights.LAZY_MODULE_STATE
 
                     placement_device = None
                     if target_is_cpu:
@@ -762,23 +864,27 @@ class ModelPatcher:
                         m.bias_function = []
 
                     if placement_device is None:
+                        comfy.disk_weights.module_to(m, torch.device("meta"), allow_materialize=False)
                         # Keep weights on meta. Apply patches lazily via LowVramPatch when used.
                         if weight_key in self.patches:
-                            _, set_func, convert_func = get_key_weight(self.model, weight_key)
+                            set_func, convert_func = _patch_funcs_for_key(weight_key)
                             m.weight_function = [LowVramPatch(weight_key, self.patches, convert_func, set_func)]
                             patch_counter += 1
                         if bias_key in self.patches:
-                            _, set_func, convert_func = get_key_weight(self.model, bias_key)
+                            set_func, convert_func = _patch_funcs_for_key(bias_key)
                             m.bias_function = [LowVramPatch(bias_key, self.patches, convert_func, set_func)]
                             patch_counter += 1
                     else:
                         # Materialize this module only onto the selected device.
-                        refs = comfy.disk_weights.REGISTRY.get(m)
-                        if refs:
-                            for local_name in sorted(refs.keys()):
-                                comfy.disk_weights.load_module_tensor(m, local_name, device=placement_device)
+                        if is_lazy_module:
+                            comfy.disk_weights.ensure_module_materialized(m, placement_device, dtype_override=None)
                         else:
-                            comfy.disk_weights.module_to(m, placement_device, allow_materialize=False)
+                            refs = comfy.disk_weights.REGISTRY.get(m)
+                            if refs:
+                                for local_name in sorted(refs.keys()):
+                                    comfy.disk_weights.load_module_tensor(m, local_name, device=placement_device)
+                            else:
+                                comfy.disk_weights.module_to(m, placement_device, allow_materialize=False)
 
                         if hasattr(m, "comfy_patched_weights") and m.comfy_patched_weights is True:
                             pass
@@ -809,13 +915,7 @@ class ModelPatcher:
                     mem_counter += move_weight_functions(m, device_to)
 
                 # Determine whether everything fit on the target device.
-                target_fully_loaded = True
-                for v in self.model.state_dict().values():
-                    if not hasattr(v, "device"):
-                        continue
-                    if v.device != device_to:
-                        target_fully_loaded = False
-                        break
+                target_fully_loaded = cpu_loaded_bytes == 0 and deferred_bytes == 0
 
                 usable_stat = "{:.2f} MB usable,".format(lowvram_model_memory / (1024 * 1024)) if lowvram_model_memory < 1e32 else ""
                 if not target_fully_loaded:

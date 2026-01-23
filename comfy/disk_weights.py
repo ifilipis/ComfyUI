@@ -1380,6 +1380,8 @@ def _materialize_module_from_state_dict(
             module.factory_kwargs["device"] = factory_device
     if len(error_msgs) > 0:
         raise RuntimeError('Error(s) in loading state_dict for {}:\n\t{}'.format(module.__class__.__name__, "\n\t".join(error_msgs)))
+    register_module_weights(module, lazy_state.state_dict, prefix=lazy_state.prefix)
+    refs = REGISTRY.get(module) or {}
     for name, disk_ref in refs.items():
         if name in module._parameters:
             tensor = module._parameters[name]

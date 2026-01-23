@@ -717,15 +717,18 @@ class ModelPatcher:
             parts = key.rsplit(".", 1)
             if len(parts) == 2:
                 module = comfy.utils.get_attr(self.model, parts[0])
-                param_name = parts[1]
+                local_name = parts[1]
             else:
                 module = self.model
-                param_name = parts[0]
-            target_device = self.offload_device or torch.device("cpu")
-            if module in comfy.disk_weights.LAZY_MODULE_STATE:
-                comfy.disk_weights.ensure_module_materialized(module, target_device, dtype_override=None)
-            else:
-                comfy.disk_weights.load_module_tensor(module, param_name, device=target_device)
+                local_name = parts[0]
+            tensor = module._parameters.get(local_name)
+            if tensor is None:
+                tensor = module._buffers.get(local_name)
+            if tensor is None or tensor.device.type != "cpu" or tensor.device.type == "meta":
+                return
+            if comfy.model_management.pin_memory(tensor):
+                self.pinned.add(key)
+            return
         weight, set_func, convert_func = get_key_weight(self.model, key)
         if comfy.model_management.pin_memory(weight):
             self.pinned.add(key)
@@ -736,15 +739,17 @@ class ModelPatcher:
                 parts = key.rsplit(".", 1)
                 if len(parts) == 2:
                     module = comfy.utils.get_attr(self.model, parts[0])
-                    param_name = parts[1]
+                    local_name = parts[1]
                 else:
                     module = self.model
-                    param_name = parts[0]
-                target_device = self.offload_device or torch.device("cpu")
-                if module in comfy.disk_weights.LAZY_MODULE_STATE:
-                    comfy.disk_weights.ensure_module_materialized(module, target_device, dtype_override=None)
-                else:
-                    comfy.disk_weights.load_module_tensor(module, param_name, device=target_device)
+                    local_name = parts[0]
+                tensor = module._parameters.get(local_name)
+                if tensor is None:
+                    tensor = module._buffers.get(local_name)
+                if tensor is not None and tensor.device.type == "cpu":
+                    comfy.model_management.unpin_memory(tensor)
+                self.pinned.discard(key)
+                return
             weight, set_func, convert_func = get_key_weight(self.model, key)
             if comfy.model_management.unpin_memory(weight):
                 self.pinned.remove(key)
@@ -1288,8 +1293,16 @@ class ModelPatcher:
                         offload_weight_factor.pop(0)
                         logging.debug("freed {}".format(n))
 
-                        for param in params:
-                            self.pin_weight_to_device("{}.{}".format(n, param))
+                        if (
+                            comfy.disk_weights.disk_weights_enabled()
+                            and device_to is not None
+                            and device_to.type == "meta"
+                        ):
+                            for param in params:
+                                self.pinned.discard("{}.{}".format(n, param))
+                        else:
+                            for param in params:
+                                self.pin_weight_to_device("{}.{}".format(n, param))
 
 
             self.model.model_lowvram = True

@@ -1323,6 +1323,8 @@ def _materialize_module_from_state_dict(
     error_msgs = []
     metadata = getattr(lazy_state.state_dict, "_metadata", None)
     local_metadata = {} if metadata is None else metadata.get(lazy_state.prefix[:-1], {})
+    local_metadata = dict(local_metadata)
+    local_metadata["assign_to_params_buffers"] = True
     refs = REGISTRY.get(module) or {}
     # Do not persist dtype overrides into storage.
     state = _get_materialization_state(module)
@@ -1382,6 +1384,7 @@ def _materialize_module_from_state_dict(
         raise RuntimeError('Error(s) in loading state_dict for {}:\n\t{}'.format(module.__class__.__name__, "\n\t".join(error_msgs)))
     register_module_weights(module, lazy_state.state_dict, prefix=lazy_state.prefix)
     refs = REGISTRY.get(module) or {}
+    _rebuild_materialization_state(module, refs, state)
     for name, disk_ref in refs.items():
         if name in module._parameters:
             tensor = module._parameters[name]

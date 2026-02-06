@@ -633,7 +633,7 @@ class LoadedModel:
             self._patcher_finalizer.detach()
 
     def is_dead(self):
-        return self.real_model() is not None and self.model is None
+        return callable(rm := getattr(self, "real_model", None)) and getattr(self, "model", None) is None
 
 
 def use_more_memory(extra_memory, loaded_models, device):

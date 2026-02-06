@@ -18,6 +18,7 @@
 
 
 import torch
+import time
 import math
 import struct
 import comfy.checkpoint_pickle

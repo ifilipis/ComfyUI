@@ -480,7 +480,7 @@ def _log_materialization(
     if total_bytes == 0:
         return
     partial = meta_bytes > 0
-    LOGGER.info(
+    LOGGER.debug(
         "%s: module=%s dest=%s load=%0.2fMB free=%0.2fMB partial=%s "
         "loaded=%0.2fMB meta=%0.2fMB cpu=%0.2fMB gpu=%0.2fMB full_load=%s",
         context,

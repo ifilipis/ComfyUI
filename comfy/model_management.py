@@ -23,7 +23,6 @@ from enum import Enum
 from comfy.cli_args import args, PerformanceFeature
 import torch
 import sys
-import importlib
 import platform
 import weakref
 import gc
@@ -351,15 +350,27 @@ try:
         except:
             rocm_version = (6, -1)
 
+        def aotriton_supported(gpu_arch):
+            path = torch.__path__[0]
+            path = os.path.join(os.path.join(path, "lib"), "aotriton.images")
+            gfx = set(map(lambda a: a[4:], filter(lambda a: a.startswith("amd-gfx"), os.listdir(path))))
+            if gpu_arch in gfx:
+                return True
+            if "{}x".format(gpu_arch[:-1]) in gfx:
+                return True
+            if "{}xx".format(gpu_arch[:-2]) in gfx:
+                return True
+            return False
+
         logging.info("AMD arch: {}".format(arch))
         logging.info("ROCm version: {}".format(rocm_version))
         if args.use_split_cross_attention == False and args.use_quad_cross_attention == False:
-            if importlib.util.find_spec('triton') is not None:  # AMD efficient attention implementation depends on triton. TODO: better way of detecting if it's compiled in or not.
+            if aotriton_supported(arch):  # AMD efficient attention implementation depends on aotriton.
                 if torch_version_numeric >= (2, 7):  # works on 2.6 but doesn't actually seem to improve much
                     if any((a in arch) for a in ["gfx90a", "gfx942", "gfx1100", "gfx1101", "gfx1151"]):  # TODO: more arches, TODO: gfx950
                         ENABLE_PYTORCH_ATTENTION = True
                 if rocm_version >= (7, 0):
-                   if any((a in arch) for a in ["gfx1201"]):
+                   if any((a in arch) for a in ["gfx1200", "gfx1201"]):
                        ENABLE_PYTORCH_ATTENTION = True
         if torch_version_numeric >= (2, 7) and rocm_version >= (6, 4):
             if any((a in arch) for a in ["gfx1200", "gfx1201", "gfx950"]):  # TODO: more arches, "gfx942" gives error on pytorch nightly 2.10 1013 rocm7.0
@@ -454,6 +465,79 @@ except:
 current_loaded_models = []
 
 def module_size(module):
+    # Disk-weights streaming models can contain modules that only create parameters during
+    # their custom _load_from_state_dict. Calling state_dict() on such modules can fail
+    # before materialization. When disk weights are enabled, compute sizes from the
+    # disk-weights registries and safetensors metadata without materializing tensors.
+    if comfy.disk_weights.disk_weights_enabled():
+        dw = comfy.disk_weights
+        total_bytes = 0
+        counted_keys = set()
+
+        for submodule in module.modules():
+            refs = dw.REGISTRY.get(submodule)
+            if refs:
+                for _, ref in refs.items():
+                    key = getattr(ref, "key", None)
+                    if key is None or key in counted_keys:
+                        continue
+                    meta = getattr(ref, "meta", None)
+                    nbytes = getattr(meta, "nbytes", None)
+                    if nbytes is None:
+                        shape = getattr(meta, "shape", None)
+                        dtype = getattr(meta, "dtype", None)
+                        if shape is not None and dtype is not None:
+                            numel = 1
+                            for d in shape:
+                                numel *= int(d)
+                            nbytes = numel * torch.empty((), dtype=dtype).element_size()
+                    if nbytes is None:
+                        continue
+                    total_bytes += int(nbytes)
+                    counted_keys.add(key)
+
+            lazy_state = dw.LAZY_MODULE_STATE.get(submodule)
+            if lazy_state is not None:
+                sd = lazy_state.state_dict
+                if hasattr(sd, "keys") and hasattr(sd, "meta"):
+                    for key in sd.keys():
+                        if key in counted_keys:
+                            continue
+                        meta = sd.meta(key)
+                        nbytes = getattr(meta, "nbytes", None)
+                        if nbytes is None:
+                            shape = getattr(meta, "shape", None)
+                            dtype = getattr(meta, "dtype", None)
+                            if shape is not None and dtype is not None:
+                                numel = 1
+                                for d in shape:
+                                    numel *= int(d)
+                                nbytes = numel * torch.empty((), dtype=dtype).element_size()
+                        if nbytes is None:
+                            continue
+                        total_bytes += int(nbytes)
+                        counted_keys.add(key)
+
+        # Include any already-materialized tensors not tracked by disk weights metadata.
+        for submodule in module.modules():
+            refs = dw.REGISTRY.get(submodule)
+
+            for name, param in getattr(submodule, "_parameters", {}).items():
+                if param is None or getattr(param, "device", None) is None or param.device.type == "meta":
+                    continue
+                if refs and name in refs and getattr(refs[name], "key", None) in counted_keys:
+                    continue
+                total_bytes += int(param.numel()) * int(param.element_size())
+
+            for name, buf in getattr(submodule, "_buffers", {}).items():
+                if buf is None or getattr(buf, "device", None) is None or buf.device.type == "meta":
+                    continue
+                if refs and name in refs and getattr(refs[name], "key", None) in counted_keys:
+                    continue
+                total_bytes += int(buf.numel()) * int(buf.element_size())
+
+        return int(total_bytes)
+
     module_mem = 0
     sd = module.state_dict()
     for k in sd:
@@ -549,7 +633,7 @@ class LoadedModel:
             self._patcher_finalizer.detach()
 
     def is_dead(self):
-        return self.real_model() is not None and self.model is None
+        return callable(rm := getattr(self, "real_model", None)) and getattr(self, "model", None) is None
 
 
 def use_more_memory(extra_memory, loaded_models, device):
@@ -1369,6 +1453,7 @@ def force_upcast_attention_dtype():
         return None
 
 def get_free_memory(dev=None, torch_free_too=False):
+    soft_empty_cache()
     global directml_enabled
     if dev is None:
         dev = get_torch_device()
@@ -1389,28 +1474,28 @@ def get_free_memory(dev=None, torch_free_too=False):
             mem_reserved = stats['reserved_bytes.all.current']
             mem_free_xpu = torch.xpu.get_device_properties(dev).total_memory - mem_reserved
             mem_free_torch = mem_reserved - mem_active
-            mem_free_total = mem_free_xpu + mem_free_torch
+            mem_free_total = mem_free_xpu #+ mem_free_torch #Causes false readings
         elif is_ascend_npu():
             stats = torch.npu.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
             mem_reserved = stats['reserved_bytes.all.current']
             mem_free_npu, _ = torch.npu.mem_get_info(dev)
             mem_free_torch = mem_reserved - mem_active
-            mem_free_total = mem_free_npu + mem_free_torch
+            mem_free_total = mem_free_npu #+ mem_free_torch #Causes false readings
         elif is_mlu():
             stats = torch.mlu.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
             mem_reserved = stats['reserved_bytes.all.current']
             mem_free_mlu, _ = torch.mlu.mem_get_info(dev)
             mem_free_torch = mem_reserved - mem_active
-            mem_free_total = mem_free_mlu + mem_free_torch
+            mem_free_total = mem_free_mlu #+ mem_free_torch #Causes false readings
         else:
             stats = torch.cuda.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
             mem_reserved = stats['reserved_bytes.all.current']
             mem_free_cuda, _ = torch.cuda.mem_get_info(dev)
             mem_free_torch = mem_reserved - mem_active
-            mem_free_total = mem_free_cuda + mem_free_torch
+            mem_free_total = mem_free_cuda #+ mem_free_torch #Causes false readings
 
     if torch_free_too:
         return (mem_free_total, mem_free_torch)

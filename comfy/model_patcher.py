@@ -136,7 +136,45 @@ class LowVramPatch:
 
 LOWVRAM_PATCH_ESTIMATE_MATH_FACTOR = 2
 
+def _disk_weight_meta_for_key(model, key):
+    if not comfy.disk_weights.disk_weights_enabled():
+        return None
+    op_keys = key.rsplit('.', 1)
+    if len(op_keys) < 2:
+        module = model
+        name = key
+    else:
+        module = comfy.utils.get_attr(model, op_keys[0])
+        name = op_keys[1]
+    if module is None:
+        return None
+    return comfy.disk_weights.get_module_tensor_meta(module, name)
+
+def _disk_weight_meta_numel(meta):
+    if meta is None:
+        return None
+    numel = getattr(meta, "numel", None)
+    if numel is not None:
+        return numel
+    shape = getattr(meta, "shape", None)
+    if shape is None:
+        return None
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    return numel
+
 def low_vram_patch_estimate_vram(model, key):
+    if comfy.disk_weights.disk_weights_enabled():
+        meta = _disk_weight_meta_for_key(model, key)
+        if meta is not None:
+            numel = _disk_weight_meta_numel(meta)
+            if numel is None:
+                return 0
+            model_dtype = getattr(model, "manual_cast_dtype", torch.float32)
+            if model_dtype is None:
+                model_dtype = getattr(meta, "dtype", torch.float32)
+            return int(numel) * model_dtype.itemsize * LOWVRAM_PATCH_ESTIMATE_MATH_FACTOR
     weight, set_func, convert_func = get_key_weight(model, key)
     if weight is None:
         return 0
@@ -686,6 +724,16 @@ class ModelPatcher:
                         if key in self.patches:
                             return low_vram_patch_estimate_vram(self.model, key)
                         model_dtype = getattr(self.model, "manual_cast_dtype", None)
+                        if comfy.disk_weights.disk_weights_enabled():
+                            meta = _disk_weight_meta_for_key(self.model, key)
+                            if meta is not None:
+                                numel = _disk_weight_meta_numel(meta)
+                                if model_dtype is None or numel is None:
+                                    return 0
+                                meta_dtype = getattr(meta, "dtype", None)
+                                if meta_dtype != model_dtype:
+                                    return int(numel) * model_dtype.itemsize
+                                return 0
                         weight, _, _ = get_key_weight(self.model, key)
                         if model_dtype is None or weight is None:
                             return 0

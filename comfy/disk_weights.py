@@ -418,6 +418,21 @@ def _state_dict_meta(state_dict: MutableMapping, key: str):
     )
 
 
+def get_module_tensor_meta(module: torch.nn.Module, name: str):
+    if not disk_weights_enabled():
+        return None
+    refs = REGISTRY.get(module)
+    if refs and name in refs:
+        return refs[name].meta
+    lazy_state = LAZY_MODULE_STATE.get(module)
+    if lazy_state is None:
+        return None
+    key = f"{lazy_state.prefix}{name}"
+    if key not in lazy_state.state_dict:
+        return None
+    return _state_dict_meta(lazy_state.state_dict, key)
+
+
 def _rebuild_materialization_state(module: torch.nn.Module, refs: Dict[str, DiskTensorRef], state: DiskMaterializationState):
     state.loaded_keys.clear()
     state.deferred_keys.clear()

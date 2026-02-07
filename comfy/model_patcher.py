@@ -146,12 +146,15 @@ def low_vram_patch_estimate_vram(model, key):
 
     return weight.numel() * model_dtype.itemsize * LOWVRAM_PATCH_ESTIMATE_MATH_FACTOR
 
-def get_key_weight(model, key):
+def get_key_weight(model, key, load_weight=True, materialize_device=None):
     set_func = None
     convert_func = None
     op_keys = key.rsplit('.', 1)
     if len(op_keys) < 2:
-        weight = comfy.utils.get_attr(model, key)
+        if not load_weight:
+            return None, set_func, convert_func
+        module = model
+        name = key
     else:
         op = comfy.utils.get_attr(model, op_keys[0])
         try:
@@ -164,6 +167,24 @@ def get_key_weight(model, key):
         except AttributeError:
             pass
 
+        if not load_weight:
+            return None, set_func, convert_func
+        module = op
+        name = op_keys[1]
+
+    if load_weight and comfy.disk_weights.disk_weights_enabled():
+        target_device = materialize_device
+        if target_device is None:
+            target_device = getattr(model, "device", None)
+        if target_device is None:
+            target_device = getattr(model, "load_device", None)
+        if target_device is None:
+            target_device = torch.device("cpu")
+        comfy.disk_weights.load_module_tensor(module, name, device=target_device)
+
+    if len(op_keys) < 2:
+        weight = comfy.utils.get_attr(model, key)
+    else:
         weight = getattr(op, op_keys[1])
         if convert_func is not None:
             weight = comfy.utils.get_attr(model, key)
@@ -764,11 +785,11 @@ class ModelPatcher:
                     if placement_device is None:
                         # Keep weights on meta. Apply patches lazily via LowVramPatch when used.
                         if weight_key in self.patches:
-                            _, set_func, convert_func = get_key_weight(self.model, weight_key)
+                            _, set_func, convert_func = get_key_weight(self.model, weight_key, load_weight=False)
                             m.weight_function = [LowVramPatch(weight_key, self.patches, convert_func, set_func)]
                             patch_counter += 1
                         if bias_key in self.patches:
-                            _, set_func, convert_func = get_key_weight(self.model, bias_key)
+                            _, set_func, convert_func = get_key_weight(self.model, bias_key, load_weight=False)
                             m.bias_function = [LowVramPatch(bias_key, self.patches, convert_func, set_func)]
                             patch_counter += 1
                     else:
@@ -810,12 +831,18 @@ class ModelPatcher:
 
                 # Determine whether everything fit on the target device.
                 target_fully_loaded = True
-                for v in self.model.state_dict().values():
-                    if not hasattr(v, "device"):
-                        continue
-                    if v.device != device_to:
+                for m in self.model.modules():
+                    lazy_state = comfy.disk_weights.LAZY_MODULE_STATE.get(m)
+                    if lazy_state is not None and not lazy_state.loaded:
                         target_fully_loaded = False
                         break
+                    refs = comfy.disk_weights.REGISTRY.get(m)
+                    if refs:
+                        state = comfy.disk_weights._get_materialization_state(m)
+                        comfy.disk_weights._rebuild_materialization_state(m, refs, state)
+                        if state.deferred_bytes > 0:
+                            target_fully_loaded = False
+                            break
 
                 usable_stat = "{:.2f} MB usable,".format(lowvram_model_memory / (1024 * 1024)) if lowvram_model_memory < 1e32 else ""
                 if not target_fully_loaded:
@@ -891,14 +918,14 @@ class ModelPatcher:
                         if force_patch_weights:
                             self.patch_weight_to_device(weight_key)
                         else:
-                            _, set_func, convert_func = get_key_weight(self.model, weight_key)
+                            _, set_func, convert_func = get_key_weight(self.model, weight_key, load_weight=False)
                             m.weight_function = [LowVramPatch(weight_key, self.patches, convert_func, set_func)]
                             patch_counter += 1
                     if bias_key in self.patches:
                         if force_patch_weights:
                             self.patch_weight_to_device(bias_key)
                         else:
-                            _, set_func, convert_func = get_key_weight(self.model, bias_key)
+                            _, set_func, convert_func = get_key_weight(self.model, bias_key, load_weight=False)
                             m.bias_function = [LowVramPatch(bias_key, self.patches, convert_func, set_func)]
                             patch_counter += 1
 
@@ -1126,14 +1153,14 @@ class ModelPatcher:
                                 if force_patch_weights:
                                     self.patch_weight_to_device(weight_key)
                                 else:
-                                    _, set_func, convert_func = get_key_weight(self.model, weight_key)
+                                    _, set_func, convert_func = get_key_weight(self.model, weight_key, load_weight=False)
                                     m.weight_function.append(LowVramPatch(weight_key, self.patches, convert_func, set_func))
                                     patch_counter += 1
                             if bias_key in self.patches:
                                 if force_patch_weights:
                                     self.patch_weight_to_device(bias_key)
                                 else:
-                                    _, set_func, convert_func = get_key_weight(self.model, bias_key)
+                                    _, set_func, convert_func = get_key_weight(self.model, bias_key, load_weight=False)
                                     m.bias_function.append(LowVramPatch(bias_key, self.patches, convert_func, set_func))
                                     patch_counter += 1
                             cast_weight = True

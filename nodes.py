@@ -313,7 +313,10 @@ class VAEDecode:
         if latent.is_nested:
             latent = latent.unbind()[0]
 
-        images = vae.decode(latent)
+        if samples.get("pixel_space_output", False):
+            images = ((latent.movedim(1, -1) + 1.0) * 0.5).clamp(0.0, 1.0)
+        else:
+            images = vae.decode(latent)
         if len(images.shape) == 5: #Combine batches
             images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
         return (images, )
@@ -1544,6 +1547,9 @@ def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, 
     out = latent.copy()
     out.pop("downscale_ratio_spacial", None)
     out["samples"] = samples
+    latent_format = model.get_model_object("latent_format")
+    if getattr(latent_format, "pixel_space_output", False):
+        out["pixel_space_output"] = True
     return (out, )
 
 class KSampler:

@@ -771,6 +771,9 @@ class SamplerCustom(io.ComfyNode):
         out = latent.copy()
         out.pop("downscale_ratio_spacial", None)
         out["samples"] = samples
+        latent_format = model.get_model_object("latent_format")
+        if getattr(latent_format, "pixel_space_output", False):
+            out["pixel_space_output"] = True
         if "x0" in x0_output:
             x0_out = model.model.process_latent_out(x0_output["x0"].cpu())
             if samples.is_nested:
@@ -778,6 +781,8 @@ class SamplerCustom(io.ComfyNode):
                 x0_out = comfy.nested_tensor.NestedTensor(comfy.utils.unpack_latents(x0_out, latent_shapes))
             out_denoised = latent.copy()
             out_denoised["samples"] = x0_out
+            if getattr(latent_format, "pixel_space_output", False):
+                out_denoised["pixel_space_output"] = True
         else:
             out_denoised = out
         return io.NodeOutput(out, out_denoised)
@@ -966,6 +971,9 @@ class SamplerCustomAdvanced(io.ComfyNode):
         out = latent.copy()
         out.pop("downscale_ratio_spacial", None)
         out["samples"] = samples
+        latent_format = guider.model_patcher.get_model_object("latent_format")
+        if getattr(latent_format, "pixel_space_output", False):
+            out["pixel_space_output"] = True
         if "x0" in x0_output:
             x0_out = guider.model_patcher.model.process_latent_out(x0_output["x0"].cpu())
             if samples.is_nested:
@@ -973,6 +981,8 @@ class SamplerCustomAdvanced(io.ComfyNode):
                 x0_out = comfy.nested_tensor.NestedTensor(comfy.utils.unpack_latents(x0_out, latent_shapes))
             out_denoised = latent.copy()
             out_denoised["samples"] = x0_out
+            if getattr(latent_format, "pixel_space_output", False):
+                out_denoised["pixel_space_output"] = True
         else:
             out_denoised = out
         return io.NodeOutput(out, out_denoised)

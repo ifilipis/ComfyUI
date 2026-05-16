@@ -799,6 +799,76 @@ class HiDreamO1Pixel(ChromaRadiance):
     """
     pass
 
+
+class AsymFlux2Oklab(ChromaRadiance):
+    """Pixel-space latent format for AsymFLUX.2 klein.
+    Converts external RGB [-1, 1] tensors to normalized Oklab and back.
+    """
+    pixel_space_output = True
+
+    def __init__(self, use_affine_norm=True, mean=(0.56, 0.0, 0.01), std=0.16):
+        super().__init__()
+        self.use_affine_norm = use_affine_norm
+        self.lrgb_to_lms = torch.tensor([
+            [0.4122214708, 0.5363325363, 0.0514459929],
+            [0.2119034982, 0.6806995451, 0.1073969566],
+            [0.0883024619, 0.2817188376, 0.6299787005],
+        ], dtype=torch.float32)
+        self.lms_to_oklab = torch.tensor([
+            [0.2104542553, 0.7936177850, -0.0040720468],
+            [1.9779984951, -2.4285922050, 0.4505937099],
+            [0.0259040371, 0.7827717662, -0.8086757660],
+        ], dtype=torch.float32)
+        self.oklab_to_lms = torch.linalg.inv(self.lms_to_oklab)
+        self.lms_to_lrgb = torch.linalg.inv(self.lrgb_to_lms)
+        self.affine_mean = torch.tensor(mean, dtype=torch.float32)
+        self.affine_std = torch.tensor(std, dtype=torch.float32)
+
+    @staticmethod
+    def _srgb_to_lrgb(srgb):
+        a = 0.055
+        return torch.where(srgb <= 0.04045, srgb / 12.92, ((srgb + a) / (1.0 + a)) ** 2.4)
+
+    @staticmethod
+    def _lrgb_to_srgb(lrgb):
+        lrgb = lrgb.clamp(min=0.0)
+        a = 0.055
+        return torch.where(lrgb <= 0.0031308, lrgb * 12.92, (1.0 + a) * (lrgb ** (1.0 / 2.4)) - a)
+
+    def _lrgb_to_oklab(self, lrgb):
+        lrgb_to_lms = self.lrgb_to_lms.to(device=lrgb.device, dtype=lrgb.dtype)
+        lms_to_oklab = self.lms_to_oklab.to(device=lrgb.device, dtype=lrgb.dtype)
+        lms = torch.einsum("ij,bj...->bi...", lrgb_to_lms, lrgb).clamp(min=0.0)
+        return torch.einsum("ij,bj...->bi...", lms_to_oklab, lms.pow(1.0 / 3.0))
+
+    def _oklab_to_lrgb(self, oklab):
+        oklab_to_lms = self.oklab_to_lms.to(device=oklab.device, dtype=oklab.dtype)
+        lms_to_lrgb = self.lms_to_lrgb.to(device=oklab.device, dtype=oklab.dtype)
+        lms = torch.einsum("ij,bj...->bi...", oklab_to_lms, oklab).pow(3.0)
+        return torch.einsum("ij,bj...->bi...", lms_to_lrgb, lms).clamp(0.0, 1.0)
+
+    def process_in(self, latent):
+        rgb = latent / 2.0 + 0.5
+        lrgb = self._srgb_to_lrgb(rgb)
+        oklab = self._lrgb_to_oklab(lrgb)
+        if self.use_affine_norm:
+            n_dim = latent.dim() - 2
+            mean = self.affine_mean.to(device=latent.device, dtype=latent.dtype).reshape(-1, *([1] * n_dim))
+            std = self.affine_std.to(device=latent.device, dtype=latent.dtype).reshape(-1, *([1] * n_dim))
+            oklab = (oklab - mean) / std
+        return oklab
+
+    def process_out(self, latent):
+        oklab = latent
+        if self.use_affine_norm:
+            n_dim = latent.dim() - 2
+            mean = self.affine_mean.to(device=latent.device, dtype=latent.dtype).reshape(-1, *([1] * n_dim))
+            std = self.affine_std.to(device=latent.device, dtype=latent.dtype).reshape(-1, *([1] * n_dim))
+            oklab = oklab * std + mean
+        lrgb = self._oklab_to_lrgb(oklab)
+        rgb = self._lrgb_to_srgb(lrgb)
+        return rgb * 2.0 - 1.0
+
 class CogVideoX(LatentFormat):
     """Latent format for CogVideoX-2b (THUDM/CogVideoX-2b).
 

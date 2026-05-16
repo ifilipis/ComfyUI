@@ -470,7 +470,7 @@ def calculate_weight(patches, weight, key, intermediate_dtype=torch.float32, ori
                 else:
                     weight += function(strength * comfy.model_management.cast_to_device(diff, weight.device, weight.dtype))
         elif patch_type == "set":
-            weight.copy_(v[0])
+            weight.copy_(function(comfy.model_management.cast_to_device(v[0], weight.device, weight.dtype)))
         elif patch_type == "model_as_lora":
             target_weight: torch.Tensor = v[0]
             diff_weight = comfy.model_management.cast_to_device(target_weight, weight.device, intermediate_dtype) - \

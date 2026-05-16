@@ -1,11 +1,15 @@
 import node_helpers
 import comfy.utils
+import comfy.sd
+import comfy.latent_formats
+import comfy.model_sampling
 from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
 import comfy.model_management
 import torch
 import math
 import nodes
+import folder_paths
 import comfy.ldm.flux.math
 
 class CLIPTextEncodeFlux(io.ComfyNode):
@@ -54,7 +58,7 @@ class EmptyFlux2LatentImage(io.ComfyNode):
     @classmethod
     def execute(cls, width, height, batch_size=1) -> io.NodeOutput:
         latent = torch.zeros([batch_size, 128, height // 16, width // 16], device=comfy.model_management.intermediate_device())
-        return io.NodeOutput({"samples": latent})
+        return io.NodeOutput({"samples": latent, "downscale_ratio_spacial": 16})
 
 class FluxGuidance(io.ComfyNode):
     @classmethod
@@ -100,6 +104,126 @@ class FluxDisableGuidance(io.ComfyNode):
         return io.NodeOutput(c)
 
     append = execute  # TODO: remove
+
+
+class AsymFlux2AdapterLoader(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="AsymFlux2AdapterLoader",
+            display_name="Load AsymFLUX.2 Adapter",
+            category="loaders/flux",
+            inputs=[
+                io.Model.Input("model"),
+                io.Combo.Input("adapter_name", options=folder_paths.get_filename_list("loras")),
+                io.Float.Input("strength_model", default=1.0, min=-100.0, max=100.0, step=0.01),
+            ],
+            outputs=[
+                io.Model.Output(),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model, adapter_name, strength_model=1.0) -> io.NodeOutput:
+        if strength_model == 0:
+            return io.NodeOutput(model)
+
+        adapter_path = folder_paths.get_full_path_or_raise("loras", adapter_name)
+        adapter_sd = comfy.utils.load_torch_file(adapter_path, safe_load=True)
+        proj_buffer = adapter_sd.get("proj_buffer", None)
+        scale_buffer = adapter_sd.get("scale_buffer", None)
+        proj_out_weight = adapter_sd.get("proj_out.weight", None)
+        x_embedder_weight = adapter_sd.get("x_embedder.weight", None)
+
+        # Convert trainable adapter keys to Comfy patches.
+        patch_sd = {}
+        for k, v in adapter_sd.items():
+            if k in ("proj_buffer", "scale_buffer", "proj_out.weight", "x_embedder.weight"):
+                continue
+            if k.startswith("time_guidance_embed.timestep_embedder.linear_1."):
+                suffix = k.split("time_guidance_embed.timestep_embedder.linear_1.", 1)[1]
+                patch_sd[f"time_text_embed.timestep_embedder.linear_1.{suffix}"] = v
+                continue
+            if k.startswith("time_guidance_embed.timestep_embedder.linear_2."):
+                suffix = k.split("time_guidance_embed.timestep_embedder.linear_2.", 1)[1]
+                patch_sd[f"time_text_embed.timestep_embedder.linear_2.{suffix}"] = v
+                continue
+            if ".lora_A." in k or ".lora_B." in k or k.endswith(".alpha") or k.endswith(".dora_scale"):
+                patch_sd[k] = v
+            elif k.endswith(".weight") or k.endswith(".bias"):
+                patch_sd[f"{k.rsplit('.', 1)[0]}.set_weight"] = v
+            else:
+                patch_sd[f"{k}.set_weight"] = v
+
+        patched_model, _ = comfy.sd.load_lora_for_models(
+            model,
+            None,
+            patch_sd,
+            strength_model,
+            0.0,
+        )
+        if patched_model is None:
+            raise RuntimeError("Failed to apply AsymFLUX adapter to model.")
+
+        if proj_buffer is None or scale_buffer is None or proj_out_weight is None or x_embedder_weight is None:
+            raise RuntimeError("AsymFLUX adapter is missing required keys: proj_buffer, scale_buffer, x_embedder.weight, or proj_out.weight.")
+
+        # Non-LoRA AsymFlow state (projection/calibration/output head and pixel-mode switch).
+        patched_model.add_object_patch("diffusion_model.proj_buffer", proj_buffer.to(torch.float32))
+        patched_model.add_object_patch("diffusion_model.scale_buffer", scale_buffer.to(torch.float32))
+        patched_model.add_object_patch("diffusion_model.asymflow_proj_out_weight", proj_out_weight.to(torch.float32))
+        patched_model.add_object_patch("diffusion_model.asymflow_x_embedder_weight", x_embedder_weight.to(torch.float32))
+        patched_model.add_object_patch("diffusion_model.asymflow_pixel_mode", True)
+        patched_model.add_object_patch("diffusion_model.asymflow_use_proj_out", True)
+        patched_model.add_object_patch("diffusion_model.asymflow_num_timesteps", 1.0)
+        patched_model.add_object_patch("diffusion_model.asymflow_dynamic_shift", True)
+        patched_model.add_object_patch("diffusion_model.asymflow_base_seq_len", float(1024 ** 2))
+        patched_model.add_object_patch("diffusion_model.asymflow_max_seq_len", float(2048 ** 2))
+        patched_model.add_object_patch("diffusion_model.asymflow_base_logshift", math.log(17.0))
+        patched_model.add_object_patch("diffusion_model.asymflow_max_logshift", math.log(34.0))
+
+        # AsymFLUX uses pixel-space Oklab-normalized latents.
+        asym_latent_format = comfy.latent_formats.AsymFlux2Oklab()
+
+        # Use FlowAdapter-compatible shifted flow sampling dynamics.
+        class AsymFlowSampling(comfy.model_sampling.ModelSamplingFlux, comfy.model_sampling.CONST):
+            def calculate_denoised(self, sigma, model_output, model_input):
+                denoised = super().calculate_denoised(sigma, model_output, model_input)
+                if getattr(self, "asymflow_clamp_denoised", False):
+                    latent_format = getattr(self, "asymflow_latent_format", None)
+                    if latent_format is not None:
+                        image = latent_format.process_out(denoised).clamp(-1.0, 1.0)
+                        denoised = latent_format.process_in(image).to(denoised.dtype)
+                return denoised
+
+        asym_sampling = AsymFlowSampling(patched_model.model.model_config)
+        asym_sampling.set_parameters(shift=math.log(17.0))
+        asym_sampling.asymflow_use_step_sigma_schedule = True
+        asym_sampling.asymflow_clamp_denoised = True
+        asym_sampling.asymflow_latent_format = asym_latent_format
+        patched_model.add_object_patch("model_sampling", asym_sampling)
+
+        patched_model.add_object_patch("latent_format", asym_latent_format)
+        patched_model.add_object_patch("model_config.latent_format", asym_latent_format)
+
+        # AsymFlow orthogonal CFG from the author implementation.
+        def asymflow_cfg(args):
+            cond = args["cond"]
+            uncond = args["uncond"]
+            cond_scale = args["cond_scale"]
+            if cond is None or uncond is None:
+                return cond
+
+            bias = (cond - uncond) * (cond_scale - 1.0)
+            parallel_dir = args["cond_denoised"]
+            if parallel_dir is not None:
+                dim = tuple(range(1, cond.ndim))
+                proj = (bias * parallel_dir).mean(dim=dim, keepdim=True) / (parallel_dir * parallel_dir).mean(dim=dim, keepdim=True).clamp(min=1e-6)
+                bias = bias - proj * parallel_dir
+            return cond + bias
+        patched_model.set_model_sampler_cfg_function(asymflow_cfg, disable_cfg1_optimization=True)
+
+        return io.NodeOutput(patched_model)
 
 
 PREFERRED_KONTEXT_RESOLUTIONS = [
@@ -302,6 +426,7 @@ class FluxExtension(ComfyExtension):
             CLIPTextEncodeFlux,
             FluxGuidance,
             FluxDisableGuidance,
+            AsymFlux2AdapterLoader,
             FluxKontextImageScale,
             FluxKontextMultiReferenceLatentMethod,
             EmptyFlux2LatentImage,

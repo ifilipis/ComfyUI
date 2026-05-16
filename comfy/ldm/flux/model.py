@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 from einops import rearrange, repeat
 import comfy.ldm.common_dit
@@ -14,6 +15,7 @@ from .layers import (
     LastLayer,
     MLPEmbedder,
     SingleStreamBlock,
+    apply_mod,
     timestep_embedding,
     Modulation,
 )
@@ -144,6 +146,79 @@ class Flux(nn.Module):
                 self.hidden_size, double=False, bias=False, dtype=dtype, device=device, operations=operations
             )
 
+        # AsymFlow buffers and constants.
+        self.asymflow_sigma_min = 1e-4
+        self.asymflow_train_sigma_min = 1e-6
+        self.asymflow_num_timesteps = 1.0
+        self.asymflow_patch_size = 16
+        self.asymflow_pixel_mode = False
+        self.asymflow_use_proj_out = False
+        self.asymflow_dynamic_shift = False
+        self.asymflow_base_seq_len = float(1024 ** 2)
+        self.asymflow_max_seq_len = float(2048 ** 2)
+        self.asymflow_base_logshift = float(torch.log(torch.tensor(17.0)))
+        self.asymflow_max_logshift = float(torch.log(torch.tensor(34.0)))
+        base_rank = min(128, self.in_channels)
+        asym_patch_dim = 3 * self.asymflow_patch_size * self.asymflow_patch_size
+        proj_dim = max(self.in_channels, asym_patch_dim)
+        eye = torch.eye(base_rank, device=device, dtype=torch.float32)
+        proj = F.pad(eye, (0, 0, 0, proj_dim - base_rank))
+        self.register_buffer("proj_buffer", proj)
+        self.register_buffer("scale_buffer", torch.tensor(1.0, device=device, dtype=torch.float32))
+        self.register_buffer(
+            "asymflow_proj_out_weight",
+            torch.zeros((asym_patch_dim, self.hidden_size), device=device, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "asymflow_x_embedder_weight",
+            torch.zeros((self.hidden_size, asym_patch_dim), device=device, dtype=torch.float32),
+        )
+
+    def asymflow_calibration(self, timestep: Tensor, batch_size: int, ndim: int):
+        timestep = timestep.float()
+        s = self.scale_buffer.float()
+        sigma = timestep / self.asymflow_num_timesteps
+        k = 1.0 / (s + (1.0 - s) * sigma)
+        cal_timestep = timestep * k
+        sigma = sigma.expand(batch_size).reshape(batch_size, *((ndim - 1) * [1])).float()
+        k = k.reshape(batch_size, *((ndim - 1) * [1]))
+        return {
+            "s": s,
+            "k": k,
+            "timestep": cal_timestep,
+            "sigma": sigma,
+        }
+
+    @staticmethod
+    def orthogonal_decomposition(full_rank_state: Tensor, proj_buffer: Tensor):
+        subspace = full_rank_state @ proj_buffer @ proj_buffer.T
+        complement = full_rank_state - subspace
+        return subspace, complement
+
+    @staticmethod
+    def _proj_for_dim(proj_buffer: Tensor, dim: int):
+        if proj_buffer.shape[0] < dim:
+            raise RuntimeError(
+                f"AsymFlow projection rows ({proj_buffer.shape[0]}) are smaller than state dim ({dim})."
+            )
+        return proj_buffer[:dim]
+
+    def asymflow_velocity(self, u_a_packed: Tensor, x_t_packed: Tensor, calibration: dict[str, Tensor]):
+        sigma_min = self.asymflow_train_sigma_min if self.training else self.asymflow_sigma_min
+        u_a_packed = u_a_packed.float()
+        x_t_packed = x_t_packed.float()
+        proj_buffer = self._proj_for_dim(self.proj_buffer.float(), x_t_packed.shape[-1])
+
+        u_a_subspace, u_a_complement = self.orthogonal_decomposition(u_a_packed, proj_buffer)
+        x_t_subspace, x_t_complement = self.orthogonal_decomposition(x_t_packed, proj_buffer)
+
+        sk = calibration["s"] * calibration["k"]
+        sigma_clamped = calibration["sigma"].clamp(min=sigma_min)
+
+        u_subspace = sk * u_a_subspace + (1.0 - sk) / sigma_clamped * x_t_subspace
+        u_complement = (x_t_complement + calibration["s"] * u_a_complement) / sigma_clamped
+        return u_subspace + u_complement
+
     def forward_orig(
         self,
         img: Tensor,
@@ -166,7 +241,10 @@ class Flux(nn.Module):
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
         # running on sequences img
-        img = self.img_in(img)
+        if self.asymflow_pixel_mode:
+            img = torch.nn.functional.linear(img, self.asymflow_x_embedder_weight.to(img.dtype))
+        else:
+            img = self.img_in(img)
         vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
         if self.params.guidance_embed:
             if guidance is not None:
@@ -308,7 +386,16 @@ class Flux(nn.Module):
         if timestep_zero_index is not None:
             extra_kwargs["modulation_dims"] = modulation_dims
 
-        img = self.final_layer(img, vec_orig, **extra_kwargs)  # (N, T, patch_size ** 2 * out_channels)
+        if self.asymflow_use_proj_out:
+            vec_proj = vec_orig
+            if vec_proj.ndim == 2:
+                vec_proj = vec_proj[:, None, :]
+            shift, scale = self.final_layer.adaLN_modulation(vec_proj).chunk(2, dim=-1)
+            mod_dims = extra_kwargs.get("modulation_dims", None)
+            img = apply_mod(self.final_layer.norm_final(img), (1 + scale), shift, mod_dims)
+            img = torch.nn.functional.linear(img, self.asymflow_proj_out_weight.to(img.dtype))
+        else:
+            img = self.final_layer(img, vec_orig, **extra_kwargs)  # (N, T, patch_size ** 2 * out_channels)
         return img
 
     def process_img(self, x, index=0, h_offset=0, w_offset=0, transformer_options={}):
@@ -350,13 +437,33 @@ class Flux(nn.Module):
 
     def _forward(self, x, timestep, context, y=None, guidance=None, ref_latents=None, control=None, transformer_options={}, **kwargs):
         bs, c, h_orig, w_orig = x.shape
-        patch_size = self.patch_size
+        patch_size = self.asymflow_patch_size if self.asymflow_pixel_mode else self.patch_size
 
         h_len = ((h_orig + (patch_size // 2)) // patch_size)
         w_len = ((w_orig + (patch_size // 2)) // patch_size)
-        img, img_ids = self.process_img(x, transformer_options=transformer_options)
-        img_tokens = img.shape[1]
+        if self.asymflow_pixel_mode:
+            x_img = comfy.ldm.common_dit.pad_to_patch_size(x, (patch_size, patch_size))
+            x_t_packed = rearrange(
+                x_img,
+                "b c (h ph) (w pw) -> b (h w) (c ph pw)",
+                ph=patch_size,
+                pw=patch_size,
+            )
+            img_ids = torch.zeros((h_len, w_len, len(self.params.axes_dim)), device=x.device, dtype=torch.float32)
+            img_ids[:, :, 1] = torch.linspace(0, h_len - 1, steps=h_len, device=x.device, dtype=torch.float32).unsqueeze(1)
+            img_ids[:, :, 2] = torch.linspace(0, w_len - 1, steps=w_len, device=x.device, dtype=torch.float32).unsqueeze(0)
+            img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs)
+        else:
+            img, img_ids = self.process_img(x, transformer_options=transformer_options)
+            x_t_packed = img
+
+        img_tokens = x_t_packed.shape[1]
+        calibration = self.asymflow_calibration(timestep, bs, x_t_packed.ndim)
+        img = x_t_packed * calibration["k"].to(x_t_packed.dtype)
+        input_timestep = calibration["timestep"]
         timestep_zero_index = None
+        ref_imgs = []
+        ref_img_ids = []
         if ref_latents is not None:
             ref_num_tokens = []
             h = 0
@@ -387,12 +494,19 @@ class Flux(nn.Module):
                     w = max(w, ref.shape[-1] + w_offset)
 
                 kontext, kontext_ids = self.process_img(ref, index=index, h_offset=h_offset, w_offset=w_offset, transformer_options=transformer_options)
-                img = torch.cat([img, kontext], dim=1)
-                img_ids = torch.cat([img_ids, kontext_ids], dim=1)
+                ref_imgs.append(kontext)
+                ref_img_ids.append(kontext_ids)
                 ref_num_tokens.append(kontext.shape[1])
+
+            if len(ref_imgs) > 0:
+                s = calibration["s"].to(img.dtype)
+                scaled_refs = [r / s for r in ref_imgs]
+                img = torch.cat([img] + scaled_refs, dim=1)
+                img_ids = torch.cat([img_ids] + ref_img_ids, dim=1)
+
             if timestep_zero:
                 if index > 0:
-                    timestep = torch.cat([timestep, timestep * 0], dim=0)
+                    input_timestep = torch.cat([input_timestep, input_timestep * 0], dim=0)
                     timestep_zero_index = [[img_tokens, img_ids.shape[1]]]
             transformer_options = transformer_options.copy()
             transformer_options["reference_image_num_tokens"] = ref_num_tokens
@@ -403,6 +517,27 @@ class Flux(nn.Module):
             for i in self.params.txt_ids_dims:
                 txt_ids[:, :, i] = torch.linspace(0, context.shape[1] - 1, steps=context.shape[1], device=x.device, dtype=torch.float32)
 
-        out = self.forward_orig(img, img_ids, context, txt_ids, timestep, y, guidance, control, timestep_zero_index=timestep_zero_index, transformer_options=transformer_options, attn_mask=kwargs.get("attention_mask", None))
-        out = out[:, :img_tokens]
-        return rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=self.patch_size, pw=self.patch_size)[:,:,:h_orig,:w_orig]
+        u_a = self.forward_orig(
+            img,
+            img_ids,
+            context,
+            txt_ids,
+            input_timestep,
+            y,
+            guidance,
+            control,
+            timestep_zero_index=timestep_zero_index,
+            transformer_options=transformer_options,
+            attn_mask=kwargs.get("attention_mask", None),
+        )
+        u_a = u_a[:, :img_tokens]
+        if u_a.shape[-1] != x_t_packed.shape[-1]:
+            proj_buffer = self._proj_for_dim(self.proj_buffer.to(u_a.dtype), x_t_packed.shape[-1])
+            if u_a.shape[-1] == proj_buffer.shape[-1]:
+                u_a = torch.matmul(u_a, proj_buffer.T)
+            else:
+                raise RuntimeError(
+                    f"AsymFlow output dim mismatch: u_A={u_a.shape[-1]}, x_t={x_t_packed.shape[-1]}, proj_rank={proj_buffer.shape[-1]}"
+                )
+        out = self.asymflow_velocity(u_a, x_t_packed, calibration).to(u_a.dtype)
+        return rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=patch_size, pw=patch_size)[:, :, :h_orig, :w_orig]

@@ -948,6 +948,9 @@ class Flux(BaseModel):
             out['ref_latents'] = list([1, 16, sum(map(lambda a: math.prod(a.size()[2:]), ref_latents))])
         return out
 
+    def process_timestep(self, timestep, x, **kwargs):
+        return timestep
+
 class LongCatImage(Flux):
     def _apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None, transformer_options={}, **kwargs):
         transformer_options = transformer_options.copy()

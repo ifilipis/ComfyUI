@@ -430,6 +430,14 @@ def ddim_scheduler(model_sampling, steps):
 
 def normal_scheduler(model_sampling, steps, sgm=False, floor=False):
     s = model_sampling
+    if getattr(s, "asymflow_use_step_sigma_schedule", False):
+        ts = torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float32)[:-1]
+        if hasattr(s, "multiplier"):
+            ts = ts * float(s.multiplier)
+        sigs = [float(s.sigma(t)) for t in ts]
+        sigs += [0.0]
+        return torch.FloatTensor(sigs)
+
     start = s.timestep(s.sigma_max)
     end = s.timestep(s.sigma_min)
 

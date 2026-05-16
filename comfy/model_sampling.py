@@ -2,6 +2,8 @@ import torch
 from comfy.ldm.modules.diffusionmodules.util import make_beta_schedule
 import math
 
+FLOW_SIGMA_EPS = 1e-4
+
 def rescale_zero_terminal_snr_sigmas(sigmas):
     alphas_cumprod = 1 / ((sigmas * sigmas) + 1)
     alphas_bar_sqrt = alphas_cumprod.sqrt()
@@ -137,6 +139,27 @@ class COSMOS_RFLOW:
 
     def inverse_noise_scaling(self, sigma, latent):
         return latent
+
+def sampling_is_flow_sigma(model_sampling):
+    return isinstance(model_sampling, CONST)
+
+def sigma_alpha(sigma, model_sampling, eps=0.0):
+    if sampling_is_flow_sigma(model_sampling):
+        return (1.0 - sigma).clamp(min=eps)
+    return torch.ones_like(sigma)
+
+def sigma_std(sigma, model_sampling, eps=0.0):
+    return sigma.clamp(min=eps)
+
+def sigma_to_half_log_snr(sigma, model_sampling, eps=1e-12):
+    if sampling_is_flow_sigma(model_sampling):
+        return torch.log(sigma_alpha(sigma, model_sampling, eps=eps)) - torch.log(sigma_std(sigma, model_sampling, eps=eps))
+    return -torch.log(sigma.clamp(min=eps))
+
+def half_log_snr_to_sigma(half_log_snr, model_sampling):
+    if sampling_is_flow_sigma(model_sampling):
+        return 1.0 / (torch.exp(half_log_snr) + 1.0)
+    return torch.exp(-half_log_snr)
 
 class ModelSamplingDiscrete(torch.nn.Module):
     def __init__(self, model_config=None, zsnr=None):

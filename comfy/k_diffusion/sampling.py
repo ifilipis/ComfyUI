@@ -151,25 +151,24 @@ class BrownianTreeNoiseSampler:
 
 def sigma_to_half_log_snr(sigma, model_sampling):
     """Convert sigma to half-logSNR log(alpha_t / sigma_t)."""
-    if isinstance(model_sampling, comfy.model_sampling.CONST):
-        # log((1 - t) / t) = log((1 - sigma) / sigma)
-        return sigma.logit().neg()
-    return sigma.log().neg()
+    return comfy.model_sampling.sigma_to_half_log_snr(sigma, model_sampling)
 
 
 def half_log_snr_to_sigma(half_log_snr, model_sampling):
     """Convert half-logSNR log(alpha_t / sigma_t) to sigma."""
-    if isinstance(model_sampling, comfy.model_sampling.CONST):
-        # 1 / (1 + exp(half_log_snr))
-        return half_log_snr.neg().sigmoid()
-    return half_log_snr.neg().exp()
+    return comfy.model_sampling.half_log_snr_to_sigma(half_log_snr, model_sampling)
 
 
-def offset_first_sigma_for_snr(sigmas, model_sampling, percent_offset=1e-4):
+def sigma_to_alpha(sigma, model_sampling):
+    """Convert Comfy sigma to the data coefficient alpha_t."""
+    return comfy.model_sampling.sigma_alpha(sigma, model_sampling)
+
+
+def offset_first_sigma_for_snr(sigmas, model_sampling, percent_offset=comfy.model_sampling.FLOW_SIGMA_EPS):
     """Adjust the first sigma to avoid invalid logSNR."""
     if len(sigmas) <= 1:
         return sigmas
-    if isinstance(model_sampling, comfy.model_sampling.CONST):
+    if comfy.model_sampling.sampling_is_flow_sigma(model_sampling):
         if sigmas[0] >= 1:
             sigmas = sigmas.clone()
             sigmas[0] = model_sampling.percent_to_sigma(percent_offset)
@@ -646,7 +645,7 @@ def sample_dpm_adaptive(model, x, sigma_min, sigma_max, extra_args=None, callbac
 
 @torch.no_grad()
 def sample_dpmpp_2s_ancestral(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None):
-    if isinstance(model.inner_model.inner_model.model_sampling, comfy.model_sampling.CONST):
+    if comfy.model_sampling.sampling_is_flow_sigma(model.inner_model.inner_model.model_sampling):
         return sample_dpmpp_2s_ancestral_RF(model, x, sigmas, extra_args, callback, disable, eta, s_noise, noise_sampler)
 
     """Ancestral sampling with DPM-Solver++(2S) second-order steps."""
@@ -688,10 +687,13 @@ def sample_dpmpp_2s_ancestral_RF(model, x, sigmas, extra_args=None, callback=Non
     extra_args = {} if extra_args is None else extra_args
     seed = extra_args.get("seed", None)
     noise_sampler = default_noise_sampler(x, seed=seed) if noise_sampler is None else noise_sampler
-    s_noise = s_noise * getattr(model.inner_model.model_patcher.get_model_object('model_sampling'), "noise_scale", 1.0)
+    model_sampling = model.inner_model.model_patcher.get_model_object('model_sampling')
+    sigmas = offset_first_sigma_for_snr(sigmas, model_sampling)
+    s_noise = s_noise * getattr(model_sampling, "noise_scale", 1.0)
     s_in = x.new_ones([x.shape[0]])
-    sigma_fn = lambda lbda: (lbda.exp() + 1) ** -1
-    lambda_fn = lambda sigma: ((1-sigma)/sigma).log()
+    sigma_fn = partial(half_log_snr_to_sigma, model_sampling=model_sampling)
+    lambda_fn = partial(sigma_to_half_log_snr, model_sampling=model_sampling)
+    alpha_fn = partial(sigma_to_alpha, model_sampling=model_sampling)
 
     # logged_x = x.unsqueeze(0)
 
@@ -699,8 +701,8 @@ def sample_dpmpp_2s_ancestral_RF(model, x, sigmas, extra_args=None, callback=Non
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         downstep_ratio = 1 + (sigmas[i+1]/sigmas[i] - 1) * eta
         sigma_down = sigmas[i+1] * downstep_ratio
-        alpha_ip1 = 1 - sigmas[i+1]
-        alpha_down = 1 - sigma_down
+        alpha_ip1 = alpha_fn(sigmas[i+1])
+        alpha_down = alpha_fn(sigma_down)
         renoise_coeff = (sigmas[i+1]**2 - sigma_down**2*alpha_ip1**2/alpha_down**2)**0.5
         # sigma_down, sigma_up = get_ancestral_step(sigmas[i], sigmas[i + 1], eta=eta)
         if callback is not None:
@@ -712,14 +714,11 @@ def sample_dpmpp_2s_ancestral_RF(model, x, sigmas, extra_args=None, callback=Non
             x = x + d * dt
         else:
             # DPM-Solver++(2S)
-            if sigmas[i] == 1.0:
-                sigma_s = 0.9999
-            else:
-                t_i, t_down = lambda_fn(sigmas[i]), lambda_fn(sigma_down)
-                r = 1 / 2
-                h = t_down - t_i
-                s = t_i + r * h
-                sigma_s = sigma_fn(s)
+            t_i, t_down = lambda_fn(sigmas[i]), lambda_fn(sigma_down)
+            r = 1 / 2
+            h = t_down - t_i
+            s = t_i + r * h
+            sigma_s = sigma_fn(s)
             # sigma_s = sigmas[i+1]
             sigma_s_i_ratio = sigma_s / sigmas[i]
             u = sigma_s_i_ratio * x + (1 - sigma_s_i_ratio) * denoised
@@ -797,8 +796,10 @@ def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=No
     """DPM-Solver++(2M)."""
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
-    sigma_fn = lambda t: t.neg().exp()
-    t_fn = lambda sigma: sigma.log().neg()
+    model_sampling = model.inner_model.model_patcher.get_model_object('model_sampling')
+    t_fn = partial(sigma_to_half_log_snr, model_sampling=model_sampling)
+    alpha_fn = partial(sigma_to_alpha, model_sampling=model_sampling)
+    sigmas = offset_first_sigma_for_snr(sigmas, model_sampling)
     old_denoised = None
 
     for i in trange(len(sigmas) - 1, disable=disable):
@@ -808,12 +809,12 @@ def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=No
         t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
         h = t_next - t
         if old_denoised is None or sigmas[i + 1] == 0:
-            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised
+            x = (sigmas[i + 1] / sigmas[i]) * x - alpha_fn(sigmas[i + 1]) * (-h).expm1() * denoised
         else:
             h_last = t - t_fn(sigmas[i - 1])
             r = h_last / h
             denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
-            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_d
+            x = (sigmas[i + 1] / sigmas[i]) * x - alpha_fn(sigmas[i + 1]) * (-h).expm1() * denoised_d
         old_denoised = denoised
     return x
 

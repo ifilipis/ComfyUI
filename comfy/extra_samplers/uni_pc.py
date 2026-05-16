@@ -3,6 +3,7 @@
 import torch
 import math
 import logging
+import comfy.model_sampling
 
 from tqdm.auto import trange
 
@@ -837,6 +838,28 @@ class SigmaConvert:
         log_std = 0.5 * torch.log(1. - torch.exp(2. * log_mean_coeff))
         return log_mean_coeff - log_std
 
+class ModelSamplingSigmaConvert:
+    schedule = ""
+
+    def __init__(self, model_sampling, eps=comfy.model_sampling.FLOW_SIGMA_EPS):
+        self.model_sampling = model_sampling
+        self.eps = eps
+
+    def marginal_log_mean_coeff(self, sigma):
+        return torch.log(comfy.model_sampling.sigma_alpha(sigma, self.model_sampling, eps=self.eps))
+
+    def marginal_alpha(self, sigma):
+        return comfy.model_sampling.sigma_alpha(sigma, self.model_sampling, eps=self.eps)
+
+    def marginal_std(self, sigma):
+        return comfy.model_sampling.sigma_std(sigma, self.model_sampling, eps=self.eps)
+
+    def marginal_lambda(self, sigma):
+        return comfy.model_sampling.sigma_to_half_log_snr(sigma, self.model_sampling, eps=self.eps)
+
+    def inverse_lambda(self, lamb):
+        return comfy.model_sampling.half_log_snr_to_sigma(lamb, self.model_sampling)
+
 def predict_eps_sigma(model, input, sigma_in, **kwargs):
     sigma = sigma_in.view(sigma_in.shape[:1] + (1,) * (input.ndim - 1))
     input = input * ((sigma ** 2 + 1.0) ** 0.5)
@@ -844,21 +867,24 @@ def predict_eps_sigma(model, input, sigma_in, **kwargs):
 
 
 def sample_unipc(model, noise, sigmas, extra_args=None, callback=None, disable=False, variant='bh1'):
+    extra_args = {} if extra_args is None else extra_args
+    model_sampling = getattr(getattr(model, "inner_model", None), "model_patcher", None)
+    if model_sampling is not None:
+        model_sampling = model_sampling.get_model_object("model_sampling")
+    else:
+        model_sampling = getattr(getattr(model, "inner_model", None), "inner_model", None)
+        model_sampling = getattr(model_sampling, "model_sampling", None)
+
+    if comfy.model_sampling.sampling_is_flow_sigma(model_sampling):
         timesteps = sigmas.clone()
-        if sigmas[-1] == 0:
-            timesteps = sigmas[:]
-            timesteps[-1] = 0.001
-        else:
-            timesteps = sigmas.clone()
-        ns = SigmaConvert()
-
-        noise = noise / torch.sqrt(1.0 + timesteps[0] ** 2.0)
-        model_type = "noise"
-
+        denoise_to_zero = timesteps[-1] == 0
+        if denoise_to_zero:
+            timesteps[-1] = comfy.model_sampling.FLOW_SIGMA_EPS
+        ns = ModelSamplingSigmaConvert(model_sampling)
         model_fn = model_wrapper(
-            lambda input, sigma, **kwargs: predict_eps_sigma(model, input, sigma, **kwargs),
+            lambda input, sigma, **kwargs: model(input, sigma, **kwargs),
             ns,
-            model_type=model_type,
+            model_type="x_start",
             guidance_type="uncond",
             model_kwargs=extra_args,
         )
@@ -866,8 +892,34 @@ def sample_unipc(model, noise, sigmas, extra_args=None, callback=None, disable=F
         order = min(3, len(timesteps) - 2)
         uni_pc = UniPC(model_fn, ns, predict_x0=True, thresholding=False, variant=variant)
         x = uni_pc.sample(noise, timesteps=timesteps, skip_type="time_uniform", method="multistep", order=order, lower_order_final=True, callback=callback, disable_pbar=disable)
-        x /= ns.marginal_alpha(timesteps[-1])
+        if denoise_to_zero:
+            x = model(x, timesteps[-1].expand(x.shape[0]), **extra_args)
         return x
+
+    timesteps = sigmas.clone()
+    if sigmas[-1] == 0:
+        timesteps = sigmas[:]
+        timesteps[-1] = 0.001
+    else:
+        timesteps = sigmas.clone()
+    ns = SigmaConvert()
+
+    noise = noise / torch.sqrt(1.0 + timesteps[0] ** 2.0)
+    model_type = "noise"
+
+    model_fn = model_wrapper(
+        lambda input, sigma, **kwargs: predict_eps_sigma(model, input, sigma, **kwargs),
+        ns,
+        model_type=model_type,
+        guidance_type="uncond",
+        model_kwargs=extra_args,
+    )
+
+    order = min(3, len(timesteps) - 2)
+    uni_pc = UniPC(model_fn, ns, predict_x0=True, thresholding=False, variant=variant)
+    x = uni_pc.sample(noise, timesteps=timesteps, skip_type="time_uniform", method="multistep", order=order, lower_order_final=True, callback=callback, disable_pbar=disable)
+    x /= ns.marginal_alpha(timesteps[-1])
+    return x
 
 def sample_unipc_bh2(model, noise, sigmas, extra_args=None, callback=None, disable=False):
     return sample_unipc(model, noise, sigmas, extra_args, callback, disable, variant='bh2')

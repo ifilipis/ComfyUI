@@ -988,8 +988,8 @@ class WorldStereoCameraJSONLoader:
     def INPUT_TYPES(s):
         return {"required": {"camera_json": (_worldstereo_camera_json_files(), )}}
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("camera",)
+    RETURN_TYPES = ("LATENT", "TENSOR", "TENSOR", "EXTRINSICS", "INTRINSICS")
+    RETURN_NAMES = ("camera", "camera_poses", "camera_intrinsics", "geometry_extrinsics", "geometry_intrinsics")
     FUNCTION = "load_camera"
     CATEGORY = "loaders"
 
@@ -1017,7 +1017,7 @@ class WorldStereoCameraJSONLoader:
         if (source_width is None) != (source_height is None):
             raise RuntimeError("WorldStereo camera JSON must provide both source width and source height, or neither.")
 
-        return ({
+        camera = {
             "samples": torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32),
             "worldstereo_camera": {
                 "extrinsics": extrinsics,
@@ -1025,7 +1025,13 @@ class WorldStereoCameraJSONLoader:
                 "source_width": source_width,
                 "source_height": source_height,
             },
-        },)
+        }
+
+        camera_poses = torch.linalg.inv(extrinsics)
+        geometry_extrinsics = extrinsics[0].tolist()
+        geometry_intrinsics = intrinsics[0].tolist()
+
+        return (camera, camera_poses, intrinsics, geometry_extrinsics, geometry_intrinsics)
 
     @classmethod
     def IS_CHANGED(s, camera_json):

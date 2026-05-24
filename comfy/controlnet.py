@@ -37,6 +37,8 @@ import comfy.cldm.mmdit
 import comfy.ldm.hydit.controlnet
 import comfy.ldm.flux.controlnet
 import comfy.ldm.qwen_image.controlnet
+import comfy.ldm.wan.worldstereo
+import comfy.ldm.wan.model
 import comfy.cldm.dit_embedder
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -320,6 +322,107 @@ class QwenFunControlNet(ControlNet):
         c.control_model_wrapped = self.control_model_wrapped
         self.copy_to(c)
         return c
+
+
+class WorldStereoControlNet(ControlBase):
+    def __init__(self, control_model, model_patches, mode="camera", load_device=None, manual_cast_dtype=None):
+        super().__init__()
+        self.control_model = control_model
+        self.control_model_wrapped = None
+        if self.control_model is not None:
+            self.control_model_wrapped = comfy.model_patcher.CoreModelPatcher(self.control_model, load_device=load_device, offload_device=comfy.model_management.unet_offload_device())
+        self.model_patches = model_patches
+        self.mode = mode
+        self.load_device = load_device
+        self.manual_cast_dtype = manual_cast_dtype
+        self.model_sampling_current = None
+        self.render_latent = None
+        self.render_mask = None
+        self.camera = None
+        self.diffusion_model_current = None
+
+    def set_worldstereo_inputs(self, render_latent, render_mask, camera):
+        self.render_latent = render_latent
+        self.render_mask = render_mask
+        self.camera = camera
+        return self
+
+    def pre_run(self, model, percent_to_timestep_function):
+        super().pre_run(model, percent_to_timestep_function)
+        self.model_sampling_current = model.model_sampling
+        self.diffusion_model_current = model.diffusion_model
+
+    def cleanup(self):
+        self.model_sampling_current = None
+        self.diffusion_model_current = None
+        super().cleanup()
+
+    def get_models(self):
+        out = super().get_models()
+        if self.control_model_wrapped is not None:
+            out.append(self.control_model_wrapped)
+        return out
+
+    def copy(self):
+        c = WorldStereoControlNet(None, self.model_patches, mode=self.mode, load_device=self.load_device, manual_cast_dtype=self.manual_cast_dtype)
+        c.control_model = self.control_model
+        c.control_model_wrapped = self.control_model_wrapped
+        c.render_latent = self.render_latent
+        c.render_mask = self.render_mask
+        c.camera = self.camera
+        self.copy_to(c)
+        return c
+
+    @staticmethod
+    def broadcast_to_control_batch(tensor, target_batch_size, batched_number):
+        if tensor.shape[0] == 1 and target_batch_size > 1:
+            return comfy.utils.repeat_to_batch_size(tensor, target_batch_size)
+        return broadcast_image_to(tensor, target_batch_size, batched_number)
+
+    def get_control(self, x_noisy, t, cond, batched_number, transformer_options):
+        control_prev = None
+        if self.previous_controlnet is not None:
+            control_prev = self.previous_controlnet.get_control(x_noisy, t, cond, batched_number, transformer_options)
+
+        dtype = self.control_model.dtype
+        if self.manual_cast_dtype is not None:
+            dtype = self.manual_cast_dtype
+
+        c_concat = cond.get("c_concat", None)
+        if c_concat is None:
+            raise RuntimeError("WorldStereo requires Wan image-to-video conditioning in c_concat.")
+        if self.render_latent is None or self.render_mask is None or self.camera is None:
+            raise RuntimeError("WorldStereo control inputs were not set by the WorldStereo Conditioning node.")
+
+        x_input = self.model_sampling_current.calculate_input(t, x_noisy)
+        c_concat = comfy.model_base.convert_tensor(c_concat, dtype, x_input.device)
+        x_input = torch.cat([x_input.to(dtype), c_concat], dim=1)
+
+        render_latent = self.render_latent.to(device=x_input.device, dtype=dtype)
+        render_mask = self.render_mask.to(device=x_input.device, dtype=dtype)
+        camera_embedding = self.camera["camera_embedding"].to(device=x_input.device, dtype=dtype)
+
+        if x_input.shape[0] != render_latent.shape[0]:
+            render_latent = self.broadcast_to_control_batch(render_latent, x_input.shape[0], batched_number)
+        if x_input.shape[0] != render_mask.shape[0]:
+            render_mask = self.broadcast_to_control_batch(render_mask, x_input.shape[0], batched_number)
+        if x_input.shape[0] != camera_embedding.shape[0]:
+            camera_embedding = self.broadcast_to_control_batch(camera_embedding, x_input.shape[0], batched_number)
+
+        timestep = self.model_sampling_current.timestep(t).float()
+        temb = self.diffusion_model_current.time_embedding(
+            comfy.ldm.wan.model.sinusoidal_embedding_1d(self.diffusion_model_current.freq_dim, timestep.flatten()).to(dtype=x_input.dtype, device=x_input.device)
+        )
+        control = self.control_model(
+            hidden_states=x_input,
+            render_latent=render_latent,
+            render_mask=render_mask,
+            camera_embedding=camera_embedding,
+            temb=temb,
+            transformer_options=transformer_options,
+        )
+        out = {"input": control, "middle": [], "output": []}
+        return self.control_merge(out, control_prev, output_dtype=None)
 
 class ControlLoraOps:
     class Linear(torch.nn.Module, comfy.ops.CastWeightBiasOp):
@@ -677,12 +780,151 @@ def load_controlnet_qwen_fun(sd, model_options={}):
     )
     return control
 
+def _worldstereo_count_blocks(sd, prefix):
+    count = 0
+    while any(k.startswith("{}{}.".format(prefix, count)) for k in sd):
+        count += 1
+    return count
+
+def _worldstereo_base_key(key):
+    out = None
+    if key == "patch_embedding.weight" or key == "patch_embedding.bias":
+        out = key
+    elif key == "proj_out.weight":
+        out = "head.head.weight"
+    elif key == "proj_out.bias":
+        out = "head.head.bias"
+    elif key == "scale_shift_table":
+        out = "head.modulation"
+    elif key.startswith("condition_embedder.text_embedder.linear_1."):
+        out = key.replace("condition_embedder.text_embedder.linear_1.", "text_embedding.0.")
+    elif key.startswith("condition_embedder.text_embedder.linear_2."):
+        out = key.replace("condition_embedder.text_embedder.linear_2.", "text_embedding.2.")
+    elif key.startswith("condition_embedder.time_embedder.linear_1."):
+        out = key.replace("condition_embedder.time_embedder.linear_1.", "time_embedding.0.")
+    elif key.startswith("condition_embedder.time_embedder.linear_2."):
+        out = key.replace("condition_embedder.time_embedder.linear_2.", "time_embedding.2.")
+    elif key.startswith("condition_embedder.time_proj."):
+        out = key.replace("condition_embedder.time_proj.", "time_projection.1.")
+    elif key.startswith("condition_embedder.image_embedder.norm1."):
+        out = key.replace("condition_embedder.image_embedder.norm1.", "img_emb.proj.0.")
+    elif key.startswith("condition_embedder.image_embedder.ff.net.0.proj."):
+        out = key.replace("condition_embedder.image_embedder.ff.net.0.proj.", "img_emb.proj.1.")
+    elif key.startswith("condition_embedder.image_embedder.ff.net.2."):
+        out = key.replace("condition_embedder.image_embedder.ff.net.2.", "img_emb.proj.3.")
+    elif key.startswith("condition_embedder.image_embedder.norm2."):
+        out = key.replace("condition_embedder.image_embedder.norm2.", "img_emb.proj.4.")
+    elif key.startswith("blocks."):
+        parts = key.split(".")
+        if len(parts) >= 5 and parts[2] == "attn1":
+            suffix = ".".join(parts[3:])
+            suffix = suffix.replace("to_q.", "q.").replace("to_k.", "k.").replace("to_v.", "v.")
+            suffix = suffix.replace("to_out.0.", "o.")
+            suffix = suffix.replace("norm_q.", "norm_q.").replace("norm_k.", "norm_k.")
+            out = "blocks.{}.self_attn.{}".format(parts[1], suffix)
+        elif len(parts) >= 6 and parts[2] == "ffn" and parts[3] == "net" and parts[5] == "proj":
+            out = "blocks.{}.ffn.{}.{}".format(parts[1], parts[4], ".".join(parts[6:]))
+        elif len(parts) == 3 and parts[2] == "scale_shift_table":
+            out = "blocks.{}.modulation".format(parts[1])
+    if out is None:
+        return None
+    return "diffusion_model.{}".format(out)
+
+WORLDSTEREO_CONTROL_CONFIG = {
+    "conv_out_dim": 5120,
+    "time_embed_dim": 5120,
+    "dim": 1024,
+    "ffn_dim": 4096,
+    "num_heads": 16,
+    "num_layers": 20,
+    "add_channels": 7,
+    "mid_channels": 256,
+    "mask_downsample": 1,
+    "render_in_channels": 36,
+    "base_model": "Wan2.1-14B",
+}
+
+WORLDSTEREO_CONTROL_SHAPES = {
+    "controlnet.controlnet_patch_embedding.weight": (5120, 36, 1, 2, 2),
+    "controlnet.controlnet_mask_embedding.mask_proj.0.weight": (256, 7, 1, 8, 8),
+    "controlnet.controlnet_blocks.0.self_attn.to_q.weight": (1024, 1024),
+    "controlnet.controlnet_blocks.0.norm1.linear.weight": (3072, 5120),
+    "controlnet.controlnet_blocks.0.ffn.0.weight": (4096, 1024),
+}
+
+def _worldstereo_validate_checkpoint(sd):
+    mismatched = []
+    for key, shape in WORLDSTEREO_CONTROL_SHAPES.items():
+        tensor = sd.get(key)
+        if tensor is None:
+            mismatched.append("{} missing".format(key))
+        elif tuple(tensor.shape) != shape:
+            mismatched.append("{} expected {}, got {}".format(key, shape, tuple(tensor.shape)))
+
+    block_count = _worldstereo_count_blocks(sd, "controlnet.controlnet_blocks.")
+    if block_count != WORLDSTEREO_CONTROL_CONFIG["num_layers"]:
+        mismatched.append("controlnet block count expected {}, got {}".format(WORLDSTEREO_CONTROL_CONFIG["num_layers"], block_count))
+
+    if mismatched:
+        raise RuntimeError("Unsupported WorldStereo checkpoint. Expected official WorldStereo control config: {}".format(mismatched))
+
+def load_controlnet_worldstereo(sd, model_options={}):
+    load_device = comfy.model_management.get_torch_device()
+    weight_dtype = comfy.utils.weight_dtype(sd)
+    unet_dtype = model_options.get("dtype", None)
+    if unet_dtype is None:
+        unet_dtype = comfy.model_management.unet_dtype(model_params=-1, supported_dtypes=[torch.float16, torch.bfloat16, torch.float32], weight_dtype=weight_dtype)
+
+    manual_cast_dtype = comfy.model_management.unet_manual_cast(unet_dtype, load_device)
+    operations = model_options.get("custom_operations", None)
+    if operations is None:
+        operations = comfy.ops.pick_operations(unet_dtype, manual_cast_dtype, disable_fast_fp8=True)
+
+    _worldstereo_validate_checkpoint(sd)
+    cfg = WORLDSTEREO_CONTROL_CONFIG.copy()
+
+    control_model = comfy.ldm.wan.worldstereo.WorldStereoControlNetModel(
+        operations=operations,
+        device=comfy.model_management.unet_offload_device(),
+        dtype=unet_dtype,
+        **cfg,
+    )
+
+    control_sd = {}
+    model_patches = {}
+    unmapped = []
+    for k, v in sd.items():
+        if k.startswith("controlnet."):
+            control_sd[k[len("controlnet."):]] = v
+        else:
+            mapped = _worldstereo_base_key(k)
+            if mapped is not None:
+                model_patches[mapped] = ("set", (v,))
+            else:
+                unmapped.append(k)
+
+    if len(unmapped) > 0:
+        raise RuntimeError("Unmapped WorldStereo base patch keys: {}".format(unmapped[:20] + (["..."] if len(unmapped) > 20 else [])))
+
+    missing, unexpected = control_model.load_state_dict(control_sd, strict=False)
+    if len(missing) > 0:
+        raise RuntimeError("Missing WorldStereo controlnet keys: {}".format(missing))
+    if len(unexpected) > 0:
+        raise RuntimeError("Unexpected WorldStereo controlnet keys: {}".format(unexpected))
+
+    mode = "memory" if "blocks.0.ffn.net.0.proj.weight" in sd else "camera"
+    control = WorldStereoControlNet(control_model, model_patches, mode=mode, load_device=load_device, manual_cast_dtype=manual_cast_dtype)
+    return control
+
 def convert_mistoline(sd):
     return comfy.utils.state_dict_prefix_replace(sd, {"single_controlnet_blocks.": "controlnet_single_blocks."})
 
 
 def load_controlnet_state_dict(state_dict, model=None, model_options={}):
     controlnet_data = state_dict
+    if "controlnet.controlnet_blocks.0.self_attn.to_q.weight" in controlnet_data and "controlnet.controlnet_patch_embedding.weight" in controlnet_data:
+        return load_controlnet_worldstereo(controlnet_data, model_options=model_options)
+
     if 'after_proj_list.18.bias' in controlnet_data.keys(): #Hunyuan DiT
         return load_controlnet_hunyuandit(controlnet_data, model_options=model_options)
 

@@ -527,6 +527,7 @@ class WanModel(torch.nn.Module):
         context,
         clip_fea=None,
         freqs=None,
+        control=None,
         transformer_options={},
         **kwargs,
     ):
@@ -595,6 +596,13 @@ class WanModel(torch.nn.Module):
                 x = out["img"]
             else:
                 x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
+
+            if control is not None:
+                control_i = control.get("input")
+                if control_i is not None and i < len(control_i):
+                    add = control_i[i]
+                    if add is not None:
+                        x += add.to(dtype=x.dtype, device=x.device)
 
         # head
         x = self.head(x, e)

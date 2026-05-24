@@ -29,6 +29,7 @@ import comfy.sample
 import comfy.sd
 import comfy.utils
 import comfy.controlnet
+import comfy.ldm.wan.worldstereo
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict, FileLocator
 from comfy_api.internal import register_versions, ComfyAPIWithVersion
 from comfy_api.version_list import supported_versions
@@ -313,7 +314,18 @@ class VAEDecode:
         if latent.is_nested:
             latent = latent.unbind()[0]
 
-        images = vae.decode(latent)
+        if samples.get("worldstereo_keyframe_decode", False):
+            if latent.ndim != 5:
+                raise RuntimeError("WorldStereo keyframe decode requires a Wan video latent.")
+            decoded_frames = []
+            for i in range(latent.shape[2]):
+                decoded = vae.decode(latent[:, :, i:i + 1])
+                if len(decoded.shape) != 5 or decoded.shape[1] != 1:
+                    raise RuntimeError("WorldStereo keyframe decode requires a Wan video VAE.")
+                decoded_frames.append(decoded)
+            images = torch.cat(decoded_frames, dim=1)
+        else:
+            images = vae.decode(latent)
         if len(images.shape) == 5: #Combine batches
             images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
         return (images, )
@@ -930,6 +942,288 @@ class ControlNetApplyAdvanced:
                 c.append(n)
             out.append(c)
         return (out[0], out[1])
+
+
+def _worldstereo_camera_json_files():
+    input_dir = folder_paths.get_input_directory()
+    out = []
+    for root, _, files in os.walk(input_dir):
+        for f in files:
+            if f.lower().endswith(".json"):
+                out.append(os.path.relpath(os.path.join(root, f), input_dir))
+    return sorted(out)
+
+
+def _worldstereo_tensor_from_json(value, name, dims):
+    tensor = torch.tensor(np.array(value), dtype=torch.float32)
+    if tensor.ndim == dims - 1:
+        tensor = tensor.unsqueeze(0)
+    if tensor.ndim != dims:
+        raise RuntimeError("WorldStereo camera JSON field {} has invalid rank.".format(name))
+    return tensor
+
+
+def _worldstereo_optional_positive_int(data, names):
+    for name in names:
+        value = data.get(name, None)
+        if value is None:
+            continue
+        value = int(value)
+        if value <= 0:
+            raise RuntimeError("WorldStereo camera JSON field {} must be positive.".format(name))
+        return value
+    return None
+
+
+def _worldstereo_validate_camera_frame_counts(extrinsics, intrinsics):
+    ext_frames = extrinsics.shape[0]
+    int_frames = intrinsics.shape[0]
+    if ext_frames == int_frames or ext_frames == 1 or int_frames == 1:
+        return
+    raise RuntimeError("WorldStereo camera JSON intrinsic/extrinsic frame counts must match unless one is a singleton.")
+
+
+class WorldStereoCameraJSONLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"camera_json": (_worldstereo_camera_json_files(), )}}
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("camera",)
+    FUNCTION = "load_camera"
+    CATEGORY = "loaders"
+
+    def load_camera(self, camera_json):
+        camera_path = folder_paths.get_annotated_filepath(camera_json)
+        with open(camera_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if "extrinsic" not in data or "intrinsic" not in data:
+            raise RuntimeError("WorldStereo camera JSON requires extrinsic and intrinsic arrays.")
+
+        extrinsics = _worldstereo_tensor_from_json(data["extrinsic"], "extrinsic", 3)
+        intrinsics = _worldstereo_tensor_from_json(data["intrinsic"], "intrinsic", 3)
+
+        if extrinsics.shape[-2:] != (4, 4):
+            raise RuntimeError("WorldStereo extrinsic matrices must be 4x4.")
+        if intrinsics.shape[-2:] != (3, 3):
+            raise RuntimeError("WorldStereo intrinsic matrices must be 3x3.")
+        _worldstereo_validate_camera_frame_counts(extrinsics, intrinsics)
+        if not torch.isfinite(extrinsics).all() or not torch.isfinite(intrinsics).all():
+            raise RuntimeError("WorldStereo camera JSON contains non-finite camera values.")
+
+        source_width = _worldstereo_optional_positive_int(data, ("width", "image_width", "original_width"))
+        source_height = _worldstereo_optional_positive_int(data, ("height", "image_height", "original_height"))
+        if (source_width is None) != (source_height is None):
+            raise RuntimeError("WorldStereo camera JSON must provide both source width and source height, or neither.")
+
+        return ({
+            "samples": torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32),
+            "worldstereo_camera": {
+                "extrinsics": extrinsics,
+                "intrinsics": intrinsics,
+                "source_width": source_width,
+                "source_height": source_height,
+            },
+        },)
+
+    @classmethod
+    def IS_CHANGED(s, camera_json):
+        camera_path = folder_paths.get_annotated_filepath(camera_json)
+        m = hashlib.sha256()
+        with open(camera_path, "rb") as f:
+            m.update(f.read())
+        return m.digest().hex()
+
+    @classmethod
+    def VALIDATE_INPUTS(s, camera_json):
+        if not folder_paths.exists_annotated_filepath(camera_json):
+            return "Invalid camera JSON file: {}".format(camera_json)
+        return True
+
+
+def _worldstereo_video_mask(mask):
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    if mask.ndim == 3:
+        mask = mask.unsqueeze(0).unsqueeze(0)
+    elif mask.ndim == 4:
+        mask = mask.unsqueeze(1)
+    if mask.ndim != 5:
+        raise RuntimeError("WorldStereo render mask must be a video mask.")
+    return mask
+
+
+def _worldstereo_match_frames(tensor, frames, name):
+    if tensor.shape[0] == frames:
+        return tensor
+    if tensor.shape[0] == 1:
+        if tensor.ndim < 3:
+            raise RuntimeError("WorldStereo {} singleton frame data has invalid rank.".format(name))
+        return tensor.repeat(frames, *([1] * (tensor.ndim - 1)))
+    if tensor.shape[0] > frames:
+        indices = torch.linspace(0, tensor.shape[0] - 1, frames, dtype=torch.long)
+        return tensor[indices]
+    raise RuntimeError("WorldStereo {} frame count does not match render mask frames.".format(name))
+
+
+def _worldstereo_scale_intrinsics(intrinsics, source_width, source_height, target_width, target_height):
+    intrinsics = intrinsics.clone()
+    intrinsics[:, 0, :] *= float(target_width) / float(source_width)
+    intrinsics[:, 1, :] *= float(target_height) / float(source_height)
+    return intrinsics
+
+
+def _worldstereo_resize_image(image, width, height, length=None):
+    if length is not None:
+        if image.shape[0] > length:
+            indices = torch.linspace(0, image.shape[0] - 1, length, dtype=torch.long)
+            image = image[indices]
+        else:
+            image = image[:length]
+    return comfy.utils.common_upscale(image.movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
+
+
+def _worldstereo_select_video_frames(tensor, frames, name):
+    if tensor.shape[2] == frames:
+        return tensor
+    if tensor.shape[2] > frames:
+        indices = torch.linspace(0, tensor.shape[2] - 1, frames, dtype=torch.long)
+        return tensor[:, :, indices]
+    raise RuntimeError("WorldStereo {} frame count must be at least the Wan latent frame count.".format(name))
+
+
+def _worldstereo_encode_keyframes(vae, image):
+    latents = []
+    for i in range(image.shape[0]):
+        latents.append(vae.encode(image[i:i + 1, :, :, :3]))
+    return torch.cat(latents, dim=2)
+
+
+def _worldstereo_first_frame_condition(vae, start_image, batch_size, latent_frames, width, height):
+    start_image = _worldstereo_resize_image(start_image, width, height, 1)
+    first_latent = vae.encode(start_image[:, :, :, :3]).repeat(batch_size, 1, 1, 1, 1)
+    zero_image = torch.ones((1, height, width, 3), device=start_image.device, dtype=start_image.dtype) * 0.5
+    zero_latent = vae.encode(zero_image).repeat(batch_size, 1, max(0, latent_frames - 1), 1, 1)
+    if latent_frames > 1:
+        return torch.cat([first_latent, zero_latent], dim=2)
+    return first_latent
+
+
+class WorldStereoConditioning:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "model": ("MODEL",),
+            "positive": ("CONDITIONING",),
+            "negative": ("CONDITIONING",),
+            "vae": ("VAE",),
+            "control_net": ("CONTROL_NET",),
+            "width": ("INT", {"default": 832, "min": 16, "max": MAX_RESOLUTION, "step": 16}),
+            "height": ("INT", {"default": 480, "min": 16, "max": MAX_RESOLUTION, "step": 16}),
+            "length": ("INT", {"default": 21, "min": 1, "max": MAX_RESOLUTION, "step": 4}),
+            "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
+            "start_image": ("IMAGE",),
+            "render_image": ("IMAGE",),
+            "render_mask": ("MASK",),
+            "camera": ("LATENT",),
+            "clip_vision_output": ("CLIP_VISION_OUTPUT",),
+        }}
+
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT")
+    RETURN_NAMES = ("model", "positive", "negative", "latent")
+    FUNCTION = "apply_worldstereo"
+    CATEGORY = "conditioning/controlnet"
+
+    def apply_worldstereo(self, model, positive, negative, vae, control_net, width, height, length, batch_size, start_image, render_image, render_mask, camera, clip_vision_output):
+        model_patches = getattr(control_net, "model_patches", None)
+        if not model_patches:
+            raise RuntimeError("WorldStereo conditioning requires a WorldStereo checkpoint loaded with ControlNetLoader.")
+        if getattr(control_net, "mode", "camera") != "camera":
+            raise RuntimeError("WorldStereo memory checkpoints require reference-memory inputs and are not valid for the camera conditioning node.")
+
+        out_model = model.clone()
+        model_sd = out_model.model_state_dict()
+        missing = sorted(k for k in model_patches if k not in model_sd)
+        if missing:
+            raise RuntimeError("WorldStereo base patch does not match the connected Wan model.")
+        mismatched = []
+        for k, patch in model_patches.items():
+            if patch[0] == "set" and model_sd[k].shape != patch[1][0].shape:
+                mismatched.append(k)
+        if mismatched:
+            raise RuntimeError("WorldStereo base patch tensor shapes do not match the connected Wan model.")
+        patched = set(out_model.add_patches(model_patches, strength_patch=1.0, strength_model=1.0))
+        missing = sorted(set(model_patches.keys()) - patched)
+        if missing:
+            raise RuntimeError("WorldStereo base patch does not match the connected Wan model.")
+
+        latent_frames = length
+        latent = torch.zeros([batch_size, 16, latent_frames, height // 8, width // 8], device=comfy.model_management.intermediate_device())
+
+        concat_latent_image = _worldstereo_first_frame_condition(vae, start_image, batch_size, latent_frames, width, height)
+        concat_mask = torch.ones((1, 1, latent_frames, concat_latent_image.shape[-2], concat_latent_image.shape[-1]), device=concat_latent_image.device, dtype=concat_latent_image.dtype)
+        concat_mask[:, :, 0] = 0.0
+        positive = node_helpers.conditioning_set_values(positive, {"concat_latent_image": concat_latent_image, "concat_mask": concat_mask, "clip_vision_output": clip_vision_output})
+        negative = node_helpers.conditioning_set_values(negative, {"concat_latent_image": concat_latent_image, "concat_mask": concat_mask, "clip_vision_output": clip_vision_output})
+
+        render_image = _worldstereo_resize_image(render_image, width, height, latent_frames)
+        if render_image.shape[0] != latent_frames:
+            raise RuntimeError("WorldStereo render_image must contain one frame per Wan latent frame.")
+        render_image[0:1] = _worldstereo_resize_image(start_image, width, height, 1)
+        render_latent_samples = _worldstereo_encode_keyframes(vae, render_image)
+        render_latent_samples = out_model.model.latent_format.process_in(render_latent_samples)
+
+        render_mask_samples = _worldstereo_video_mask(render_mask)
+        render_mask_samples = _worldstereo_select_video_frames(render_mask_samples, latent_frames, "render_mask")
+        render_mask_samples = comfy.utils.common_upscale(render_mask_samples.flatten(0, 2).unsqueeze(1), width, height, "nearest-exact", "center").reshape(render_mask_samples.shape[0], render_mask_samples.shape[1], render_mask_samples.shape[2], height, width)
+        render_mask_samples = (render_mask_samples >= 0.5).to(dtype=render_mask_samples.dtype)
+        camera_data = camera.get("worldstereo_camera", None)
+        if camera_data is None:
+            raise RuntimeError("WorldStereo conditioning requires the WorldStereo Camera JSON Loader output.")
+
+        frames = render_mask_samples.shape[2]
+        if render_latent_samples.shape[2] != frames:
+            raise RuntimeError("WorldStereo render latent and render mask must have the same frame count.")
+
+        intrinsics = _worldstereo_match_frames(camera_data["intrinsics"], frames, "intrinsic")
+        extrinsics = _worldstereo_match_frames(camera_data["extrinsics"], frames, "extrinsic")
+        if intrinsics.shape[0] != frames or extrinsics.shape[0] != frames:
+            raise RuntimeError("WorldStereo camera frame count does not match render mask frames.")
+        height = render_mask_samples.shape[-2]
+        width = render_mask_samples.shape[-1]
+        source_width = camera_data.get("source_width", None)
+        source_height = camera_data.get("source_height", None)
+        if source_width is None:
+            source_width = start_image.shape[2]
+        if source_height is None:
+            source_height = start_image.shape[1]
+        intrinsics = _worldstereo_scale_intrinsics(intrinsics, source_width, source_height, width, height)
+        camera_embedding = comfy.ldm.wan.worldstereo.get_camera_embedding(intrinsics, extrinsics, frames, height, width, normalize=True, is_w2c=True)
+        prepared_camera = {
+            "intrinsics": intrinsics,
+            "extrinsics": extrinsics,
+            "camera_embedding": camera_embedding,
+        }
+
+        cnets = {}
+        out = []
+        for conditioning in [positive, negative]:
+            c = []
+            for t in conditioning:
+                d = t[1].copy()
+                prev_cnet = d.get("control", None)
+                if prev_cnet in cnets:
+                    c_net = cnets[prev_cnet]
+                else:
+                    c_net = control_net.copy().set_worldstereo_inputs(render_latent_samples, render_mask_samples, prepared_camera)
+                    c_net.set_previous_controlnet(prev_cnet)
+                    cnets[prev_cnet] = c_net
+                d["control"] = c_net
+                d["control_apply_to_uncond"] = False
+                c.append([t[0], d])
+            out.append(c)
+        return (out_model, out[0], out[1], {"samples": latent, "worldstereo_keyframe_decode": True})
 
 
 class UNETLoader:
@@ -2060,6 +2354,8 @@ NODE_CLASS_MAPPINGS = {
     "unCLIPConditioning": unCLIPConditioning,
     "ControlNetApply": ControlNetApply,
     "ControlNetApplyAdvanced": ControlNetApplyAdvanced,
+    "WorldStereoConditioning": WorldStereoConditioning,
+    "WorldStereoCameraJSONLoader": WorldStereoCameraJSONLoader,
     "ControlNetLoader": ControlNetLoader,
     "DiffControlNetLoader": DiffControlNetLoader,
     "StyleModelLoader": StyleModelLoader,
@@ -2095,6 +2391,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CLIPLoader": "Load CLIP",
     "ControlNetLoader": "Load ControlNet Model",
     "DiffControlNetLoader": "Load ControlNet Model (diff)",
+    "WorldStereoCameraJSONLoader": "Load WorldStereo Camera JSON",
+    "WorldStereoConditioning": "WorldStereo Conditioning",
     "StyleModelLoader": "Load Style Model",
     "CLIPVisionLoader": "Load CLIP Vision",
     "UNETLoader": "Load Diffusion Model",

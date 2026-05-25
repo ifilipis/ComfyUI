@@ -1445,6 +1445,19 @@ class WAN21(BaseModel):
         if reference_latents is not None:
             out['reference_latent'] = comfy.conds.CONDRegular(self.process_latent_in(reference_latents[-1])[:, :, 0])
 
+        worldstereo_reference_latent = kwargs.get("worldstereo_reference_latent", None)
+        if worldstereo_reference_latent is not None:
+            out["worldstereo_reference_latent"] = comfy.conds.CONDRegular(worldstereo_reference_latent)
+        worldstereo_ref_index = kwargs.get("worldstereo_ref_index", None)
+        if worldstereo_ref_index is not None:
+            out["worldstereo_ref_index"] = comfy.conds.CONDRegular(worldstereo_ref_index)
+        worldstereo_camera_qt = kwargs.get("worldstereo_camera_qt", None)
+        if worldstereo_camera_qt is not None:
+            out["worldstereo_camera_qt"] = comfy.conds.CONDRegular(worldstereo_camera_qt)
+        worldstereo_camera_qt_ref = kwargs.get("worldstereo_camera_qt_ref", None)
+        if worldstereo_camera_qt_ref is not None:
+            out["worldstereo_camera_qt_ref"] = comfy.conds.CONDRegular(worldstereo_camera_qt_ref)
+
         return out
 
 

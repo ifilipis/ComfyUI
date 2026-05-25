@@ -983,6 +983,24 @@ def _worldstereo_validate_camera_frame_counts(extrinsics, intrinsics):
     raise RuntimeError("WorldStereo camera JSON intrinsic/extrinsic frame counts must match unless one is a singleton.")
 
 
+def _worldstereo_ref_index_from_json(data):
+    value = None
+    for name in ("ref_index", "ref_indices", "reference_index", "reference_indices"):
+        if name in data:
+            value = data[name]
+            break
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = sorted(int(k) for k in value.keys())
+    tensor = torch.tensor(value, dtype=torch.long).flatten()
+    if tensor.numel() == 0:
+        raise RuntimeError("WorldStereo reference indices must not be empty.")
+    if torch.min(tensor) < 0:
+        raise RuntimeError("WorldStereo reference indices must be non-negative.")
+    return tensor
+
+
 class WorldStereoCameraJSONLoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -1024,6 +1042,7 @@ class WorldStereoCameraJSONLoader:
                 "intrinsics": intrinsics,
                 "source_width": source_width,
                 "source_height": source_height,
+                "ref_index": _worldstereo_ref_index_from_json(data),
             },
         }
 
@@ -1116,6 +1135,35 @@ def _worldstereo_first_frame_condition(vae, start_image, batch_size, latent_fram
     return first_latent
 
 
+def _worldstereo_prepare_reference_memory(model, vae, reference_image, reference_camera, target_extrinsics, target_frames, width, height):
+    if reference_image is None or reference_camera is None:
+        raise RuntimeError("WorldStereo memory checkpoints require reference video and reference camera conditioning.")
+
+    reference_image = _worldstereo_resize_image(reference_image, width, height)
+    reference_latent = _worldstereo_encode_keyframes(vae, reference_image)
+    reference_latent = model.model.latent_format.process_in(reference_latent)
+    reference_mask = torch.ones_like(reference_latent[:, :4])
+    reference_latent = torch.cat([reference_latent, reference_mask, reference_latent], dim=1)
+
+    ref_data = reference_camera.get("worldstereo_camera", None)
+    if ref_data is None:
+        raise RuntimeError("WorldStereo memory conditioning requires the WorldStereo Camera JSON Loader output for reference cameras.")
+    ref_frames = reference_latent.shape[2]
+    reference_extrinsics = _worldstereo_match_frames(ref_data["extrinsics"], ref_frames, "reference extrinsic")
+    ref_index = ref_data.get("ref_index", None)
+    if ref_index is None:
+        ref_index = torch.arange(ref_frames, dtype=torch.long)
+    else:
+        ref_index = ref_index.to(dtype=torch.long).flatten()
+        if ref_index.shape[0] != ref_frames:
+            raise RuntimeError("WorldStereo reference index count must match reference video frames.")
+    if ref_index.numel() == 0 or torch.min(ref_index) < 0 or torch.max(ref_index) + 1 >= target_frames:
+        raise RuntimeError("WorldStereo reference indices must map to target frames 1 through length-1.")
+
+    camera_qt, camera_qt_ref = comfy.ldm.wan.worldstereo.camera_qt_embedding(target_extrinsics, reference_extrinsics)
+    return reference_latent, ref_index.unsqueeze(0), camera_qt, camera_qt_ref
+
+
 class WorldStereoConditioning:
     @classmethod
     def INPUT_TYPES(s):
@@ -1134,6 +1182,9 @@ class WorldStereoConditioning:
             "render_mask": ("MASK",),
             "camera": ("LATENT",),
             "clip_vision_output": ("CLIP_VISION_OUTPUT",),
+        }, "optional": {
+            "reference_image": ("IMAGE",),
+            "reference_camera": ("LATENT",),
         }}
 
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT")
@@ -1141,14 +1192,14 @@ class WorldStereoConditioning:
     FUNCTION = "apply_worldstereo"
     CATEGORY = "conditioning/controlnet"
 
-    def apply_worldstereo(self, model, positive, negative, vae, control_net, width, height, length, batch_size, start_image, render_image, render_mask, camera, clip_vision_output):
+    def apply_worldstereo(self, model, positive, negative, vae, control_net, width, height, length, batch_size, start_image, render_image, render_mask, camera, clip_vision_output, reference_image=None, reference_camera=None):
         model_patches = getattr(control_net, "model_patches", None)
         if not model_patches:
             raise RuntimeError("WorldStereo conditioning requires a WorldStereo checkpoint loaded with ControlNetLoader.")
-        if getattr(control_net, "mode", "camera") != "camera":
-            raise RuntimeError("WorldStereo memory checkpoints require reference-memory inputs and are not valid for the camera conditioning node.")
 
         out_model = model.clone()
+        for object_name, object_patch in getattr(control_net, "model_object_patches", {}).items():
+            out_model.add_object_patch(object_name, object_patch)
         model_sd = out_model.model_state_dict()
         missing = sorted(k for k in model_patches if k not in model_sd)
         if missing:
@@ -1212,6 +1263,17 @@ class WorldStereoConditioning:
             "camera_embedding": camera_embedding,
         }
 
+        memory_values = {}
+        if getattr(control_net, "mode", "camera") == "memory":
+            if reference_image is not None or reference_camera is not None:
+                reference_latent, ref_index, camera_qt, camera_qt_ref = _worldstereo_prepare_reference_memory(out_model, vae, reference_image, reference_camera, extrinsics, frames, width, height)
+                memory_values = {
+                    "worldstereo_reference_latent": reference_latent,
+                    "worldstereo_ref_index": ref_index,
+                    "worldstereo_camera_qt": camera_qt,
+                    "worldstereo_camera_qt_ref": camera_qt_ref,
+                }
+
         cnets = {}
         out = []
         for conditioning in [positive, negative]:
@@ -1226,6 +1288,7 @@ class WorldStereoConditioning:
                     c_net.set_previous_controlnet(prev_cnet)
                     cnets[prev_cnet] = c_net
                 d["control"] = c_net
+                d.update(memory_values)
                 d["control_apply_to_uncond"] = False
                 c.append([t[0], d])
             out.append(c)

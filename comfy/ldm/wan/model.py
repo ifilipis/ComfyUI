@@ -260,6 +260,63 @@ class WanAttentionBlock(nn.Module):
         return x
 
 
+def wan_worldstereo_sparse_block(block, x, ref, e, freqs, ref_freqs, context, context_img_len=257, transformer_options={}):
+    if ref is None:
+        raise RuntimeError("WorldStereo memory model requires reference latents.")
+
+    if e.ndim < 4:
+        e = (comfy.model_management.cast_to(block.modulation, dtype=x.dtype, device=x.device) + e).chunk(6, dim=1)
+    else:
+        e = (comfy.model_management.cast_to(block.modulation, dtype=x.dtype, device=x.device).unsqueeze(0) + e).unbind(2)
+
+    x = x.contiguous()
+    ref = ref.contiguous()
+    x_norm = torch.addcmul(repeat_e(e[0], x), block.norm1(x), 1 + repeat_e(e[1], x))
+    ref_norm = torch.addcmul(repeat_e(e[0], ref), block.norm1(ref), 1 + repeat_e(e[1], ref))
+
+    b, s, n, d = *x_norm.shape[:2], block.self_attn.num_heads, block.self_attn.head_dim
+    ref_s = ref_norm.shape[1]
+    q = block.self_attn.norm_q(block.self_attn.q(x_norm)).view(b, s, n, d)
+    k = block.self_attn.norm_k(block.self_attn.k(x_norm)).view(b, s, n, d)
+    v = block.self_attn.v(x_norm).view(b, s, n * d)
+    ref_q = block.self_attn.norm_q(block.self_attn.q(ref_norm)).view(b, ref_s, n, d)
+    ref_k = block.self_attn.norm_k(block.self_attn.k(ref_norm)).view(b, ref_s, n, d)
+    ref_v = block.self_attn.v(ref_norm).view(b, ref_s, n * d)
+
+    q = apply_rope1(q, freqs)
+    k = apply_rope1(k, freqs)
+    ref_q = apply_rope1(ref_q, ref_freqs)
+    ref_k = apply_rope1(ref_k, ref_freqs)
+
+    combined = optimized_attention(
+        torch.cat([ref_q.view(b, ref_s, n * d), q.view(b, s, n * d)], dim=1),
+        torch.cat([ref_k.view(b, ref_s, n * d), k.view(b, s, n * d)], dim=1),
+        torch.cat([ref_v, v], dim=1),
+        heads=block.self_attn.num_heads,
+        transformer_options=transformer_options,
+    )
+    ref_y = combined[:, :ref_s]
+    y = combined[:, ref_s:]
+    del combined
+
+    y = block.self_attn.o(y)
+    ref_y = block.self_attn.o(ref_y)
+    x = torch.addcmul(x, y, repeat_e(e[2], x))
+    ref = torch.addcmul(ref, ref_y, repeat_e(e[2], ref))
+    del y, ref_y
+
+    x = x + block.cross_attn(block.norm3(x), context, context_img_len=context_img_len, transformer_options=transformer_options)
+    if "attn2_patch" in transformer_options.get("patches", {}):
+        for p in transformer_options["patches"]["attn2_patch"]:
+            x = p({"x": x, "transformer_options": transformer_options})
+
+    y = block.ffn(torch.addcmul(repeat_e(e[3], x), block.norm2(x), 1 + repeat_e(e[4], x)))
+    x = torch.addcmul(x, y, repeat_e(e[5], x))
+    ref_y = block.ffn(torch.addcmul(repeat_e(e[3], ref), block.norm2(ref), 1 + repeat_e(e[4], ref)))
+    ref = torch.addcmul(ref, ref_y, repeat_e(e[5], ref))
+    return x, ref
+
+
 class VaceWanAttentionBlock(WanAttentionBlock):
     def __init__(
             self,
@@ -565,7 +622,12 @@ class WanModel(torch.nn.Module):
         e0 = self.time_projection(e).unflatten(2, (6, self.dim))
 
         full_ref = None
-        if self.ref_conv is not None:
+        worldstereo_ref = kwargs.get("worldstereo_reference_latent", None)
+        worldstereo_ref_index = kwargs.get("worldstereo_ref_index", None)
+        worldstereo_camera_qt = kwargs.get("worldstereo_camera_qt", None)
+        worldstereo_camera_qt_ref = kwargs.get("worldstereo_camera_qt_ref", None)
+        worldstereo_camera_embedding = getattr(self, "worldstereo_camera_embedding", None)
+        if worldstereo_ref is None and self.ref_conv is not None:
             full_ref = kwargs.get("reference_latent", None)
             if full_ref is not None:
                 full_ref = self.ref_conv(full_ref).flatten(2).transpose(1, 2)
@@ -585,9 +647,53 @@ class WanModel(torch.nn.Module):
         blocks_replace = patches_replace.get("dit", {})
         transformer_options["total_blocks"] = len(self.blocks)
         transformer_options["block_type"] = "double"
+        worldstereo_ref_states = None
+        worldstereo_ref_freqs = None
+        if worldstereo_ref is not None:
+            if worldstereo_ref_index is None:
+                raise RuntimeError("WorldStereo memory model requires reference frame indices.")
+            worldstereo_ref = self.patch_embedding(worldstereo_ref.float()).to(x.dtype)
+            worldstereo_ref_grid_sizes = worldstereo_ref.shape[2:]
+            if tuple(worldstereo_ref_grid_sizes[1:]) != tuple(grid_sizes[1:]):
+                raise RuntimeError("WorldStereo reference latent spatial size must match the target latent size.")
+            worldstereo_ref = worldstereo_ref.flatten(2).transpose(1, 2)
+            worldstereo_ref_index = worldstereo_ref_index.to(device=x.device, dtype=torch.long).flatten()
+            if worldstereo_ref_index.shape[0] != worldstereo_ref_grid_sizes[0]:
+                raise RuntimeError("WorldStereo reference frame index count must match reference latent frames.")
+            if worldstereo_ref_index.numel() == 0 or torch.min(worldstereo_ref_index) < 0 or torch.max(worldstereo_ref_index) + 1 >= grid_sizes[0]:
+                raise RuntimeError("WorldStereo reference frame indices must address target frames 1..N.")
+
+            double_freqs = self.rope_encode(
+                grid_sizes[0] * self.patch_size[0],
+                grid_sizes[1] * self.patch_size[1],
+                grid_sizes[2] * self.patch_size[2] * 2,
+                steps_t=grid_sizes[0],
+                steps_h=grid_sizes[1],
+                steps_w=grid_sizes[2] * 2,
+                device=x.device,
+                dtype=x.dtype,
+                transformer_options=transformer_options,
+            )
+            double_freqs = double_freqs.reshape(1, grid_sizes[0], grid_sizes[1], grid_sizes[2] * 2, *double_freqs.shape[2:])
+            freqs = double_freqs[:, :, :, :grid_sizes[2]].reshape(1, -1, *double_freqs.shape[4:])
+            worldstereo_ref_freqs = double_freqs[:, worldstereo_ref_index + 1, :, grid_sizes[2]:].reshape(1, -1, *double_freqs.shape[4:])
+
+            if worldstereo_camera_embedding is not None:
+                if worldstereo_camera_qt is None or worldstereo_camera_qt_ref is None:
+                    raise RuntimeError("WorldStereo memory model requires target and reference camera pose embeddings.")
+                cam_emb = worldstereo_camera_embedding(worldstereo_camera_qt.to(device=x.device, dtype=x.dtype))
+                cam_emb = cam_emb.unsqueeze(2).unsqueeze(2).expand(-1, -1, grid_sizes[1], grid_sizes[2], -1).reshape(x.shape[0], -1, x.shape[-1])
+                x = x + cam_emb
+                ref_cam_emb = worldstereo_camera_embedding(worldstereo_camera_qt_ref.to(device=x.device, dtype=x.dtype))
+                ref_cam_emb = ref_cam_emb.unsqueeze(2).unsqueeze(2).expand(-1, -1, worldstereo_ref_grid_sizes[1], worldstereo_ref_grid_sizes[2], -1).reshape(worldstereo_ref.shape[0], -1, worldstereo_ref.shape[-1])
+                worldstereo_ref = worldstereo_ref + ref_cam_emb
+            worldstereo_ref_states = worldstereo_ref
+
         for i, block in enumerate(self.blocks):
             transformer_options["block_index"] = i
-            if ("double_block", i) in blocks_replace:
+            if worldstereo_ref_states is not None:
+                x, worldstereo_ref_states = wan_worldstereo_sparse_block(block, x, worldstereo_ref_states, e0, freqs, worldstereo_ref_freqs, context, context_img_len=context_img_len, transformer_options=transformer_options)
+            elif ("double_block", i) in blocks_replace:
                 def block_wrap(args):
                     out = {}
                     out["img"] = block(args["img"], context=args["txt"], e=args["vec"], freqs=args["pe"], context_img_len=context_img_len, transformer_options=args["transformer_options"])

@@ -325,13 +325,14 @@ class QwenFunControlNet(ControlNet):
 
 
 class WorldStereoControlNet(ControlBase):
-    def __init__(self, control_model, model_patches, mode="camera", load_device=None, manual_cast_dtype=None):
+    def __init__(self, control_model, model_patches, model_object_patches=None, mode="camera", load_device=None, manual_cast_dtype=None):
         super().__init__()
         self.control_model = control_model
         self.control_model_wrapped = None
         if self.control_model is not None:
             self.control_model_wrapped = comfy.model_patcher.CoreModelPatcher(self.control_model, load_device=load_device, offload_device=comfy.model_management.unet_offload_device())
         self.model_patches = model_patches
+        self.model_object_patches = model_object_patches or {}
         self.mode = mode
         self.load_device = load_device
         self.manual_cast_dtype = manual_cast_dtype
@@ -364,7 +365,7 @@ class WorldStereoControlNet(ControlBase):
         return out
 
     def copy(self):
-        c = WorldStereoControlNet(None, self.model_patches, mode=self.mode, load_device=self.load_device, manual_cast_dtype=self.manual_cast_dtype)
+        c = WorldStereoControlNet(None, self.model_patches, self.model_object_patches, mode=self.mode, load_device=self.load_device, manual_cast_dtype=self.manual_cast_dtype)
         c.control_model = self.control_model
         c.control_model_wrapped = self.control_model_wrapped
         c.render_latent = self.render_latent
@@ -822,10 +823,25 @@ def _worldstereo_base_key(key):
             suffix = suffix.replace("to_out.0.", "o.")
             suffix = suffix.replace("norm_q.", "norm_q.").replace("norm_k.", "norm_k.")
             out = "blocks.{}.self_attn.{}".format(parts[1], suffix)
-        elif len(parts) >= 6 and parts[2] == "ffn" and parts[3] == "net" and parts[5] == "proj":
+        elif len(parts) >= 5 and parts[2] == "attn2":
+            suffix = ".".join(parts[3:])
+            suffix = suffix.replace("to_q.", "q.").replace("to_k.", "k.").replace("to_v.", "v.")
+            suffix = suffix.replace("to_out.0.", "o.")
+            suffix = suffix.replace("add_k_proj.", "k_img.").replace("add_v_proj.", "v_img.")
+            suffix = suffix.replace("norm_added_k.", "norm_k_img.")
+            out = "blocks.{}.cross_attn.{}".format(parts[1], suffix)
+        elif len(parts) >= 6 and parts[2] == "ffn" and parts[3] == "net" and parts[4] == "0" and parts[5] == "proj":
             out = "blocks.{}.ffn.{}.{}".format(parts[1], parts[4], ".".join(parts[6:]))
+        elif len(parts) >= 6 and parts[2] == "ffn" and parts[3] == "net" and parts[4] == "2":
+            out = "blocks.{}.ffn.{}.{}".format(parts[1], parts[4], ".".join(parts[5:]))
         elif len(parts) == 3 and parts[2] == "scale_shift_table":
             out = "blocks.{}.modulation".format(parts[1])
+        elif len(parts) >= 4 and parts[2] == "norm2":
+            out = "blocks.{}.norm3.{}".format(parts[1], ".".join(parts[3:]))
+        elif len(parts) >= 4 and parts[2] == "norm3":
+            out = "blocks.{}.norm2.{}".format(parts[1], ".".join(parts[3:]))
+    elif key.startswith("ref_index_embedding."):
+        out = None
     if out is None:
         return None
     return "diffusion_model.{}".format(out)
@@ -842,6 +858,11 @@ WORLDSTEREO_CONTROL_CONFIG = {
     "mask_downsample": 1,
     "render_in_channels": 36,
     "base_model": "Wan2.1-14B",
+}
+
+WORLDSTEREO_CAMERA_EMBEDDING_CONFIG = {
+    "camera_embedding_dim": 7,
+    "dim": 5120,
 }
 
 WORLDSTEREO_CONTROL_SHAPES = {
@@ -892,10 +913,15 @@ def load_controlnet_worldstereo(sd, model_options={}):
 
     control_sd = {}
     model_patches = {}
+    camera_embedding_sd = {}
     unmapped = []
     for k, v in sd.items():
         if k.startswith("controlnet."):
             control_sd[k[len("controlnet."):]] = v
+        elif k.startswith("camera_embedding."):
+            camera_embedding_sd["net.{}".format(k[len("camera_embedding."):])] = v
+        elif k.startswith("ref_index_embedding."):
+            continue
         else:
             mapped = _worldstereo_base_key(k)
             if mapped is not None:
@@ -913,7 +939,21 @@ def load_controlnet_worldstereo(sd, model_options={}):
         raise RuntimeError("Unexpected WorldStereo controlnet keys: {}".format(unexpected))
 
     mode = "memory" if "blocks.0.ffn.net.0.proj.weight" in sd else "camera"
-    control = WorldStereoControlNet(control_model, model_patches, mode=mode, load_device=load_device, manual_cast_dtype=manual_cast_dtype)
+    model_object_patches = {}
+    if len(camera_embedding_sd) > 0:
+        camera_embedding = comfy.ldm.wan.worldstereo.WorldStereoCameraEmbedding(
+            operations=operations,
+            device=comfy.model_management.unet_offload_device(),
+            dtype=unet_dtype,
+            **WORLDSTEREO_CAMERA_EMBEDDING_CONFIG,
+        )
+        missing, unexpected = camera_embedding.load_state_dict(camera_embedding_sd, strict=False)
+        if len(missing) > 0:
+            raise RuntimeError("Missing WorldStereo camera embedding keys: {}".format(missing))
+        if len(unexpected) > 0:
+            raise RuntimeError("Unexpected WorldStereo camera embedding keys: {}".format(unexpected))
+        model_object_patches["diffusion_model.worldstereo_camera_embedding"] = camera_embedding
+    control = WorldStereoControlNet(control_model, model_patches, model_object_patches=model_object_patches, mode=mode, load_device=load_device, manual_cast_dtype=manual_cast_dtype)
     return control
 
 def convert_mistoline(sd):

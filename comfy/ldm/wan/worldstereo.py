@@ -199,6 +199,21 @@ class WorldStereoControlNetModel(nn.Module):
         return controlnet_states
 
 
+class WorldStereoCameraEmbedding(nn.Module):
+    def __init__(self, camera_embedding_dim=7, dim=5120, operations=None, device=None, dtype=None):
+        super().__init__()
+        self.net = nn.Sequential(
+            operations.Linear(camera_embedding_dim, dim // 2, device=device, dtype=dtype),
+            nn.SiLU(),
+            operations.Linear(dim // 2, dim, device=device, dtype=dtype),
+            nn.SiLU(),
+            zero_module(operations.Linear(dim, dim, device=device, dtype=dtype)),
+        )
+
+    def forward(self, camera_qt):
+        return self.net(camera_qt)
+
+
 @torch.amp.autocast("cuda", enabled=False)
 def camera_center_normalization(w2c, nframe, camera_scale=2.0, is_w2c=False):
     w2c = w2c.float()
@@ -252,3 +267,83 @@ def get_camera_embedding(intrinsic, extrinsic, frames, height, width, normalize=
     if not torch.isfinite(cam_emb).all():
         raise RuntimeError("WorldStereo camera embedding contains non-finite values.")
     return cam_emb
+
+
+def standardize_quaternion(quaternions):
+    return torch.where(quaternions[..., 0:1] < 0, -quaternions, quaternions)
+
+
+def _sqrt_positive_part(x):
+    ret = torch.zeros_like(x)
+    positive_mask = x > 0
+    if torch.is_grad_enabled():
+        ret[positive_mask] = torch.sqrt(x[positive_mask])
+    else:
+        ret = torch.where(positive_mask, torch.sqrt(x), ret)
+    return ret
+
+
+def matrix_to_quaternion(matrix):
+    if matrix.size(-1) != 3 or matrix.size(-2) != 3:
+        raise RuntimeError("WorldStereo camera rotation matrices must be 3x3.")
+
+    batch_dim = matrix.shape[:-2]
+    m00, m01, m02, m10, m11, m12, m20, m21, m22 = torch.unbind(matrix.reshape(batch_dim + (9,)), dim=-1)
+    q_abs = _sqrt_positive_part(torch.stack([
+        1.0 + m00 + m11 + m22,
+        1.0 + m00 - m11 - m22,
+        1.0 - m00 + m11 - m22,
+        1.0 - m00 - m11 + m22,
+    ], dim=-1))
+
+    quat_by_rijk = torch.stack([
+        torch.stack([q_abs[..., 0] ** 2, m21 - m12, m02 - m20, m10 - m01], dim=-1),
+        torch.stack([m21 - m12, q_abs[..., 1] ** 2, m10 + m01, m02 + m20], dim=-1),
+        torch.stack([m02 - m20, m10 + m01, q_abs[..., 2] ** 2, m12 + m21], dim=-1),
+        torch.stack([m10 - m01, m20 + m02, m21 + m12, q_abs[..., 3] ** 2], dim=-1),
+    ], dim=-2)
+
+    flr = torch.tensor(0.1, dtype=q_abs.dtype, device=q_abs.device)
+    quat_candidates = quat_by_rijk / (2.0 * q_abs[..., None].max(flr))
+    indices = q_abs.argmax(dim=-1, keepdim=True)
+    gather_indices = indices.unsqueeze(-1).expand(list(batch_dim) + [1, 4])
+    return standardize_quaternion(torch.gather(quat_candidates, -2, gather_indices).squeeze(-2))
+
+
+@torch.amp.autocast("cuda", enabled=False)
+def unified_camera_normalization(w2c, w2c_ref, camera_scale=2.0):
+    w2c = w2c.float()
+    w2c_ref = w2c_ref.float()
+    num_target = w2c.shape[0]
+
+    combined_w2c = torch.cat([w2c, w2c_ref], dim=0)
+    c2w_view0 = combined_w2c[0:1].inverse().repeat(combined_w2c.shape[0], 1, 1)
+    combined_w2c = combined_w2c @ c2w_view0
+
+    combined_c2w = torch.linalg.inv(combined_w2c)
+    target_c2w = combined_c2w[:num_target]
+    camera_dist_2med = torch.norm(target_c2w[:, :3, 3] - target_c2w[:, :3, 3].median(0, keepdim=True).values, dim=-1)
+    valid_mask = camera_dist_2med <= torch.clamp(torch.quantile(camera_dist_2med, 0.97) * 10, max=1e6)
+    combined_c2w[:, :3, 3] -= target_c2w[valid_mask, :3, 3].mean(0, keepdim=True)
+    combined_w2c = torch.linalg.inv(combined_c2w)
+
+    target_c2w = combined_c2w[:num_target]
+    camera_dists = target_c2w[:, :3, 3].clone()
+    translation_scaling_factor = (
+        camera_scale
+        if torch.isclose(torch.norm(camera_dists[0]), torch.zeros(1, dtype=camera_dists.dtype, device=camera_dists.device), atol=1e-5).any()
+        else camera_scale / torch.norm(camera_dists[0])
+    )
+    combined_w2c[:, :3, 3] *= translation_scaling_factor
+    return combined_w2c[:num_target], combined_w2c[num_target:]
+
+
+def camera_qt_embedding(extrinsics, reference_extrinsics):
+    extrinsics, reference_extrinsics = unified_camera_normalization(extrinsics, reference_extrinsics)
+    quaternion = matrix_to_quaternion(extrinsics[:, :3, :3])
+    quaternion_ref = matrix_to_quaternion(reference_extrinsics[:, :3, :3])
+    camera_qt = torch.cat([quaternion, extrinsics[:, :3, 3]], dim=-1).unsqueeze(0)
+    camera_qt_ref = torch.cat([quaternion_ref, reference_extrinsics[:, :3, 3]], dim=-1).unsqueeze(0)
+    if not torch.isfinite(camera_qt).all() or not torch.isfinite(camera_qt_ref).all():
+        raise RuntimeError("WorldStereo reference camera embedding contains non-finite values.")
+    return camera_qt, camera_qt_ref

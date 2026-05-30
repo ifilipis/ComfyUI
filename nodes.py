@@ -14,6 +14,8 @@ import math
 import time
 import random
 import logging
+import collections
+import re
 
 from PIL import Image, ImageOps, ImageSequence
 from PIL.PngImagePlugin import PngInfo
@@ -954,6 +956,110 @@ def _worldstereo_camera_json_files():
     return sorted(out)
 
 
+def _worldstereo_memory_scan_roots():
+    roots = [folder_paths.get_input_directory()]
+    out = []
+    seen = set()
+    for root in roots:
+        root = os.path.abspath(root)
+        if root in seen or not os.path.isdir(root):
+            continue
+        seen.add(root)
+        out.append(root)
+    return out
+
+
+def _worldstereo_render_png_files(path, scene):
+    files = glob.glob(os.path.join(path, "{}_render_*.png".format(scene)))
+    files.extend(glob.glob(os.path.join(path, "{}_render.[0-9]*.png".format(scene))))
+    out = []
+    for render_png_path in sorted(set(files)):
+        if re.match(r"^{}_render[._](\d+)\.png$".format(re.escape(scene)), os.path.basename(render_png_path)):
+            out.append(render_png_path)
+    return out
+
+
+def _worldstereo_memory_scene_files(path, scene):
+    json_path = os.path.join(path, "{}.json".format(scene))
+    video_path = os.path.join(path, "{}.mp4".format(scene))
+    mask_path = os.path.join(path, "{}_mask.mp4".format(scene))
+    render_video_path = os.path.join(path, "{}_render.mp4".format(scene))
+    render_png_paths = _worldstereo_render_png_files(path, scene)
+    render_path = render_video_path if os.path.isfile(render_video_path) else (render_png_paths[0] if render_png_paths else None)
+    render_frame_indices = []
+    for render_png_path in render_png_paths:
+        m = re.match(r"^{}_render[._](\d+)\.png$".format(re.escape(scene)), os.path.basename(render_png_path))
+        render_frame_indices.append(int(m.group(1)) if m is not None else None)
+    if os.path.isfile(json_path) and os.path.isfile(video_path) and os.path.isfile(mask_path):
+        return {
+            "json": json_path,
+            "video": video_path,
+            "mask": mask_path,
+            "render": render_path,
+            "render_pngs": render_png_paths,
+            "render_frame_indices": torch.tensor(render_frame_indices, dtype=torch.long) if len(render_frame_indices) > 0 and all(x is not None for x in render_frame_indices) else None,
+        }
+    return None
+
+
+def _worldstereo_memory_scene_names():
+    scenes = set()
+    for root in _worldstereo_memory_scan_roots():
+        files = os.listdir(root)
+        file_set = set(files)
+        for f in files:
+            if not f.lower().endswith(".json"):
+                continue
+            scene = f[:-5]
+            if "{}.mp4".format(scene) not in file_set or "{}_mask.mp4".format(scene) not in file_set:
+                continue
+            scenes.add(scene)
+    if not scenes:
+        scenes.add("none")
+    return sorted(scenes)
+
+
+def _worldstereo_resolve_memory_scene(path, scene):
+    if scene == "none":
+        raise RuntimeError("No WorldStereo memory scenes were found.")
+    search_paths = []
+    if path:
+        search_paths.append(os.path.abspath(os.path.expanduser(path)))
+    search_paths.extend(_worldstereo_memory_scan_roots())
+    seen = set()
+    for search_path in search_paths:
+        if search_path in seen or not os.path.isdir(search_path):
+            continue
+        seen.add(search_path)
+        files = _worldstereo_memory_scene_files(search_path, scene)
+        if files is not None:
+            return os.path.dirname(files["json"]), files
+    raise RuntimeError("WorldStereo memory scene '{}' was not found in '{}'.".format(scene, path))
+
+
+def _worldstereo_memory_scenes_in_path(path, fallback_root=None):
+    search_path = os.path.abspath(os.path.expanduser(path)) if path else folder_paths.get_input_directory()
+    if not os.path.isdir(search_path):
+        search_path = fallback_root
+    if search_path is None or not os.path.isdir(search_path):
+        return []
+    out = []
+    seen = set()
+    files = os.listdir(search_path)
+    for f in files:
+        if not f.lower().endswith(".json"):
+            continue
+        scene = f[:-5]
+        key = (search_path, scene)
+        if key in seen:
+            continue
+        seen.add(key)
+        scene_files = _worldstereo_memory_scene_files(search_path, scene)
+        if scene_files is not None:
+            out.append((scene, search_path, scene_files))
+    return sorted(out, key=lambda x: (x[1], x[0]))
+
+
 def _worldstereo_tensor_from_json(value, name, dims):
     tensor = torch.tensor(np.array(value), dtype=torch.float32)
     if tensor.ndim == dims - 1:
@@ -1006,8 +1112,8 @@ class WorldStereoCameraJSONLoader:
     def INPUT_TYPES(s):
         return {"required": {"camera_json": (_worldstereo_camera_json_files(), )}}
 
-    RETURN_TYPES = ("LATENT", "TENSOR", "TENSOR", "EXTRINSICS", "INTRINSICS")
-    RETURN_NAMES = ("camera", "camera_poses", "camera_intrinsics", "geometry_extrinsics", "geometry_intrinsics")
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("camera",)
     FUNCTION = "load_camera"
     CATEGORY = "loaders"
 
@@ -1046,11 +1152,7 @@ class WorldStereoCameraJSONLoader:
             },
         }
 
-        camera_poses = torch.linalg.inv(extrinsics)
-        geometry_extrinsics = extrinsics[0].tolist()
-        geometry_intrinsics = intrinsics[0].tolist()
-
-        return (camera, camera_poses, intrinsics, geometry_extrinsics, geometry_intrinsics)
+        return (camera,)
 
     @classmethod
     def IS_CHANGED(s, camera_json):
@@ -1064,6 +1166,593 @@ class WorldStereoCameraJSONLoader:
     def VALIDATE_INPUTS(s, camera_json):
         if not folder_paths.exists_annotated_filepath(camera_json):
             return "Invalid camera JSON file: {}".format(camera_json)
+        return True
+
+
+class WorldStereoCameraConverter:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"camera": ("LATENT",)}}
+
+    RETURN_TYPES = ("TENSOR", "TENSOR", "EXTRINSICS", "INTRINSICS")
+    RETURN_NAMES = ("camera_poses", "camera_intrinsics", "geometrypack_extrinsics", "geometrypack_intrinsics")
+    FUNCTION = "convert_camera"
+    CATEGORY = "latent"
+
+    def convert_camera(self, camera):
+        data = camera.get("worldstereo_camera", None)
+        if data is None:
+            raise RuntimeError("WorldStereo camera converter requires a WorldStereo camera latent.")
+
+        extrinsics = data.get("extrinsics", None)
+        intrinsics = data.get("intrinsics", None)
+        if not isinstance(extrinsics, torch.Tensor) or extrinsics.ndim != 3 or extrinsics.shape[-2:] != (4, 4):
+            raise RuntimeError("WorldStereo camera converter requires extrinsics shaped [frames, 4, 4].")
+        if not isinstance(intrinsics, torch.Tensor) or intrinsics.ndim != 3 or intrinsics.shape[-2:] != (3, 3):
+            raise RuntimeError("WorldStereo camera converter requires intrinsics shaped [frames, 3, 3].")
+
+        camera_poses = torch.linalg.inv(extrinsics)
+        geometrypack_extrinsics = extrinsics[0].tolist()
+        geometrypack_intrinsics = intrinsics[0].tolist()
+        return (camera_poses, intrinsics, geometrypack_extrinsics, geometrypack_intrinsics)
+
+
+def _worldstereo_load_video_images(path):
+    dtype = comfy.model_management.intermediate_dtype()
+    device = comfy.model_management.intermediate_device()
+    components = InputImpl.VideoFromFile(path).get_components()
+    if components.images.shape[0] == 0:
+        raise RuntimeError("WorldStereo video/image file has no frames: {}".format(path))
+    return components.images[:, :, :, :3].to(device=device, dtype=dtype)
+
+
+def _worldstereo_load_png_sequence(paths):
+    dtype = comfy.model_management.intermediate_dtype()
+    device = comfy.model_management.intermediate_device()
+    images = []
+    width = None
+    height = None
+    for path in paths:
+        img = node_helpers.pillow(Image.open, path)
+        img = node_helpers.pillow(ImageOps.exif_transpose, img).convert("RGB")
+        if width is None:
+            width, height = img.size
+        if img.size != (width, height):
+            raise RuntimeError("WorldStereo render PNG sequence frames must have matching sizes.")
+        images.append(torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0))
+    if len(images) == 0:
+        raise RuntimeError("WorldStereo render PNG sequence is empty.")
+    return torch.cat(images, dim=0).to(device=device, dtype=dtype)
+
+
+def _worldstereo_load_render_images(files):
+    if files["render"].lower().endswith(".mp4"):
+        return _worldstereo_load_video_images(files["render"])
+    return _worldstereo_load_png_sequence(files["render_pngs"])
+
+
+def _worldstereo_load_scene_mask(path):
+    images = _worldstereo_load_video_images(path)
+    mask = images[:, :, :, 0]
+    return (mask >= 0.5).to(dtype=images.dtype)
+
+
+def _worldstereo_camera_from_tensors(extrinsics, intrinsics, source_width, source_height, ref_index=None):
+    return {
+        "samples": torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32),
+        "worldstereo_camera": {
+            "extrinsics": extrinsics,
+            "intrinsics": intrinsics,
+            "source_width": source_width,
+            "source_height": source_height,
+            "ref_index": ref_index,
+        },
+    }
+
+
+def _worldstereo_camera_data_from_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if "extrinsic" not in data or "intrinsic" not in data:
+        raise RuntimeError("WorldStereo memory JSON requires extrinsic and intrinsic arrays.")
+
+    extrinsics = _worldstereo_tensor_from_json(data["extrinsic"], "extrinsic", 3)
+    intrinsics = _worldstereo_tensor_from_json(data["intrinsic"], "intrinsic", 3)
+    if extrinsics.shape[-2:] != (4, 4):
+        raise RuntimeError("WorldStereo extrinsic matrices must be 4x4.")
+    if intrinsics.shape[-2:] != (3, 3):
+        raise RuntimeError("WorldStereo intrinsic matrices must be 3x3.")
+    _worldstereo_validate_camera_frame_counts(extrinsics, intrinsics)
+    if not torch.isfinite(extrinsics).all() or not torch.isfinite(intrinsics).all():
+        raise RuntimeError("WorldStereo memory JSON contains non-finite camera values.")
+
+    source_width = _worldstereo_optional_positive_int(data, ("width", "image_width", "original_width"))
+    source_height = _worldstereo_optional_positive_int(data, ("height", "image_height", "original_height"))
+    return extrinsics, intrinsics, source_width, source_height
+
+
+def _worldstereo_load_all_renders_and_cameras(scene_entries, fallback_width, fallback_height):
+    all_renders = []
+    all_extrinsics = []
+    all_intrinsics = []
+    source_width = None
+    source_height = None
+    render_height = None
+    render_width = None
+
+    for _, _, files in scene_entries:
+        if files["render"] is None:
+            continue
+        extrinsics, intrinsics, scene_source_width, scene_source_height = _worldstereo_camera_data_from_json(files["json"])
+        render_images = _worldstereo_load_render_images(files)
+        if scene_source_width is None:
+            scene_source_width = fallback_width
+        if scene_source_height is None:
+            scene_source_height = fallback_height
+
+        if source_width is None:
+            source_width = scene_source_width
+            source_height = scene_source_height
+            render_height = render_images.shape[1]
+            render_width = render_images.shape[2]
+        elif source_width != scene_source_width or source_height != scene_source_height:
+            raise RuntimeError("WorldStereo all_renders requires all scenes to have matching source dimensions.")
+        elif render_height != render_images.shape[1] or render_width != render_images.shape[2]:
+            raise RuntimeError("WorldStereo all_renders requires all render videos/images to have matching dimensions.")
+
+        frames = render_images.shape[0]
+        all_renders.append(render_images)
+        render_frame_indices = files.get("render_frame_indices", None)
+        if render_frame_indices is not None:
+            if torch.max(render_frame_indices) >= extrinsics.shape[0] or torch.max(render_frame_indices) >= intrinsics.shape[0]:
+                raise RuntimeError("WorldStereo render PNG frame number exceeds camera frame count.")
+            all_extrinsics.append(extrinsics[render_frame_indices])
+            all_intrinsics.append(intrinsics[render_frame_indices])
+        else:
+            all_extrinsics.append(_worldstereo_match_frames(extrinsics, frames, "all render extrinsic"))
+            all_intrinsics.append(_worldstereo_match_frames(intrinsics, frames, "all render intrinsic"))
+
+    if len(all_renders) == 0:
+        raise RuntimeError("WorldStereo all_renders found no indexed scenes.")
+
+    all_renders = torch.cat(all_renders, dim=0)
+    all_extrinsics = torch.cat(all_extrinsics, dim=0)
+    all_intrinsics = torch.cat(all_intrinsics, dim=0)
+    all_intrinsics = _worldstereo_scale_intrinsics(all_intrinsics, source_width, source_height, render_width, render_height)
+    all_cameras = _worldstereo_camera_from_tensors(all_extrinsics, all_intrinsics, render_width, render_height)
+    return all_renders, all_cameras
+
+
+def _worldstereo_load_depth_points(path, extrinsic, intrinsic, source_width, source_height, max_points=65536):
+    depth_path = os.path.join(path, "depth.exr")
+    if not os.path.isfile(depth_path):
+        return None
+
+    os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+    import cv2
+
+    depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+    if depth is None:
+        raise RuntimeError("WorldStereo could not read depth EXR: {}".format(depth_path))
+    if depth.ndim == 3:
+        depth = depth[:, :, 0]
+    if depth.ndim != 2:
+        raise RuntimeError("WorldStereo depth.exr must be a single-channel depth map.")
+
+    depth = torch.from_numpy(depth.astype(np.float32))
+    valid = torch.isfinite(depth) & (depth > 0)
+    valid_indices = torch.nonzero(valid.flatten(), as_tuple=False).flatten()
+    if valid_indices.numel() == 0:
+        raise RuntimeError("WorldStereo depth.exr has no positive finite depth samples.")
+    if valid_indices.numel() > max_points:
+        sample_indices = torch.linspace(0, valid_indices.numel() - 1, max_points, dtype=torch.long)
+        valid_indices = valid_indices[sample_indices]
+
+    height, width = depth.shape
+    y = torch.div(valid_indices, width, rounding_mode="floor").to(torch.float32)
+    x = (valid_indices % width).to(torch.float32)
+    z = depth.flatten()[valid_indices].to(torch.float32)
+
+    K = intrinsic.clone().to(torch.float32)
+    if source_width is not None and source_height is not None:
+        K[0, :] = K[0, :] / float(source_width) * float(width)
+        K[1, :] = K[1, :] / float(source_height) * float(height)
+
+    pixels = torch.stack((x, y, torch.ones_like(x)), dim=1)
+    camera_points = torch.matmul(pixels, torch.linalg.inv(K).transpose(0, 1)) * z.unsqueeze(1)
+    world_points = torch.matmul(
+        torch.cat((camera_points, torch.ones((camera_points.shape[0], 1), dtype=camera_points.dtype)), dim=1),
+        torch.linalg.inv(extrinsic.to(torch.float32)).transpose(0, 1),
+    )[:, :3]
+    return world_points
+
+
+def _worldstereo_points_in_views(points, extrinsics, intrinsics, image_width, image_height, chunk=16):
+    out = []
+    ones = torch.ones((points.shape[0], 1), dtype=points.dtype, device=points.device)
+    points_h = torch.cat((points, ones), dim=1)
+    for start in range(0, extrinsics.shape[0], chunk):
+        end = min(start + chunk, extrinsics.shape[0])
+        cam_points = torch.matmul(points_h.unsqueeze(0), extrinsics[start:end].to(points.device, points.dtype).transpose(1, 2))
+        z = cam_points[:, :, 2]
+        pixels = torch.matmul(cam_points[:, :, :3], intrinsics[start:end].to(points.device, points.dtype).transpose(1, 2))
+        u = pixels[:, :, 0] / torch.clamp(pixels[:, :, 2], min=1e-8)
+        v = pixels[:, :, 1] / torch.clamp(pixels[:, :, 2], min=1e-8)
+        out.append((z > 0) & (u >= 0) & (u < image_width) & (v >= 0) & (v < image_height))
+    return torch.cat(out, dim=0)
+
+
+def _worldstereo_find_closest_camera_by_points(target_extrinsic, ref_extrinsics, target_intrinsic, ref_intrinsics,
+                                               image_width, image_height, points_world):
+    num_refs = ref_extrinsics.shape[0]
+    target_extrinsic_batch = target_extrinsic.unsqueeze(0).expand(num_refs, -1, -1)
+    target_intrinsic_batch = target_intrinsic.unsqueeze(0).expand(num_refs, -1, -1)
+
+    fov_scores, angle_betweens = _worldstereo_calculate_fov_overlap(
+        target_intrinsic_batch, target_extrinsic_batch,
+        ref_intrinsics, ref_extrinsics,
+        image_width, image_height,
+        near=0.1, far=10.0
+    )
+
+    angle_betweens[angle_betweens < 0] = -angle_betweens[angle_betweens < 0]
+    angle_betweens[angle_betweens > 180] = 360 - angle_betweens[angle_betweens > 180]
+    fov_scores = fov_scores * torch.clip(torch.exp(((-angle_betweens + 90) / 180.0) * 5.0), 0.0, 1.0)
+
+    target_visible = _worldstereo_points_in_views(
+        points_world, target_extrinsic.unsqueeze(0), target_intrinsic.unsqueeze(0), image_width, image_height
+    )[0]
+    ref_visible = _worldstereo_points_in_views(points_world, ref_extrinsics, ref_intrinsics, image_width, image_height)
+
+    target_count = target_visible.sum()
+    ref_count = ref_visible.sum(dim=1)
+    intersection = (ref_visible & target_visible.unsqueeze(0)).sum(dim=1)
+    union = target_count + ref_count - intersection
+    point_scores = intersection.to(torch.float32) / torch.clamp(union.to(torch.float32), min=1.0)
+    scores = fov_scores + point_scores
+
+    best_idx = torch.argmax(scores)
+    return best_idx.item(), scores[best_idx].item(), angle_betweens[best_idx].item()
+
+
+def _worldstereo_calculate_camera_distance(cam1_extrinsic, cam2_extrinsic):
+    is_batched = cam1_extrinsic.dim() == 3
+    if not is_batched:
+        cam1_extrinsic = cam1_extrinsic.unsqueeze(0)
+        cam2_extrinsic = cam2_extrinsic.unsqueeze(0)
+
+    t1 = cam1_extrinsic[:, :3, 3]
+    t2 = cam2_extrinsic[:, :3, 3]
+    translation_dist = torch.norm(t1 - t2, dim=1)
+
+    R1 = cam1_extrinsic[:, :3, :3]
+    R2 = cam2_extrinsic[:, :3, :3]
+    rotation_dist = torch.norm(R1 - R2, p='fro', dim=(1, 2))
+
+    total_dist = translation_dist + 0.1 * rotation_dist
+
+    if not is_batched:
+        total_dist = total_dist.item()
+
+    return total_dist
+
+
+def _worldstereo_get_camera_frustum_corners(K, extrinsic, image_width, image_height, depth_range=(0.1, 100.0)):
+    near, far = depth_range
+
+    is_batched = K.dim() == 3
+    if not is_batched:
+        K = K.unsqueeze(0)
+        extrinsic = extrinsic.unsqueeze(0)
+
+    batch_size = K.shape[0]
+    device = K.device
+
+    c2w = torch.inverse(extrinsic)
+    camera_center = c2w[:, :3, 3]
+    R = c2w[:, :3, :3]
+
+    K_inv = torch.inverse(K)
+
+    if not isinstance(image_width, torch.Tensor):
+        image_width = torch.tensor([image_width] * batch_size, device=device, dtype=torch.float32)
+    if not isinstance(image_height, torch.Tensor):
+        image_height = torch.tensor([image_height] * batch_size, device=device, dtype=torch.float32)
+
+    corners_2d = torch.stack([
+        torch.stack([torch.zeros(batch_size, device=device), torch.zeros(batch_size, device=device), torch.ones(batch_size, device=device)], dim=1),
+        torch.stack([image_width, torch.zeros(batch_size, device=device), torch.ones(batch_size, device=device)], dim=1),
+        torch.stack([image_width, image_height, torch.ones(batch_size, device=device)], dim=1),
+        torch.stack([torch.zeros(batch_size, device=device), image_height, torch.ones(batch_size, device=device)], dim=1)
+    ], dim=1)
+
+    ray_dirs_cam = torch.bmm(corners_2d, K_inv.transpose(1, 2))
+    ray_dirs_cam = ray_dirs_cam / torch.norm(ray_dirs_cam, dim=2, keepdim=True)
+
+    corners_cam_near = ray_dirs_cam * near
+    corners_cam_far = ray_dirs_cam * far
+
+    corners_world_near = torch.bmm(corners_cam_near, R.transpose(1, 2)) + camera_center.unsqueeze(1)
+    corners_world_far = torch.bmm(corners_cam_far, R.transpose(1, 2)) + camera_center.unsqueeze(1)
+
+    corners_world = torch.cat([corners_world_near, corners_world_far], dim=1)
+
+    if not is_batched:
+        corners_world = corners_world.squeeze(0)
+
+    return corners_world
+
+
+def _worldstereo_calculate_frustum_volume_overlap(corners1, corners2):
+    is_batched = corners1.dim() == 3
+    if not is_batched:
+        corners1 = corners1.unsqueeze(0)
+        corners2 = corners2.unsqueeze(0)
+
+    min1 = torch.min(corners1, dim=1)[0]
+    max1 = torch.max(corners1, dim=1)[0]
+    min2 = torch.min(corners2, dim=1)[0]
+    max2 = torch.max(corners2, dim=1)[0]
+
+    intersection_min = torch.max(min1, min2)
+    intersection_max = torch.min(max1, max2)
+
+    intersection_valid = torch.all(intersection_max > intersection_min, dim=1)
+
+    intersection_dims = torch.clamp(intersection_max - intersection_min, min=0.0)
+    intersection_volume = torch.prod(intersection_dims, dim=1)
+
+    volume1 = torch.prod(max1 - min1, dim=1)
+    volume2 = torch.prod(max2 - min2, dim=1)
+
+    union_volume = volume1 + volume2 - intersection_volume
+    overlap_score = intersection_volume / (union_volume + 1e-8)
+
+    overlap_score = torch.where(intersection_valid, overlap_score, torch.zeros_like(overlap_score))
+
+    if not is_batched:
+        overlap_score = overlap_score.item()
+
+    return overlap_score
+
+
+def _worldstereo_calculate_fov_overlap(cam1_intrinsic, cam1_extrinsic, cam2_intrinsic, cam2_extrinsic, image_width, image_height, near, far):
+    is_batched = cam1_intrinsic.dim() == 3
+    if not is_batched:
+        cam1_intrinsic = cam1_intrinsic.unsqueeze(0)
+        cam1_extrinsic = cam1_extrinsic.unsqueeze(0)
+        cam2_intrinsic = cam2_intrinsic.unsqueeze(0)
+        cam2_extrinsic = cam2_extrinsic.unsqueeze(0)
+
+    c2w1 = torch.inverse(cam1_extrinsic)
+    c2w2 = torch.inverse(cam2_extrinsic)
+
+    cam1_view_dir = c2w1[:, :3, 2]
+    cam2_view_dir = c2w2[:, :3, 2]
+
+    cos_angle = torch.sum(cam1_view_dir * cam2_view_dir, dim=1)
+    cos_angle = torch.clamp(cos_angle, -1.0, 1.0)
+    angle_between = torch.rad2deg(torch.acos(cos_angle))
+
+    depth_range = (near, far)
+
+    corners1 = _worldstereo_get_camera_frustum_corners(
+        cam1_intrinsic, cam1_extrinsic, image_width, image_height, depth_range
+    )
+    corners2 = _worldstereo_get_camera_frustum_corners(
+        cam2_intrinsic, cam2_extrinsic, image_width, image_height, depth_range
+    )
+
+    overlap_ratio = _worldstereo_calculate_frustum_volume_overlap(corners1, corners2)
+
+    if not is_batched:
+        overlap_ratio = overlap_ratio.item() if isinstance(overlap_ratio, torch.Tensor) else overlap_ratio
+        angle_between = angle_between.item()
+
+    return overlap_ratio, angle_between
+
+
+def _worldstereo_find_closest_camera_in_view(target_extrinsic, ref_extrinsics, target_intrinsic, ref_intrinsics,
+                                             image_width, image_height, method="distance", near=0.1, far=5.0, angle_penalty=False,
+                                             shortcut_index=None, topk_return=0):
+    num_refs = ref_extrinsics.shape[0]
+
+    if num_refs == 0:
+        return None, float('inf') if method == "distance" else -1.0
+
+    target_extrinsic_batch = target_extrinsic.unsqueeze(0).expand(num_refs, -1, -1)
+
+    if method == "distance":
+        distances = _worldstereo_calculate_camera_distance(target_extrinsic_batch, ref_extrinsics)
+
+        min_distance_idx = torch.argmin(distances)
+        min_distance = distances[min_distance_idx].item()
+
+        return min_distance_idx.item(), min_distance
+
+    elif method == "fov_overlap":
+        target_intrinsic_batch = target_intrinsic.unsqueeze(0).expand(num_refs, -1, -1)
+
+        overlap_ratios, angle_betweens = _worldstereo_calculate_fov_overlap(
+            target_intrinsic_batch, target_extrinsic_batch,
+            ref_intrinsics, ref_extrinsics,
+            image_width, image_height,
+            near=near, far=far
+        )
+
+        angle_betweens[angle_betweens < 0] = -angle_betweens[angle_betweens < 0]
+        angle_betweens[angle_betweens > 180] = 360 - angle_betweens[angle_betweens > 180]
+
+        if angle_penalty:
+            overlap_ratios = overlap_ratios * torch.clip(torch.exp(((-angle_betweens + 90) / 180.0) * 5.0), 0.0, 1.0)
+
+        if shortcut_index is not None:
+            overlap_ratios[shortcut_index] += 1.0
+
+        if topk_return == 0:
+            max_overlap_idx = torch.argmax(overlap_ratios)
+            max_overlap = overlap_ratios[max_overlap_idx].item()
+            angle_between = angle_betweens[max_overlap_idx].item()
+
+            return max_overlap_idx.item(), max_overlap, angle_between
+        else:
+            max_overlap_indices = torch.topk(overlap_ratios, topk_return, dim=0, sorted=True, largest=True).indices
+            return max_overlap_indices.tolist()
+
+    else:
+        raise ValueError("Unknown method: {}. Use 'distance' or 'fov_overlap'".format(method))
+
+
+def _worldstereo_retrieve_memory_frames(tar_w2cs_full, tar_Ks_full, ref_w2cs, ref_Ks, ref_frames, image_width, image_height, nframe, points_world=None):
+    if tar_w2cs_full.shape[0] > nframe:
+        tar_w2cs = tar_w2cs_full[0::4]
+        tar_Ks = tar_Ks_full[0::4]
+    else:
+        tar_w2cs = tar_w2cs_full
+        tar_Ks = tar_Ks_full
+
+    retrieval_map = dict()
+    ref_index_dict = collections.defaultdict(dict)
+    retrieved_frames = []
+    retrieved_w2cs = []
+    retrieved_Ks = []
+    ref_w2cs_out = []
+
+    for i in range(1, tar_w2cs.shape[0]):
+        if points_world is None:
+            best_idx, best_score, angle_diff = _worldstereo_find_closest_camera_in_view(
+                tar_w2cs[i],
+                ref_w2cs,
+                tar_Ks[i],
+                ref_Ks,
+                image_width,
+                image_height,
+                method="fov_overlap",
+                near=0.1,
+                far=10.0,
+                angle_penalty=True,
+                shortcut_index=None,
+            )
+        else:
+            best_idx, best_score, angle_diff = _worldstereo_find_closest_camera_by_points(
+                tar_w2cs[i],
+                ref_w2cs,
+                tar_Ks[i],
+                ref_Ks,
+                image_width,
+                image_height,
+                points_world,
+            )
+
+        if best_idx not in retrieval_map:
+            retrieval_map[best_idx] = i - 1
+        ref_index_dict[retrieval_map[best_idx]][i] = {"score": best_score, "angle_diff": angle_diff}
+
+        retrieved_frames.append(ref_frames[best_idx:best_idx + 1])
+        retrieved_w2cs.append(ref_w2cs[best_idx])
+        retrieved_Ks.append(ref_Ks[best_idx])
+
+    ref_w2cs_out = retrieved_w2cs
+    ref_index_list = list(ref_index_dict.keys())
+
+    if len(retrieved_frames) == 0:
+        raise RuntimeError("WorldStereo memory retrieval requires at least two target camera frames.")
+
+    retrieved_frames = torch.cat(retrieved_frames, dim=0)
+    ref_index = torch.tensor(ref_index_list, dtype=torch.long)
+    ref_w2cs_out = torch.stack(ref_w2cs_out)[ref_index]
+    ref_Ks_out = torch.stack(retrieved_Ks)[ref_index]
+
+    return retrieved_frames, ref_index, ref_w2cs_out, ref_Ks_out
+
+
+class WorldStereoMemoryLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "path": ("STRING", {"default": folder_paths.get_input_directory()}),
+            "scene": (_worldstereo_memory_scene_names(), ),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "MASK", "LATENT", "IMAGE", "LATENT", "IMAGE", "LATENT")
+    RETURN_NAMES = ("scene_images", "scene_mask", "scene_camera", "reference_images", "reference_camera", "all_renders", "all_cameras")
+    FUNCTION = "load_memory"
+    CATEGORY = "loaders"
+
+    def load_memory(self, path, scene):
+        scene_root, files = _worldstereo_resolve_memory_scene(path, scene)
+        extrinsics, intrinsics, source_width, source_height = _worldstereo_camera_data_from_json(files["json"])
+
+        scene_images = _worldstereo_load_video_images(files["video"])
+        scene_mask = _worldstereo_load_scene_mask(files["mask"])
+        if source_width is None:
+            source_width = scene_images.shape[2]
+        if source_height is None:
+            source_height = scene_images.shape[1]
+
+        target_frames = scene_images.shape[0]
+        scene_camera = _worldstereo_camera_from_tensors(extrinsics, intrinsics, source_width, source_height)
+        all_scene_entries = _worldstereo_memory_scenes_in_path(path, fallback_root=scene_root)
+        all_renders, all_cameras = _worldstereo_load_all_renders_and_cameras(all_scene_entries, source_width, source_height)
+        all_camera_data = all_cameras["worldstereo_camera"]
+
+        target_extrinsics = _worldstereo_match_frames(extrinsics, target_frames, "target extrinsic")
+        target_intrinsics = _worldstereo_match_frames(intrinsics, target_frames, "target intrinsic")
+        depth_points = _worldstereo_load_depth_points(scene_root, target_extrinsics[0], target_intrinsics[0], source_width, source_height)
+
+        retrieved_frames, ref_index, reference_extrinsics, reference_intrinsics = _worldstereo_retrieve_memory_frames(
+            target_extrinsics,
+            target_intrinsics,
+            all_camera_data["extrinsics"],
+            all_camera_data["intrinsics"],
+            all_renders,
+            source_width,
+            source_height,
+            target_frames,
+            depth_points,
+        )
+        reference_images = retrieved_frames[ref_index]
+        reference_camera = _worldstereo_camera_from_tensors(reference_extrinsics, reference_intrinsics, source_width, source_height, ref_index)
+
+        return (scene_images, scene_mask, scene_camera, reference_images, reference_camera, all_renders, all_cameras)
+
+    @classmethod
+    def IS_CHANGED(s, path, scene):
+        scene_root, files = _worldstereo_resolve_memory_scene(path, scene)
+        m = hashlib.sha256()
+        for name in ("json", "video", "mask"):
+            with open(files[name], "rb") as f:
+                m.update(f.read())
+        if files["render"] is not None:
+            with open(files["render"], "rb") as f:
+                m.update(f.read())
+        for png in files["render_pngs"]:
+            with open(png, "rb") as f:
+                m.update(f.read())
+        depth_path = os.path.join(scene_root, "depth.exr")
+        if os.path.isfile(depth_path):
+            with open(depth_path, "rb") as f:
+                m.update(f.read())
+        for _, _, scene_files in _worldstereo_memory_scenes_in_path(path, fallback_root=scene_root):
+            with open(scene_files["json"], "rb") as f:
+                m.update(f.read())
+            if scene_files["render"] is None:
+                continue
+            for name in ("render",):
+                with open(scene_files[name], "rb") as f:
+                    m.update(f.read())
+            for png in scene_files["render_pngs"]:
+                with open(png, "rb") as f:
+                    m.update(f.read())
+        return m.digest().hex()
+
+    @classmethod
+    def VALIDATE_INPUTS(s, path, scene):
+        try:
+            _worldstereo_resolve_memory_scene(path, scene)
+        except Exception as e:
+            return str(e)
         return True
 
 
@@ -1265,7 +1954,30 @@ class WorldStereoConditioning:
 
         memory_values = {}
         if getattr(control_net, "mode", "camera") == "memory":
-            if reference_image is not None or reference_camera is not None:
+            reference_inputs_empty = (
+                reference_image is None
+                or not isinstance(reference_image, torch.Tensor)
+                or reference_image.numel() == 0
+                or reference_image.shape[0] == 0
+                or reference_camera is None
+                or not isinstance(reference_camera, dict)
+            )
+            if not reference_inputs_empty:
+                ref_data = reference_camera.get("worldstereo_camera", None)
+                if ref_data is None:
+                    reference_inputs_empty = True
+                else:
+                    ref_extrinsics = ref_data.get("extrinsics", None)
+                    ref_intrinsics = ref_data.get("intrinsics", None)
+                    reference_inputs_empty = (
+                        not isinstance(ref_extrinsics, torch.Tensor)
+                        or ref_extrinsics.numel() == 0
+                        or ref_extrinsics.shape[0] == 0
+                        or not isinstance(ref_intrinsics, torch.Tensor)
+                        or ref_intrinsics.numel() == 0
+                        or ref_intrinsics.shape[0] == 0
+                    )
+            if not reference_inputs_empty:
                 reference_latent, ref_index, camera_qt, camera_qt_ref = _worldstereo_prepare_reference_memory(out_model, vae, reference_image, reference_camera, extrinsics, frames, width, height)
                 memory_values = {
                     "worldstereo_reference_latent": reference_latent,
@@ -2031,6 +2743,64 @@ class SaveImage:
 
         return { "ui": { "images": results } }
 
+class SaveImageToPath:
+    def __init__(self):
+        self.type = "output"
+        self.prefix_append = ""
+        self.compress_level = 4
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "The images to save."}),
+                "output_path": ("STRING", {"default": folder_paths.get_output_directory(), "tooltip": "The directory to save images into."}),
+                "filename_prefix": ("STRING", {"default": "ComfyUI", "tooltip": "The prefix for the file to save. This may include formatting information such as %date:yyyy-MM-dd% or %Empty Latent Image.width% to include values from nodes."})
+            },
+            "hidden": {
+                "prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save_images"
+
+    OUTPUT_NODE = True
+
+    CATEGORY = "image"
+    DESCRIPTION = "Saves the input images to the specified directory."
+    SEARCH_ALIASES = ["save", "save image", "save image to path", "export image", "output image", "write image"]
+
+    def save_images(self, images, output_path, filename_prefix="ComfyUI", prompt=None, extra_pnginfo=None):
+        output_path = os.path.abspath(os.path.expanduser(output_path))
+        os.makedirs(output_path, exist_ok=True)
+        filename_prefix += self.prefix_append
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, output_path, images[0].shape[1], images[0].shape[0])
+        results = list()
+        for (batch_number, image) in enumerate(images):
+            i = 255. * image.cpu().numpy()
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+            metadata = None
+            if not args.disable_metadata:
+                metadata = PngInfo()
+                if prompt is not None:
+                    metadata.add_text("prompt", json.dumps(prompt))
+                if extra_pnginfo is not None:
+                    for x in extra_pnginfo:
+                        metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+
+            filename_with_batch_num = filename.replace("%batch_num%", str(batch_number))
+            file = f"{filename_with_batch_num}_{counter:05}_.png"
+            img.save(os.path.join(full_output_folder, file), pnginfo=metadata, compress_level=self.compress_level)
+            results.append({
+                "filename": file,
+                "subfolder": os.path.relpath(full_output_folder, output_path) if subfolder == "" else subfolder,
+                "type": self.type
+            })
+            counter += 1
+
+        return { "ui": { "images": results } }
+
 class PreviewImage(SaveImage):
     def __init__(self):
         self.output_dir = folder_paths.get_temp_directory()
@@ -2390,6 +3160,7 @@ NODE_CLASS_MAPPINGS = {
     "LatentFromBatch": LatentFromBatch,
     "RepeatLatentBatch": RepeatLatentBatch,
     "SaveImage": SaveImage,
+    "SaveImageToPath": SaveImageToPath,
     "PreviewImage": PreviewImage,
     "LoadImage": LoadImage,
     "LoadImageMask": LoadImageMask,
@@ -2425,6 +3196,8 @@ NODE_CLASS_MAPPINGS = {
     "ControlNetApplyAdvanced": ControlNetApplyAdvanced,
     "WorldStereoConditioning": WorldStereoConditioning,
     "WorldStereoCameraJSONLoader": WorldStereoCameraJSONLoader,
+    "WorldStereoCameraConverter": WorldStereoCameraConverter,
+    "WorldStereoMemoryLoader": WorldStereoMemoryLoader,
     "ControlNetLoader": ControlNetLoader,
     "DiffControlNetLoader": DiffControlNetLoader,
     "StyleModelLoader": StyleModelLoader,
@@ -2461,6 +3234,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ControlNetLoader": "Load ControlNet Model",
     "DiffControlNetLoader": "Load ControlNet Model (diff)",
     "WorldStereoCameraJSONLoader": "Load WorldStereo Camera JSON",
+    "WorldStereoCameraConverter": "Convert WorldStereo Camera",
+    "WorldStereoMemoryLoader": "Load WorldStereo Memory Scene",
     "WorldStereoConditioning": "WorldStereo Conditioning",
     "StyleModelLoader": "Load Style Model",
     "CLIPVisionLoader": "Load CLIP Vision",
@@ -2498,6 +3273,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     # Image
     "EmptyImage": "Empty Image",
     "SaveImage": "Save Image",
+    "SaveImageToPath": "Save Image To Path",
     "PreviewImage": "Preview Image",
     "LoadImage": "Load Image",
     "LoadImageMask": "Load Image (as Mask)",
@@ -2521,6 +3297,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 }
 
 EXTENSION_WEB_DIRS = {}
+EXTENSION_WEB_DIRS["worldstereo"] = os.path.join(os.path.dirname(os.path.realpath(__file__)), "web_extensions", "worldstereo")
 
 # Dictionary of successfully loaded module names and associated directories.
 LOADED_MODULE_DIRS = {}

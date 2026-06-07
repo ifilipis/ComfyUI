@@ -1398,7 +1398,7 @@ def _worldstereo_points_in_views(points, extrinsics, intrinsics, image_width, im
 
 
 def _worldstereo_find_closest_camera_by_points(target_extrinsic, ref_extrinsics, target_intrinsic, ref_intrinsics,
-                                               image_width, image_height, points_world):
+                                               image_width, image_height, points_world, excluded_indices=None):
     num_refs = ref_extrinsics.shape[0]
     target_extrinsic_batch = target_extrinsic.unsqueeze(0).expand(num_refs, -1, -1)
     target_intrinsic_batch = target_intrinsic.unsqueeze(0).expand(num_refs, -1, -1)
@@ -1425,8 +1425,14 @@ def _worldstereo_find_closest_camera_by_points(target_extrinsic, ref_extrinsics,
     union = target_count + ref_count - intersection
     point_scores = intersection.to(torch.float32) / torch.clamp(union.to(torch.float32), min=1.0)
     scores = fov_scores + point_scores
+    if excluded_indices:
+        scores[list(excluded_indices)] = -float("inf")
+        if torch.isneginf(scores).all():
+            return None, -float("inf"), float("inf")
 
     best_idx = torch.argmax(scores)
+    if scores[best_idx] <= 0:
+        return None, scores[best_idx].item(), angle_betweens[best_idx].item()
     return best_idx.item(), scores[best_idx].item(), angle_betweens[best_idx].item()
 
 
@@ -1569,16 +1575,24 @@ def _worldstereo_calculate_fov_overlap(cam1_intrinsic, cam1_extrinsic, cam2_intr
 
 def _worldstereo_find_closest_camera_in_view(target_extrinsic, ref_extrinsics, target_intrinsic, ref_intrinsics,
                                              image_width, image_height, method="distance", near=0.1, far=5.0, angle_penalty=False,
-                                             shortcut_index=None, topk_return=0):
+                                             shortcut_index=None, topk_return=0, excluded_indices=None):
     num_refs = ref_extrinsics.shape[0]
 
     if num_refs == 0:
-        return None, float('inf') if method == "distance" else -1.0
+        if method == "distance":
+            return None, float('inf')
+        if topk_return != 0:
+            return []
+        return None, -1.0, float("inf")
 
     target_extrinsic_batch = target_extrinsic.unsqueeze(0).expand(num_refs, -1, -1)
 
     if method == "distance":
         distances = _worldstereo_calculate_camera_distance(target_extrinsic_batch, ref_extrinsics)
+        if excluded_indices:
+            distances[list(excluded_indices)] = float("inf")
+            if torch.isinf(distances).all():
+                return None, float("inf")
 
         min_distance_idx = torch.argmin(distances)
         min_distance = distances[min_distance_idx].item()
@@ -1603,14 +1617,26 @@ def _worldstereo_find_closest_camera_in_view(target_extrinsic, ref_extrinsics, t
 
         if shortcut_index is not None:
             overlap_ratios[shortcut_index] += 1.0
+        if excluded_indices:
+            overlap_ratios[list(excluded_indices)] = -float("inf")
+            if torch.isneginf(overlap_ratios).all():
+                if topk_return == 0:
+                    return None, -float("inf"), float("inf")
+                return []
 
         if topk_return == 0:
             max_overlap_idx = torch.argmax(overlap_ratios)
             max_overlap = overlap_ratios[max_overlap_idx].item()
             angle_between = angle_betweens[max_overlap_idx].item()
+            if max_overlap <= 0:
+                return None, max_overlap, angle_between
 
             return max_overlap_idx.item(), max_overlap, angle_between
         else:
+            if topk_return > torch.count_nonzero(overlap_ratios > 0):
+                topk_return = torch.count_nonzero(overlap_ratios > 0).item()
+            if topk_return == 0:
+                return []
             max_overlap_indices = torch.topk(overlap_ratios, topk_return, dim=0, sorted=True, largest=True).indices
             return max_overlap_indices.tolist()
 
@@ -1618,7 +1644,7 @@ def _worldstereo_find_closest_camera_in_view(target_extrinsic, ref_extrinsics, t
         raise ValueError("Unknown method: {}. Use 'distance' or 'fov_overlap'".format(method))
 
 
-def _worldstereo_retrieve_memory_frames(tar_w2cs_full, tar_Ks_full, ref_w2cs, ref_Ks, ref_frames, image_width, image_height, nframe, points_world=None):
+def _worldstereo_retrieve_memory_frames(tar_w2cs_full, tar_Ks_full, ref_w2cs, ref_Ks, ref_frames, image_width, image_height, nframe, points_world=None, max_repeats_per_reference=3):
     if tar_w2cs_full.shape[0] > nframe:
         tar_w2cs = tar_w2cs_full[0::4]
         tar_Ks = tar_Ks_full[0::4]
@@ -1632,13 +1658,17 @@ def _worldstereo_retrieve_memory_frames(tar_w2cs_full, tar_Ks_full, ref_w2cs, re
     retrieved_w2cs = []
     retrieved_Ks = []
     ref_w2cs_out = []
+    ref_use_counts = collections.defaultdict(int)
+    target_reference_count = max(0, tar_w2cs.shape[0] - 1)
+    repeat_limit = max(max_repeats_per_reference, math.ceil(target_reference_count / ref_w2cs.shape[0])) if ref_w2cs.shape[0] > 0 else max_repeats_per_reference
+    retrieval_failed = False
 
-    for i in range(1, tar_w2cs.shape[0]):
+    def select_reference(frame_index, excluded_indices=None):
         if points_world is None:
-            best_idx, best_score, angle_diff = _worldstereo_find_closest_camera_in_view(
-                tar_w2cs[i],
+            return _worldstereo_find_closest_camera_in_view(
+                tar_w2cs[frame_index],
                 ref_w2cs,
-                tar_Ks[i],
+                tar_Ks[frame_index],
                 ref_Ks,
                 image_width,
                 image_height,
@@ -1647,21 +1677,37 @@ def _worldstereo_retrieve_memory_frames(tar_w2cs_full, tar_Ks_full, ref_w2cs, re
                 far=10.0,
                 angle_penalty=True,
                 shortcut_index=None,
+                excluded_indices=excluded_indices,
             )
-        else:
-            best_idx, best_score, angle_diff = _worldstereo_find_closest_camera_by_points(
-                tar_w2cs[i],
-                ref_w2cs,
-                tar_Ks[i],
-                ref_Ks,
-                image_width,
-                image_height,
-                points_world,
-            )
+        return _worldstereo_find_closest_camera_by_points(
+            tar_w2cs[frame_index],
+            ref_w2cs,
+            tar_Ks[frame_index],
+            ref_Ks,
+            image_width,
+            image_height,
+            points_world,
+            excluded_indices=excluded_indices,
+        )
+
+    for i in range(1, tar_w2cs.shape[0]):
+        while True:
+            excluded_indices = {idx for idx, count in ref_use_counts.items() if count >= repeat_limit}
+            best_idx, best_score, angle_diff = select_reference(i, excluded_indices=excluded_indices)
+            if best_idx is not None:
+                break
+            unrestricted_idx, _, _ = select_reference(i)
+            if unrestricted_idx is None:
+                retrieval_failed = True
+                break
+            repeat_limit += 1
+        if best_idx is None:
+            break
 
         if best_idx not in retrieval_map:
             retrieval_map[best_idx] = i - 1
         ref_index_dict[retrieval_map[best_idx]][i] = {"score": best_score, "angle_diff": angle_diff}
+        ref_use_counts[best_idx] += 1
 
         retrieved_frames.append(ref_frames[best_idx:best_idx + 1])
         retrieved_w2cs.append(ref_w2cs[best_idx])
@@ -1670,8 +1716,15 @@ def _worldstereo_retrieve_memory_frames(tar_w2cs_full, tar_Ks_full, ref_w2cs, re
     ref_w2cs_out = retrieved_w2cs
     ref_index_list = list(ref_index_dict.keys())
 
-    if len(retrieved_frames) == 0:
-        raise RuntimeError("WorldStereo memory retrieval requires at least two target camera frames.")
+    if retrieval_failed or len(retrieved_frames) == 0:
+        dtype = ref_frames.dtype
+        device = ref_frames.device
+        return (
+            torch.empty((0, *ref_frames.shape[1:]), device=device, dtype=dtype),
+            torch.empty((0,), dtype=torch.long),
+            torch.empty((0, 4, 4), dtype=ref_w2cs.dtype, device=ref_w2cs.device),
+            torch.empty((0, 3, 3), dtype=ref_Ks.dtype, device=ref_Ks.device),
+        )
 
     retrieved_frames = torch.cat(retrieved_frames, dim=0)
     ref_index = torch.tensor(ref_index_list, dtype=torch.long)

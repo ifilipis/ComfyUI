@@ -358,7 +358,7 @@ class PromptServer():
         @routes.get("/worldstereo/scenes")
         async def get_worldstereo_scenes(request):
             path = request.query.get("path", "")
-            scenes = [x[0] for x in nodes._worldstereo_memory_scenes_in_path(path)]
+            scenes = [x[0] for x in nodes._worldstereo_selectable_memory_scenes_in_path(path)]
             if len(scenes) == 0:
                 scenes = ["none"]
             return web.json_response(scenes)

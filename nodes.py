@@ -1314,7 +1314,13 @@ def _worldstereo_load_all_renders_and_cameras(scene_entries, fallback_width, fal
             all_intrinsics.append(_worldstereo_match_frames(intrinsics, frames, "all render intrinsic"))
 
     if len(all_renders) == 0:
-        raise RuntimeError("WorldStereo all_renders found no indexed scenes.")
+        dtype = comfy.model_management.intermediate_dtype()
+        device = comfy.model_management.intermediate_device()
+        all_renders = torch.empty((0, int(fallback_height), int(fallback_width), 3), device=device, dtype=dtype)
+        all_extrinsics = torch.empty((0, 4, 4), dtype=torch.float32)
+        all_intrinsics = torch.empty((0, 3, 3), dtype=torch.float32)
+        all_cameras = _worldstereo_camera_from_tensors(all_extrinsics, all_intrinsics, fallback_width, fallback_height)
+        return all_renders, all_cameras
 
     all_renders = torch.cat(all_renders, dim=0)
     all_extrinsics = torch.cat(all_extrinsics, dim=0)
@@ -1696,6 +1702,17 @@ class WorldStereoMemoryLoader:
         all_scene_entries = _worldstereo_memory_scenes_in_path(path, fallback_root=scene_root)
         all_renders, all_cameras = _worldstereo_load_all_renders_and_cameras(all_scene_entries, source_width, source_height)
         all_camera_data = all_cameras["worldstereo_camera"]
+
+        if all_renders.shape[0] == 0:
+            reference_images = all_renders
+            reference_camera = _worldstereo_camera_from_tensors(
+                all_camera_data["extrinsics"],
+                all_camera_data["intrinsics"],
+                source_width,
+                source_height,
+                torch.empty((0,), dtype=torch.long),
+            )
+            return (scene_images, scene_mask, scene_camera, reference_images, reference_camera, all_renders, all_cameras)
 
         target_extrinsics = _worldstereo_match_frames(extrinsics, target_frames, "target extrinsic")
         target_intrinsics = _worldstereo_match_frames(intrinsics, target_frames, "target intrinsic")

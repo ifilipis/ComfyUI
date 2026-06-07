@@ -979,7 +979,7 @@ def _worldstereo_render_png_files(path, scene):
     return out
 
 
-def _worldstereo_memory_scene_files(path, scene):
+def _worldstereo_memory_scene_files(path, scene, require_video=True):
     json_path = os.path.join(path, "{}.json".format(scene))
     video_path = os.path.join(path, "{}.mp4".format(scene))
     mask_path = os.path.join(path, "{}_mask.mp4".format(scene))
@@ -990,11 +990,13 @@ def _worldstereo_memory_scene_files(path, scene):
     for render_png_path in render_png_paths:
         m = re.match(r"^{}_render[._](\d+)\.png$".format(re.escape(scene)), os.path.basename(render_png_path))
         render_frame_indices.append(int(m.group(1)) if m is not None else None)
-    if os.path.isfile(json_path) and os.path.isfile(video_path) and os.path.isfile(mask_path):
+    has_video = os.path.isfile(video_path) and os.path.isfile(mask_path)
+    has_render = render_path is not None
+    if os.path.isfile(json_path) and (has_video or (not require_video and has_render)):
         return {
             "json": json_path,
-            "video": video_path,
-            "mask": mask_path,
+            "video": video_path if os.path.isfile(video_path) else None,
+            "mask": mask_path if os.path.isfile(mask_path) else None,
             "render": render_path,
             "render_pngs": render_png_paths,
             "render_frame_indices": torch.tensor(render_frame_indices, dtype=torch.long) if len(render_frame_indices) > 0 and all(x is not None for x in render_frame_indices) else None,
@@ -1017,6 +1019,27 @@ def _worldstereo_memory_scene_names():
     if not scenes:
         scenes.add("none")
     return sorted(scenes)
+
+
+def _worldstereo_selectable_memory_scenes_in_path(path):
+    search_path = os.path.abspath(os.path.expanduser(path)) if path else folder_paths.get_input_directory()
+    if search_path is None or not os.path.isdir(search_path):
+        return []
+    out = []
+    seen = set()
+    files = os.listdir(search_path)
+    for f in files:
+        if not f.lower().endswith(".json"):
+            continue
+        scene = f[:-5]
+        key = (search_path, scene)
+        if key in seen:
+            continue
+        seen.add(key)
+        scene_files = _worldstereo_memory_scene_files(search_path, scene, require_video=True)
+        if scene_files is not None:
+            out.append((scene, search_path, scene_files))
+    return sorted(out, key=lambda x: (x[1], x[0]))
 
 
 def _worldstereo_resolve_memory_scene(path, scene):
@@ -1054,7 +1077,7 @@ def _worldstereo_memory_scenes_in_path(path, fallback_root=None):
         if key in seen:
             continue
         seen.add(key)
-        scene_files = _worldstereo_memory_scene_files(search_path, scene)
+        scene_files = _worldstereo_memory_scene_files(search_path, scene, require_video=False)
         if scene_files is not None:
             out.append((scene, search_path, scene_files))
     return sorted(out, key=lambda x: (x[1], x[0]))

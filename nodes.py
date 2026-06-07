@@ -1330,48 +1330,33 @@ def _worldstereo_load_all_renders_and_cameras(scene_entries, fallback_width, fal
     return all_renders, all_cameras
 
 
-def _worldstereo_load_depth_points(path, extrinsic, intrinsic, source_width, source_height, max_points=65536):
-    depth_path = os.path.join(path, "depth.exr")
-    if not os.path.isfile(depth_path):
+def _worldstereo_load_points_ply(path, max_points=65536):
+    ply_path = os.path.join(path, "points.ply")
+    if not os.path.isfile(ply_path):
         return None
 
-    os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
-    import cv2
+    try:
+        from plyfile import PlyData
+    except ImportError as exc:
+        raise RuntimeError("WorldStereo points.ply loading requires the plyfile package.") from exc
 
-    depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
-    if depth is None:
-        raise RuntimeError("WorldStereo could not read depth EXR: {}".format(depth_path))
-    if depth.ndim == 3:
-        depth = depth[:, :, 0]
-    if depth.ndim != 2:
-        raise RuntimeError("WorldStereo depth.exr must be a single-channel depth map.")
+    ply = PlyData.read(ply_path)
+    if "vertex" not in ply:
+        raise RuntimeError("WorldStereo points.ply has no vertex element: {}".format(ply_path))
+    vertices = ply["vertex"].data
+    names = vertices.dtype.names or ()
+    if not all(name in names for name in ("x", "y", "z")):
+        raise RuntimeError("WorldStereo points.ply vertex element must contain x, y, z fields: {}".format(ply_path))
 
-    depth = torch.from_numpy(depth.astype(np.float32))
-    valid = torch.isfinite(depth) & (depth > 0)
-    valid_indices = torch.nonzero(valid.flatten(), as_tuple=False).flatten()
-    if valid_indices.numel() == 0:
-        raise RuntimeError("WorldStereo depth.exr has no positive finite depth samples.")
-    if valid_indices.numel() > max_points:
-        sample_indices = torch.linspace(0, valid_indices.numel() - 1, max_points, dtype=torch.long)
-        valid_indices = valid_indices[sample_indices]
-
-    height, width = depth.shape
-    y = torch.div(valid_indices, width, rounding_mode="floor").to(torch.float32)
-    x = (valid_indices % width).to(torch.float32)
-    z = depth.flatten()[valid_indices].to(torch.float32)
-
-    K = intrinsic.clone().to(torch.float32)
-    if source_width is not None and source_height is not None:
-        K[0, :] = K[0, :] / float(source_width) * float(width)
-        K[1, :] = K[1, :] / float(source_height) * float(height)
-
-    pixels = torch.stack((x, y, torch.ones_like(x)), dim=1)
-    camera_points = torch.matmul(pixels, torch.linalg.inv(K).transpose(0, 1)) * z.unsqueeze(1)
-    world_points = torch.matmul(
-        torch.cat((camera_points, torch.ones((camera_points.shape[0], 1), dtype=camera_points.dtype)), dim=1),
-        torch.linalg.inv(extrinsic.to(torch.float32)).transpose(0, 1),
-    )[:, :3]
-    return world_points
+    xyz = np.stack((vertices["x"], vertices["y"], vertices["z"]), axis=1).astype(np.float32, copy=False)
+    valid = np.isfinite(xyz).all(axis=1)
+    xyz = xyz[valid]
+    if xyz.shape[0] == 0:
+        raise RuntimeError("WorldStereo points.ply has no finite xyz points: {}".format(ply_path))
+    if max_points > 0 and xyz.shape[0] > max_points:
+        indices = np.linspace(0, xyz.shape[0] - 1, int(max_points), dtype=np.int64)
+        xyz = xyz[indices]
+    return torch.from_numpy(xyz.copy()).to(torch.float32)
 
 
 def _worldstereo_points_in_views(points, extrinsics, intrinsics, image_width, image_height, chunk=16):
@@ -1716,7 +1701,7 @@ class WorldStereoMemoryLoader:
 
         target_extrinsics = _worldstereo_match_frames(extrinsics, target_frames, "target extrinsic")
         target_intrinsics = _worldstereo_match_frames(intrinsics, target_frames, "target intrinsic")
-        depth_points = _worldstereo_load_depth_points(scene_root, target_extrinsics[0], target_intrinsics[0], source_width, source_height)
+        points_world = _worldstereo_load_points_ply(scene_root)
 
         retrieved_frames, ref_index, reference_extrinsics, reference_intrinsics = _worldstereo_retrieve_memory_frames(
             target_extrinsics,
@@ -1727,7 +1712,7 @@ class WorldStereoMemoryLoader:
             source_width,
             source_height,
             target_frames,
-            depth_points,
+            points_world,
         )
         reference_images = retrieved_frames[ref_index]
         reference_camera = _worldstereo_camera_from_tensors(reference_extrinsics, reference_intrinsics, source_width, source_height, ref_index)
@@ -1747,9 +1732,9 @@ class WorldStereoMemoryLoader:
         for png in files["render_pngs"]:
             with open(png, "rb") as f:
                 m.update(f.read())
-        depth_path = os.path.join(scene_root, "depth.exr")
-        if os.path.isfile(depth_path):
-            with open(depth_path, "rb") as f:
+        points_path = os.path.join(scene_root, "points.ply")
+        if os.path.isfile(points_path):
+            with open(points_path, "rb") as f:
                 m.update(f.read())
         for _, _, scene_files in _worldstereo_memory_scenes_in_path(path, fallback_root=scene_root):
             with open(scene_files["json"], "rb") as f:

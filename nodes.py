@@ -1229,6 +1229,12 @@ def _worldstereo_load_video_images(path):
     return components.images[:, :, :, :3].to(device=device, dtype=dtype)
 
 
+def _worldstereo_resize_image_batch(images, width, height, upscale_method="bilinear"):
+    if images.shape[1] == height and images.shape[2] == width:
+        return images
+    return comfy.utils.common_upscale(images.movedim(-1, 1), width, height, upscale_method, "center").movedim(1, -1)
+
+
 def _worldstereo_load_png_sequence(paths):
     dtype = comfy.model_management.intermediate_dtype()
     device = comfy.model_management.intermediate_device()
@@ -1240,12 +1246,10 @@ def _worldstereo_load_png_sequence(paths):
         img = node_helpers.pillow(ImageOps.exif_transpose, img).convert("RGB")
         if width is None:
             width, height = img.size
-        if img.size != (width, height):
-            raise RuntimeError("WorldStereo render PNG sequence frames must have matching sizes.")
         images.append(torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0))
     if len(images) == 0:
         raise RuntimeError("WorldStereo render PNG sequence is empty.")
-    return torch.cat(images, dim=0).to(device=device, dtype=dtype)
+    return torch.cat([_worldstereo_resize_image_batch(image, width, height) for image in images], dim=0).to(device=device, dtype=dtype)
 
 
 def _worldstereo_load_render_images(files):
@@ -1322,7 +1326,7 @@ def _worldstereo_load_all_renders_and_cameras(scene_entries, fallback_width, fal
         elif source_width != scene_source_width or source_height != scene_source_height:
             raise RuntimeError("WorldStereo all_renders requires all scenes to have matching source dimensions.")
         elif render_height != render_images.shape[1] or render_width != render_images.shape[2]:
-            raise RuntimeError("WorldStereo all_renders requires all render videos/images to have matching dimensions.")
+            render_images = _worldstereo_resize_image_batch(render_images, render_width, render_height)
 
         frames = render_images.shape[0]
         all_renders.append(render_images)
@@ -1382,10 +1386,23 @@ def _worldstereo_load_points_ply(path, max_points=65536):
     return torch.from_numpy(xyz.copy()).to(torch.float32)
 
 
-def _worldstereo_points_in_views(points, extrinsics, intrinsics, image_width, image_height, chunk=16):
-    out = []
+WORLDSTEREO_POINT_GRID_HEIGHT = 24
+
+
+def _worldstereo_grid_dimensions(image_width, image_height, grid_height=WORLDSTEREO_POINT_GRID_HEIGHT):
+    grid_height = max(1, min(int(image_height), int(grid_height)))
+    grid_width = max(1, round(grid_height * float(image_width) / float(image_height)))
+    return grid_width, grid_height
+
+
+def _worldstereo_project_points_to_grid(points, extrinsics, intrinsics, image_width, image_height, grid_height=WORLDSTEREO_POINT_GRID_HEIGHT, chunk=16):
+    grid_width, grid_height = _worldstereo_grid_dimensions(image_width, image_height, grid_height)
+
     ones = torch.ones((points.shape[0], 1), dtype=points.dtype, device=points.device)
     points_h = torch.cat((points, ones), dim=1)
+    visible = []
+    cell_indices = []
+
     for start in range(0, extrinsics.shape[0], chunk):
         end = min(start + chunk, extrinsics.shape[0])
         cam_points = torch.matmul(points_h.unsqueeze(0), extrinsics[start:end].to(points.device, points.dtype).transpose(1, 2))
@@ -1393,12 +1410,51 @@ def _worldstereo_points_in_views(points, extrinsics, intrinsics, image_width, im
         pixels = torch.matmul(cam_points[:, :, :3], intrinsics[start:end].to(points.device, points.dtype).transpose(1, 2))
         u = pixels[:, :, 0] / torch.clamp(pixels[:, :, 2], min=1e-8)
         v = pixels[:, :, 1] / torch.clamp(pixels[:, :, 2], min=1e-8)
-        out.append((z > 0) & (u >= 0) & (u < image_width) & (v >= 0) & (v < image_height))
-    return torch.cat(out, dim=0)
+        valid = (z > 0) & (u >= 0) & (u < image_width) & (v >= 0) & (v < image_height)
+        x = torch.clamp((u * grid_width / image_width).to(torch.long), 0, grid_width - 1)
+        y = torch.clamp((v * grid_height / image_height).to(torch.long), 0, grid_height - 1)
+        visible.append(valid)
+        cell_indices.append(y * grid_width + x)
+
+    return torch.cat(visible, dim=0), torch.cat(cell_indices, dim=0), grid_height * grid_width
+
+
+def _worldstereo_point_occupancy_masks(points, extrinsics, intrinsics, image_width, image_height, grid_height=WORLDSTEREO_POINT_GRID_HEIGHT, chunk=16):
+    visible, cell_indices, grid_cells = _worldstereo_project_points_to_grid(
+        points, extrinsics, intrinsics, image_width, image_height, grid_height=grid_height, chunk=chunk
+    )
+    masks = torch.zeros((extrinsics.shape[0], grid_cells), dtype=torch.bool, device=points.device)
+    for view in range(extrinsics.shape[0]):
+        masks[view, cell_indices[view, visible[view]]] = True
+    return masks
+
+
+def _worldstereo_points_visible_masks(points, extrinsics, intrinsics, image_width, image_height, chunk=16):
+    visible, _, _ = _worldstereo_project_points_to_grid(
+        points, extrinsics, intrinsics, image_width, image_height, chunk=chunk
+    )
+    return visible
+
+
+def _worldstereo_points_visible_mask(points, extrinsic, intrinsic, image_width, image_height):
+    return _worldstereo_points_visible_masks(
+        points, extrinsic.unsqueeze(0), intrinsic.unsqueeze(0), image_width, image_height
+    )[0]
+
+
+def _worldstereo_point_occupancy_masks_for_visibility(points, visible_masks, extrinsics, intrinsics, image_width, image_height):
+    grid_width, grid_height = _worldstereo_grid_dimensions(image_width, image_height)
+    masks = torch.zeros((visible_masks.shape[0], grid_height * grid_width), dtype=torch.bool, device=points.device)
+    for i in range(visible_masks.shape[0]):
+        if torch.any(visible_masks[i]):
+            masks[i] = _worldstereo_point_occupancy_masks(
+                points[visible_masks[i]], extrinsics[i:i + 1], intrinsics[i:i + 1], image_width, image_height
+            )[0]
+    return masks
 
 
 def _worldstereo_find_closest_camera_by_points(target_extrinsic, ref_extrinsics, target_intrinsic, ref_intrinsics,
-                                               image_width, image_height, points_world, excluded_indices=None):
+                                               target_width, target_height, ref_width, ref_height, points_world, excluded_indices=None):
     num_refs = ref_extrinsics.shape[0]
     target_extrinsic_batch = target_extrinsic.unsqueeze(0).expand(num_refs, -1, -1)
     target_intrinsic_batch = target_intrinsic.unsqueeze(0).expand(num_refs, -1, -1)
@@ -1406,7 +1462,7 @@ def _worldstereo_find_closest_camera_by_points(target_extrinsic, ref_extrinsics,
     fov_scores, angle_betweens = _worldstereo_calculate_fov_overlap(
         target_intrinsic_batch, target_extrinsic_batch,
         ref_intrinsics, ref_extrinsics,
-        image_width, image_height,
+        target_width, target_height, ref_width, ref_height,
         near=0.1, far=10.0
     )
 
@@ -1414,17 +1470,33 @@ def _worldstereo_find_closest_camera_by_points(target_extrinsic, ref_extrinsics,
     angle_betweens[angle_betweens > 180] = 360 - angle_betweens[angle_betweens > 180]
     fov_scores = fov_scores * torch.clip(torch.exp(((-angle_betweens + 90) / 180.0) * 5.0), 0.0, 1.0)
 
-    target_visible = _worldstereo_points_in_views(
-        points_world, target_extrinsic.unsqueeze(0), target_intrinsic.unsqueeze(0), image_width, image_height
+    target_visible = _worldstereo_points_visible_mask(
+        points_world, target_extrinsic, target_intrinsic, target_width, target_height
+    )
+    target_occupancy = _worldstereo_point_occupancy_masks(
+        points_world, target_extrinsic.unsqueeze(0), target_intrinsic.unsqueeze(0), target_width, target_height
     )[0]
-    ref_visible = _worldstereo_points_in_views(points_world, ref_extrinsics, ref_intrinsics, image_width, image_height)
+    ref_occupancy = _worldstereo_point_occupancy_masks(points_world, ref_extrinsics, ref_intrinsics, ref_width, ref_height)
+    ref_visible = _worldstereo_points_visible_masks(points_world, ref_extrinsics, ref_intrinsics, ref_width, ref_height)
+    shared_visible = ref_visible & target_visible.unsqueeze(0)
+    shared_target_occupancy = _worldstereo_point_occupancy_masks_for_visibility(
+        points_world,
+        shared_visible,
+        target_extrinsic.unsqueeze(0).expand(num_refs, -1, -1),
+        target_intrinsic.unsqueeze(0).expand(num_refs, -1, -1),
+        target_width,
+        target_height,
+    )
+    shared_ref_occupancy = _worldstereo_point_occupancy_masks_for_visibility(
+        points_world, shared_visible, ref_extrinsics, ref_intrinsics, ref_width, ref_height
+    )
 
-    target_count = target_visible.sum()
-    ref_count = ref_visible.sum(dim=1)
-    intersection = (ref_visible & target_visible.unsqueeze(0)).sum(dim=1)
-    union = target_count + ref_count - intersection
-    point_scores = intersection.to(torch.float32) / torch.clamp(union.to(torch.float32), min=1.0)
-    scores = fov_scores + point_scores
+    target_area = target_occupancy.sum()
+    ref_area = ref_occupancy.sum(dim=1)
+    target_coverage = shared_target_occupancy.sum(dim=1).to(torch.float32) / torch.clamp(target_area.to(torch.float32), min=1.0)
+    ref_coverage = shared_ref_occupancy.sum(dim=1).to(torch.float32) / torch.clamp(ref_area.to(torch.float32), min=1.0)
+    occupied_area_scores = target_coverage * ref_coverage
+    scores = fov_scores + occupied_area_scores
     if excluded_indices:
         scores[list(excluded_indices)] = -float("inf")
         if torch.isneginf(scores).all():
@@ -1473,18 +1545,29 @@ def _worldstereo_get_camera_frustum_corners(K, extrinsic, image_width, image_hei
     camera_center = c2w[:, :3, 3]
     R = c2w[:, :3, :3]
 
-    K_inv = torch.inverse(K)
-
     if not isinstance(image_width, torch.Tensor):
-        image_width = torch.tensor([image_width] * batch_size, device=device, dtype=torch.float32)
+        image_width = torch.tensor([image_width] * batch_size, device=device, dtype=K.dtype)
+    else:
+        image_width = image_width.to(device=device, dtype=K.dtype).reshape(-1)
+        if image_width.numel() == 1:
+            image_width = image_width.expand(batch_size)
     if not isinstance(image_height, torch.Tensor):
-        image_height = torch.tensor([image_height] * batch_size, device=device, dtype=torch.float32)
+        image_height = torch.tensor([image_height] * batch_size, device=device, dtype=K.dtype)
+    else:
+        image_height = image_height.to(device=device, dtype=K.dtype).reshape(-1)
+        if image_height.numel() == 1:
+            image_height = image_height.expand(batch_size)
+
+    K = K.clone()
+    K[:, 0, :] /= image_width[:, None]
+    K[:, 1, :] /= image_height[:, None]
+    K_inv = torch.inverse(K)
 
     corners_2d = torch.stack([
         torch.stack([torch.zeros(batch_size, device=device), torch.zeros(batch_size, device=device), torch.ones(batch_size, device=device)], dim=1),
-        torch.stack([image_width, torch.zeros(batch_size, device=device), torch.ones(batch_size, device=device)], dim=1),
-        torch.stack([image_width, image_height, torch.ones(batch_size, device=device)], dim=1),
-        torch.stack([torch.zeros(batch_size, device=device), image_height, torch.ones(batch_size, device=device)], dim=1)
+        torch.stack([torch.ones(batch_size, device=device), torch.zeros(batch_size, device=device), torch.ones(batch_size, device=device)], dim=1),
+        torch.stack([torch.ones(batch_size, device=device), torch.ones(batch_size, device=device), torch.ones(batch_size, device=device)], dim=1),
+        torch.stack([torch.zeros(batch_size, device=device), torch.ones(batch_size, device=device), torch.ones(batch_size, device=device)], dim=1)
     ], dim=1)
 
     ray_dirs_cam = torch.bmm(corners_2d, K_inv.transpose(1, 2))
@@ -1537,7 +1620,8 @@ def _worldstereo_calculate_frustum_volume_overlap(corners1, corners2):
     return overlap_score
 
 
-def _worldstereo_calculate_fov_overlap(cam1_intrinsic, cam1_extrinsic, cam2_intrinsic, cam2_extrinsic, image_width, image_height, near, far):
+def _worldstereo_calculate_fov_overlap(cam1_intrinsic, cam1_extrinsic, cam2_intrinsic, cam2_extrinsic,
+                                       cam1_width, cam1_height, cam2_width, cam2_height, near, far):
     is_batched = cam1_intrinsic.dim() == 3
     if not is_batched:
         cam1_intrinsic = cam1_intrinsic.unsqueeze(0)
@@ -1558,10 +1642,10 @@ def _worldstereo_calculate_fov_overlap(cam1_intrinsic, cam1_extrinsic, cam2_intr
     depth_range = (near, far)
 
     corners1 = _worldstereo_get_camera_frustum_corners(
-        cam1_intrinsic, cam1_extrinsic, image_width, image_height, depth_range
+        cam1_intrinsic, cam1_extrinsic, cam1_width, cam1_height, depth_range
     )
     corners2 = _worldstereo_get_camera_frustum_corners(
-        cam2_intrinsic, cam2_extrinsic, image_width, image_height, depth_range
+        cam2_intrinsic, cam2_extrinsic, cam2_width, cam2_height, depth_range
     )
 
     overlap_ratio = _worldstereo_calculate_frustum_volume_overlap(corners1, corners2)
@@ -1574,7 +1658,8 @@ def _worldstereo_calculate_fov_overlap(cam1_intrinsic, cam1_extrinsic, cam2_intr
 
 
 def _worldstereo_find_closest_camera_in_view(target_extrinsic, ref_extrinsics, target_intrinsic, ref_intrinsics,
-                                             image_width, image_height, method="distance", near=0.1, far=5.0, angle_penalty=False,
+                                             image_width, image_height, ref_width=None, ref_height=None,
+                                             method="distance", near=0.1, far=5.0, angle_penalty=False,
                                              shortcut_index=None, topk_return=0, excluded_indices=None):
     num_refs = ref_extrinsics.shape[0]
 
@@ -1601,11 +1686,15 @@ def _worldstereo_find_closest_camera_in_view(target_extrinsic, ref_extrinsics, t
 
     elif method == "fov_overlap":
         target_intrinsic_batch = target_intrinsic.unsqueeze(0).expand(num_refs, -1, -1)
+        if ref_width is None:
+            ref_width = image_width
+        if ref_height is None:
+            ref_height = image_height
 
         overlap_ratios, angle_betweens = _worldstereo_calculate_fov_overlap(
             target_intrinsic_batch, target_extrinsic_batch,
             ref_intrinsics, ref_extrinsics,
-            image_width, image_height,
+            image_width, image_height, ref_width, ref_height,
             near=near, far=far
         )
 
@@ -1644,7 +1733,7 @@ def _worldstereo_find_closest_camera_in_view(target_extrinsic, ref_extrinsics, t
         raise ValueError("Unknown method: {}. Use 'distance' or 'fov_overlap'".format(method))
 
 
-def _worldstereo_retrieve_memory_frames(tar_w2cs_full, tar_Ks_full, ref_w2cs, ref_Ks, ref_frames, image_width, image_height, nframe, points_world=None, max_repeats_per_reference=3):
+def _worldstereo_retrieve_memory_frames(tar_w2cs_full, tar_Ks_full, ref_w2cs, ref_Ks, ref_frames, target_width, target_height, nframe, points_world=None, max_repeats_per_reference=3, max_refs=0):
     if tar_w2cs_full.shape[0] > nframe:
         tar_w2cs = tar_w2cs_full[0::4]
         tar_Ks = tar_Ks_full[0::4]
@@ -1659,6 +1748,9 @@ def _worldstereo_retrieve_memory_frames(tar_w2cs_full, tar_Ks_full, ref_w2cs, re
     retrieved_Ks = []
     ref_w2cs_out = []
     ref_use_counts = collections.defaultdict(int)
+    ref_height = ref_frames.shape[1]
+    ref_width = ref_frames.shape[2]
+    max_refs = max(0, int(max_refs))
     target_reference_count = max(0, tar_w2cs.shape[0] - 1)
     repeat_limit = max(max_repeats_per_reference, math.ceil(target_reference_count / ref_w2cs.shape[0])) if ref_w2cs.shape[0] > 0 else max_repeats_per_reference
     retrieval_failed = False
@@ -1670,8 +1762,10 @@ def _worldstereo_retrieve_memory_frames(tar_w2cs_full, tar_Ks_full, ref_w2cs, re
                 ref_w2cs,
                 tar_Ks[frame_index],
                 ref_Ks,
-                image_width,
-                image_height,
+                target_width,
+                target_height,
+                ref_width,
+                ref_height,
                 method="fov_overlap",
                 near=0.1,
                 far=10.0,
@@ -1684,8 +1778,10 @@ def _worldstereo_retrieve_memory_frames(tar_w2cs_full, tar_Ks_full, ref_w2cs, re
             ref_w2cs,
             tar_Ks[frame_index],
             ref_Ks,
-            image_width,
-            image_height,
+            target_width,
+            target_height,
+            ref_width,
+            ref_height,
             points_world,
             excluded_indices=excluded_indices,
         )
@@ -1693,10 +1789,15 @@ def _worldstereo_retrieve_memory_frames(tar_w2cs_full, tar_Ks_full, ref_w2cs, re
     for i in range(1, tar_w2cs.shape[0]):
         while True:
             excluded_indices = {idx for idx, count in ref_use_counts.items() if count >= repeat_limit}
+            if max_refs > 0 and len(retrieval_map) >= max_refs:
+                excluded_indices.update(idx for idx in range(ref_w2cs.shape[0]) if idx not in retrieval_map)
             best_idx, best_score, angle_diff = select_reference(i, excluded_indices=excluded_indices)
             if best_idx is not None:
                 break
-            unrestricted_idx, _, _ = select_reference(i)
+            unrestricted_excluded = set()
+            if max_refs > 0 and len(retrieval_map) >= max_refs:
+                unrestricted_excluded.update(idx for idx in range(ref_w2cs.shape[0]) if idx not in retrieval_map)
+            unrestricted_idx, _, _ = select_reference(i, excluded_indices=unrestricted_excluded)
             if unrestricted_idx is None:
                 retrieval_failed = True
                 break
@@ -1740,6 +1841,9 @@ class WorldStereoMemoryLoader:
         return {"required": {
             "path": ("STRING", {"default": folder_paths.get_input_directory()}),
             "scene": (_worldstereo_memory_scene_names(), ),
+            "use_points_if_available": ("BOOLEAN", {"default": True, "tooltip": "Use points.ply for reference selection when available. Disable to use FOV-only selection."}),
+            "max_refs": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 1, "tooltip": "Maximum unique reference frames to select. 0 means unlimited."}),
+            "max_repeats": ("INT", {"default": 3, "min": 1, "max": 4096, "step": 1, "tooltip": "Maximum times a reference frame can be reused before relaxing the limit."}),
         }}
 
     RETURN_TYPES = ("IMAGE", "MASK", "LATENT", "IMAGE", "LATENT", "IMAGE", "LATENT")
@@ -1747,7 +1851,7 @@ class WorldStereoMemoryLoader:
     FUNCTION = "load_memory"
     CATEGORY = "loaders"
 
-    def load_memory(self, path, scene):
+    def load_memory(self, path, scene, use_points_if_available=True, max_refs=0, max_repeats=3):
         scene_root, files = _worldstereo_resolve_memory_scene(path, scene)
         extrinsics, intrinsics, source_width, source_height = _worldstereo_camera_data_from_json(files["json"])
 
@@ -1777,7 +1881,7 @@ class WorldStereoMemoryLoader:
 
         target_extrinsics = _worldstereo_match_frames(extrinsics, target_frames, "target extrinsic")
         target_intrinsics = _worldstereo_match_frames(intrinsics, target_frames, "target intrinsic")
-        points_world = _worldstereo_load_points_ply(scene_root)
+        points_world = _worldstereo_load_points_ply(scene_root) if use_points_if_available else None
 
         retrieved_frames, ref_index, reference_extrinsics, reference_intrinsics = _worldstereo_retrieve_memory_frames(
             target_extrinsics,
@@ -1789,6 +1893,8 @@ class WorldStereoMemoryLoader:
             source_height,
             target_frames,
             points_world,
+            max_repeats_per_reference=max_repeats,
+            max_refs=max_refs,
         )
         reference_images = retrieved_frames[ref_index]
         reference_camera = _worldstereo_camera_from_tensors(reference_extrinsics, reference_intrinsics, source_width, source_height, ref_index)
@@ -1796,9 +1902,12 @@ class WorldStereoMemoryLoader:
         return (scene_images, scene_mask, scene_camera, reference_images, reference_camera, all_renders, all_cameras)
 
     @classmethod
-    def IS_CHANGED(s, path, scene):
+    def IS_CHANGED(s, path, scene, use_points_if_available=True, max_refs=0, max_repeats=3):
         scene_root, files = _worldstereo_resolve_memory_scene(path, scene)
         m = hashlib.sha256()
+        m.update(str(bool(use_points_if_available)).encode("utf-8"))
+        m.update(str(int(max_refs)).encode("utf-8"))
+        m.update(str(int(max_repeats)).encode("utf-8"))
         for name in ("json", "video", "mask"):
             with open(files[name], "rb") as f:
                 m.update(f.read())
@@ -1826,7 +1935,7 @@ class WorldStereoMemoryLoader:
         return m.digest().hex()
 
     @classmethod
-    def VALIDATE_INPUTS(s, path, scene):
+    def VALIDATE_INPUTS(s, path, scene, use_points_if_available=True, max_refs=0, max_repeats=3):
         try:
             _worldstereo_resolve_memory_scene(path, scene)
         except Exception as e:

@@ -1303,8 +1303,6 @@ def _worldstereo_load_all_renders_and_cameras(scene_entries, fallback_width, fal
     all_renders = []
     all_extrinsics = []
     all_intrinsics = []
-    source_width = None
-    source_height = None
     render_height = None
     render_width = None
 
@@ -1318,13 +1316,9 @@ def _worldstereo_load_all_renders_and_cameras(scene_entries, fallback_width, fal
         if scene_source_height is None:
             scene_source_height = fallback_height
 
-        if source_width is None:
-            source_width = scene_source_width
-            source_height = scene_source_height
+        if render_width is None:
             render_height = render_images.shape[1]
             render_width = render_images.shape[2]
-        elif source_width != scene_source_width or source_height != scene_source_height:
-            raise RuntimeError("WorldStereo all_renders requires all scenes to have matching source dimensions.")
         elif render_height != render_images.shape[1] or render_width != render_images.shape[2]:
             render_images = _worldstereo_resize_image_batch(render_images, render_width, render_height)
 
@@ -1335,10 +1329,11 @@ def _worldstereo_load_all_renders_and_cameras(scene_entries, fallback_width, fal
             if torch.max(render_frame_indices) >= extrinsics.shape[0] or torch.max(render_frame_indices) >= intrinsics.shape[0]:
                 raise RuntimeError("WorldStereo render PNG frame number exceeds camera frame count.")
             all_extrinsics.append(extrinsics[render_frame_indices])
-            all_intrinsics.append(intrinsics[render_frame_indices])
+            render_intrinsics = intrinsics[render_frame_indices]
         else:
             all_extrinsics.append(_worldstereo_match_frames(extrinsics, frames, "all render extrinsic"))
-            all_intrinsics.append(_worldstereo_match_frames(intrinsics, frames, "all render intrinsic"))
+            render_intrinsics = _worldstereo_match_frames(intrinsics, frames, "all render intrinsic")
+        all_intrinsics.append(_worldstereo_scale_intrinsics(render_intrinsics, scene_source_width, scene_source_height, render_width, render_height))
 
     if len(all_renders) == 0:
         dtype = comfy.model_management.intermediate_dtype()
@@ -1352,7 +1347,6 @@ def _worldstereo_load_all_renders_and_cameras(scene_entries, fallback_width, fal
     all_renders = torch.cat(all_renders, dim=0)
     all_extrinsics = torch.cat(all_extrinsics, dim=0)
     all_intrinsics = torch.cat(all_intrinsics, dim=0)
-    all_intrinsics = _worldstereo_scale_intrinsics(all_intrinsics, source_width, source_height, render_width, render_height)
     all_cameras = _worldstereo_camera_from_tensors(all_extrinsics, all_intrinsics, render_width, render_height)
     return all_renders, all_cameras
 
